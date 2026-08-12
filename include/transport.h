@@ -10,8 +10,7 @@ public:
 
     virtual bool Listen(uint16_t port) = 0;
     virtual uint16_t GetListenPort() const = 0;
-    virtual bool Accept() = 0;
-    virtual std::shared_ptr<Transport> CreateAcceptedConnection() = 0;
+    virtual std::shared_ptr<Transport> Accept() = 0;
 
     virtual bool Connect(const std::string& addr, uint16_t port) = 0;
 

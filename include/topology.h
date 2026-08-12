@@ -1,35 +1,33 @@
 #pragma once
 
 #include <string>
-#include <memory>
 #include <vector>
-#include <cstddef>
-#include "types.h"
-
-class Communicator;
+#include "channel.h"
 
 class Topology {
 public:
     virtual ~Topology() = default;
 
-    virtual bool Init(int r, int ws) {
+    virtual bool Init(int r, int ws, int n_ch) {
         rank = r;
         world_size = ws;
+        n_channels = n_ch;
         return true;
     }
 
-    virtual std::vector<int> GetNeighbors(int r) const = 0;
-    virtual bool ShouldConnect(int my_rank, int peer_rank) const = 0;
+    virtual void FillChannels(std::vector<Channel>& channels) const = 0;
+
+    virtual int DefaultChannelCount() const {
+        return 1;
+    }
 
     const char* GetName() const {
         return topo_name.c_str();
     }
 
-    virtual bool AllReduce(Communicator& comm, const void* send_buf, void* recv_buf, size_t count, DataType dtype,
-                           ReduceOp op) = 0;
-
 protected:
     int rank = -1;
     int world_size = 0;
+    int n_channels = 0;
     std::string topo_name;
 };

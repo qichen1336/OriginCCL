@@ -308,7 +308,7 @@ template void ReduceData<double>(const double* send_buf, double* recv_buf, size_
 template void ReduceData<int32_t>(const int32_t* send_buf, int32_t* recv_buf, size_t count, ReduceOp op);
 template void ReduceData<int64_t>(const int64_t* send_buf, int64_t* recv_buf, size_t count, ReduceOp op);
 
-void PerformReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int world_size) {
+void PerformReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
     switch (dtype) {
     case DataType::FLOAT32:
         ReduceData(static_cast<const float*>(send_buf), static_cast<float*>(recv_buf), count, op);
@@ -327,41 +327,45 @@ void PerformReduce(const void* send_buf, void* recv_buf, size_t count, DataType 
         LOG_ERROR("Unknown data type to reduce");
         return;
     }
+}
 
-    if (op == ReduceOp::AVG) {
-        switch (dtype) {
-        case DataType::FLOAT32: {
-            float* data = static_cast<float*>(recv_buf);
-            for (size_t i = 0; i < count; i++) {
-                data[i] /= world_size;
-            }
-            break;
-        }
+void ApplyAverage(void* buf, size_t count, DataType dtype, int world_size) {
+    if (world_size <= 0) {
+        return;
+    }
 
-        case DataType::FLOAT64: {
-            double* data = static_cast<double*>(recv_buf);
-            for (size_t i = 0; i < count; i++) {
-                data[i] /= world_size;
-            }
-            break;
+    switch (dtype) {
+    case DataType::FLOAT32: {
+        float* data = static_cast<float*>(buf);
+        for (size_t i = 0; i < count; i++) {
+            data[i] /= world_size;
         }
-
-        case DataType::INT32: {
-            int32_t* data = static_cast<int32_t*>(recv_buf);
-            for (size_t i = 0; i < count; i++) {
-                data[i] /= world_size;
-            }
-            break;
+        break;
+    }
+    case DataType::FLOAT64: {
+        double* data = static_cast<double*>(buf);
+        for (size_t i = 0; i < count; i++) {
+            data[i] /= world_size;
         }
-
-        case DataType::INT64: {
-            int64_t* data = static_cast<int64_t*>(recv_buf);
-            for (size_t i = 0; i < count; i++) {
-                data[i] /= world_size;
-            }
-            break;
+        break;
+    }
+    case DataType::INT32: {
+        int32_t* data = static_cast<int32_t*>(buf);
+        for (size_t i = 0; i < count; i++) {
+            data[i] /= world_size;
         }
+        break;
+    }
+    case DataType::INT64: {
+        int64_t* data = static_cast<int64_t*>(buf);
+        for (size_t i = 0; i < count; i++) {
+            data[i] /= world_size;
         }
+        break;
+    }
+    default:
+        LOG_ERROR("Unknown data type to average");
+        break;
     }
 }
 

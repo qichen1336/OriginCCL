@@ -24,22 +24,7 @@ bool TransportTCP::Listen(uint16_t port) {
     return true;
 }
 
-bool TransportTCP::Accept() {
-    if (listen_fd < 0) {
-        LOG_ERROR("Not in listen mode");
-        return false;
-    }
-
-    sockfd = Utils::AcceptConnection(listen_fd);
-    if (sockfd < 0) {
-        return false;
-    }
-
-    connected = true;
-    return true;
-}
-
-std::shared_ptr<Transport> TransportTCP::CreateAcceptedConnection() {
+std::shared_ptr<Transport> TransportTCP::Accept() {
     if (listen_fd < 0) {
         LOG_ERROR("Not in listen mode");
         return nullptr;

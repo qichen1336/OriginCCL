@@ -36,7 +36,8 @@ NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset);
 
 template<typename T>
 void ReduceData(const T* send_buf, T* recv_buf, size_t count, ReduceOp op);
-void PerformReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int world_size);
+void PerformReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op);
+void ApplyAverage(void* buf, size_t count, DataType dtype, int world_size);
 
 inline size_t AlignUp(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);

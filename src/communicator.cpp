@@ -1,15 +1,14 @@
-#include <algorithm>
 #include <thread>
 #include <chrono>
 #include <mutex>
 #include <atomic>
-#include <cstring>
 #include "communicator.h"
 #include "logger.h"
 #include "utils.h"
 #include "bootstrap.h"
 #include "transport_tcp.h"
 #include "topology_ring.h"
+#include "ring_executor.h"
 
 Communicator::Communicator() {}
 
@@ -21,13 +20,22 @@ bool Communicator::Init(const CommConfig& cfg) {
     config = cfg;
 
     topology = std::make_shared<TopologyRing>();
-    if (!topology->Init(config.rank, config.world_size)) {
+    int n_channels = config.n_channels > 0 ? config.n_channels : topology->DefaultChannelCount();
+    if (!topology->Init(config.rank, config.world_size, n_channels)) {
         LOG_ERROR("Rank {}: Failed to init Topology", config.rank);
         return false;
     }
 
-    LOG_INFO("Rank {}: Init Communicator world_size = {}, transport = TCP, topology = Ring", config.rank,
-             config.world_size);
+    channels.resize(static_cast<size_t>(n_channels));
+    topology->FillChannels(channels);
+
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}",
+             config.rank, config.world_size, n_channels, topology->GetName());
+
+    if (config.world_size <= 1) {
+        LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
+        return true;
+    }
 
     auto temp_transport = std::make_shared<TransportTCP>();
     if (!temp_transport->Listen(0)) {
@@ -37,7 +45,6 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     uint16_t data_port = temp_transport->GetListenPort();
     LOG_INFO("Rank {}: Will use port {} for data plane", config.rank, data_port);
-
     temp_transport->Close();
 
     Bootstrap bootstrap;
@@ -48,8 +55,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     }
     LOG_INFO("Rank {}: Bootstrap is ready, get {} nodes info", config.rank, all_nodes.size());
 
-    if (!InitTransports(all_nodes)) {
-        LOG_ERROR("Rank {}: Failed to init transports for all nodes", config.rank);
+    if (!InitChannels(all_nodes)) {
+        LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);
         return false;
     }
 
@@ -58,132 +65,168 @@ bool Communicator::Init(const CommConfig& cfg) {
 }
 
 void Communicator::Finalize() {
-    for (auto& pair : transports) {
-        pair.second->Close();
+    for (auto& channel : channels) {
+        if (channel.send.transport) {
+            channel.send.transport->Close();
+            channel.send.transport.reset();
+        }
+        if (channel.recv.transport) {
+            channel.recv.transport->Close();
+            channel.recv.transport.reset();
+        }
     }
-    transports.clear();
+    channels.clear();
     LOG_INFO("Rank {}: Communicator finalized", config.rank);
 }
 
-std::shared_ptr<Transport> Communicator::GetTransport(int peer_rank) const {
-    auto it = transports.find(peer_rank);
-    if (it != transports.end()) {
-        return it->second;
-    } else {
-        return nullptr;
-    }
+Channel& Communicator::GetChannel(int channel_id) {
+    return channels.at(static_cast<size_t>(channel_id));
+}
+
+const Channel& Communicator::GetChannel(int channel_id) const {
+    return channels.at(static_cast<size_t>(channel_id));
 }
 
 bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
     LOG_DEBUG("Rank {}: AllReduce count {}, dtype {}, op {}", config.rank, count, Utils::GetDataTypeName(dtype),
               Utils::GetReduceOpName(op));
-    return topology->AllReduce(*this, send_buf, recv_buf, count, dtype, op);
+    CollTask task;
+    task.func = CollFunc::AllReduce;
+    task.send_buf = send_buf;
+    task.recv_buf = recv_buf;
+    task.count = count;
+    task.dtype = dtype;
+    task.op = op;
+
+    CollPlan plan = planner.Plan(*this, task);
+    return RingExecutor::Run(*this, plan, task);
 }
 
-bool Communicator::InitTransports(const std::vector<NodeInfo>& all_nodes) {
+Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {
+    if (channel_id < 0 || channel_id >= static_cast<int>(channels.size())) {
+        return nullptr;
+    }
+    Channel& channel = channels[static_cast<size_t>(channel_id)];
+    if (is_send) {
+        return channel.SendConnector(peer);
+    }
+    return channel.RecvConnector(peer);
+}
 
-    std::vector<int> neighbors = topology->GetNeighbors(config.rank);
-    LOG_INFO("Rank {}: Topology {} needs connections to {} neighbors", config.rank, topology->GetName(),
-             neighbors.size());
+bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes) {
+    std::vector<ChannelEdge> connect_edges;
+    std::vector<ChannelEdge> accept_edges;
 
-    std::vector<int> connect_peers;
-
-    std::vector<int> accept_peers;
-    for (int peer : neighbors) {
-        if (topology->ShouldConnect(config.rank, peer)) {
-            connect_peers.push_back(peer);
+    for (auto& channel : channels) {
+        ChannelEdge send_edge{channel.id, channel.ring.next, true};
+        ChannelEdge recv_edge{channel.id, channel.ring.prev, false};
+        if (config.rank < send_edge.peer) {
+            connect_edges.push_back(send_edge);
         } else {
-            accept_peers.push_back(peer);
+            accept_edges.push_back(send_edge);
+        }
+        if (config.rank < recv_edge.peer) {
+            connect_edges.push_back(recv_edge);
+        } else {
+            accept_edges.push_back(recv_edge);
         }
     }
-    LOG_INFO("Rank {}: will actively connect to {} peers, passively accept {} peers", config.rank, connect_peers.size(),
-             accept_peers.size());
+
+    LOG_INFO("Rank {}: will actively connect {} edges, passively accept {} edges", config.rank, connect_edges.size(),
+             accept_edges.size());
 
     const NodeInfo& my_info = all_nodes[config.rank];
-
     std::shared_ptr<Transport> listen_transport;
-    if (!accept_peers.empty()) {
+    if (!accept_edges.empty()) {
         listen_transport = std::make_shared<TransportTCP>();
-        if (!listen_transport || !listen_transport->Listen(my_info.data_port)) {
+        if (!listen_transport->Listen(my_info.data_port)) {
             LOG_ERROR("Rank {}: Failed to create listen transport on port {}", config.rank, my_info.data_port);
             return false;
         }
-        LOG_INFO("Rank {}: Listening on port {} for {} accept peers", config.rank, my_info.data_port,
-                 accept_peers.size());
+        LOG_INFO("Rank {}: Listening on port {} for {} accept edges", config.rank, my_info.data_port,
+                 accept_edges.size());
     }
 
     std::atomic<bool> error_occurred(false);
     std::thread connect_thread([&]() {
-        if (!connect_peers.empty()) {
-            if (!ConnectActivePeers(all_nodes, connect_peers, error_occurred)) {
+        if (!connect_edges.empty()) {
+            if (!ConnectActiveEdges(all_nodes, connect_edges, error_occurred)) {
                 error_occurred = true;
             }
         }
     });
     std::thread accept_thread([&]() {
-        if (!accept_peers.empty() && listen_transport) {
-            if (!AcceptPassivePeers(listen_transport, accept_peers, error_occurred)) {
+        if (!accept_edges.empty() && listen_transport) {
+            if (!AcceptPassiveEdges(listen_transport, accept_edges.size(), error_occurred)) {
                 error_occurred = true;
             }
         }
     });
     connect_thread.join();
     accept_thread.join();
+    if (listen_transport) {
+        listen_transport->Close();
+    }
     if (error_occurred) {
         return false;
     }
 
-    for (int peer : connect_peers) {
-        if (!SendOrFail(transports[peer].get(), &config.rank, sizeof(int), peer, "InitTransports")) {
-            return false;
-        }
-    }
-
-    LOG_INFO("Rank {}: All transports are init, with {} connect + {} accept = {} connections", config.rank,
-             connect_peers.size(), accept_peers.size(), transports.size());
+    LOG_INFO("Rank {}: All channel connections are init", config.rank);
     return true;
 }
 
-bool Communicator::ConnectActivePeers(const std::vector<NodeInfo>& all_nodes, const std::vector<int>& connect_peers,
-                                      std::atomic<bool>& error_occured) {
-    std::mutex transport_mutex;
+bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges,
+                                      std::atomic<bool>& error_occurred) {
+    std::mutex connector_mutex;
     std::vector<std::thread> threads;
 
-    for (int peer : connect_peers) {
-        threads.emplace_back([&, peer]() {
-            if (error_occured) {
+    for (const ChannelEdge& edge : edges) {
+        threads.emplace_back([&, edge]() {
+            if (error_occurred) {
                 return;
             }
 
-            const auto& peer_info = all_nodes[peer];
+            const auto& peer_info = all_nodes[edge.peer];
             auto transport = std::make_shared<TransportTCP>();
-            if (!transport) {
-                LOG_ERROR("Rank {}: Failed to create transport for connecting to rank {}", config.rank, peer);
-                error_occured = true;
-                return;
-            }
-
             bool connected = false;
             for (int retry = 0; retry < 30; ++retry) {
                 if (transport->Connect(peer_info.ip_addr, peer_info.data_port)) {
                     connected = true;
                     break;
                 }
-
-                LOG_DEBUG("Rank {}: Failed to connect to rank {}, retry {}/30", config.rank, peer, retry);
+                LOG_DEBUG("Rank {}: Failed to connect to rank {} channel {} retry {}/30", config.rank, edge.peer,
+                          edge.channel_id, retry);
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
             }
 
             if (!connected) {
-                LOG_ERROR("Rank {}: Failed to connect to rank {}:{} after 30 reties", config.rank, peer_info.ip_addr,
+                LOG_ERROR("Rank {}: Failed to connect to rank {}:{} after 30 retries", config.rank, peer_info.ip_addr,
                           peer_info.data_port);
-                error_occured = true;
+                error_occurred = true;
+                return;
+            }
+
+            ConnHandshake handshake;
+            handshake.rank = config.rank;
+            handshake.channel_id = edge.channel_id;
+            handshake.is_send = edge.is_send ? 1 : 0;
+            if (!transport->Send(&handshake, sizeof(handshake))) {
+                LOG_ERROR("Rank {}: Failed to send handshake to rank {} channel {}", config.rank, edge.peer,
+                          edge.channel_id);
+                error_occurred = true;
                 return;
             }
 
             {
-                std::lock_guard<std::mutex> lock(transport_mutex);
-                transports[peer] = transport;
+                std::lock_guard<std::mutex> lock(connector_mutex);
+                Connector* connector = FindConnector(edge.channel_id, edge.peer, edge.is_send);
+                if (!connector) {
+                    LOG_ERROR("Rank {}: No connector for peer {} channel {} is_send {}", config.rank, edge.peer,
+                              edge.channel_id, edge.is_send);
+                    error_occurred = true;
+                    return;
+                }
+                connector->transport = transport;
             }
         });
     }
@@ -194,62 +237,38 @@ bool Communicator::ConnectActivePeers(const std::vector<NodeInfo>& all_nodes, co
         }
     }
 
-    return !error_occured;
+    return !error_occurred;
 }
 
-bool Communicator::AcceptPassivePeers(const std::shared_ptr<Transport>& listen_transport,
-                                      const std::vector<int>& accept_peers, std::atomic<bool>& error_occured) {
-    std::mutex transports_mutex;
-    std::vector<std::thread> threads;
-
-    for (size_t i = 0; i < accept_peers.size(); ++i) {
-        threads.emplace_back([&, i]() {
-            if (error_occured) {
-                return;
-            }
-
-            auto transport = listen_transport->CreateAcceptedConnection();
-            if (!transport) {
-                LOG_ERROR("Rank {}: Failed to accept connection for {}/{}", config.rank, i + 1, accept_peers.size());
-                error_occured = true;
-                return;
-            }
-
-            int peer_rank = -1;
-            if (!RecvOrFail(transport.get(), &peer_rank, sizeof(int), -1, "AcceptPassivePeers")) {
-                error_occured = true;
-                return;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(transports_mutex);
-                transports[peer_rank] = transport;
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
+bool Communicator::AcceptPassiveEdges(const std::shared_ptr<Transport>& listen_transport, size_t accept_count,
+                                      std::atomic<bool>& error_occurred) {
+    for (size_t i = 0; i < accept_count; ++i) {
+        if (error_occurred) {
+            return false;
         }
+
+        auto transport = listen_transport->Accept();
+        if (!transport) {
+            LOG_ERROR("Rank {}: Failed to accept connection {}/{}", config.rank, i + 1, accept_count);
+            return false;
+        }
+
+        ConnHandshake handshake;
+        if (!transport->Recv(&handshake, sizeof(handshake))) {
+            LOG_ERROR("Rank {}: Failed to recv handshake on accept {}", config.rank, i);
+            return false;
+        }
+
+        bool peer_is_send = handshake.is_send != 0;
+        bool local_is_send = !peer_is_send;
+        Connector* connector = FindConnector(handshake.channel_id, handshake.rank, local_is_send);
+        if (!connector) {
+            LOG_ERROR("Rank {}: No connector for handshake peer {} channel {} local_is_send {}", config.rank,
+                      handshake.rank, handshake.channel_id, local_is_send);
+            return false;
+        }
+        connector->transport = transport;
     }
 
-    return !error_occured;
-}
-
-bool Communicator::SendOrFail(Transport* transport, const void* data, size_t size, int peer, const char* context) {
-    if (!transport->Send(data, size)) {
-        LOG_ERROR("Rank {}: {} - Failed to send to rank {}", config.rank, context, peer);
-        return false;
-    }
-    return true;
-}
-
-bool Communicator::RecvOrFail(Transport* transport, void* data, size_t size, int peer, const char* context) {
-    if (!transport->Recv(data, size)) {
-        LOG_ERROR("Rank {}: {} - Failed to recv from rank {}", config.rank, context, peer);
-        return false;
-    }
-    LOG_INFO("Rank {}: {} - Recv {} from rank {}", config.rank, context, size, peer);
     return true;
 }

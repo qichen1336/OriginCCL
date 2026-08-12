@@ -20,6 +20,8 @@ set(ORIGIN_CCL_SOURCES
     src/transport_tcp.cpp
     src/topology_ring.cpp
     src/bootstrap.cpp
+    src/planner.cpp
+    src/ring_executor.cpp
     src/communicator.cpp
 )
 

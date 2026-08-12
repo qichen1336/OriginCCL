@@ -12,8 +12,7 @@ public:
         return listen_port;
     }
 
-    bool Accept() override;
-    std::shared_ptr<Transport> CreateAcceptedConnection() override;
+    std::shared_ptr<Transport> Accept() override;
 
     bool Connect(const std::string& addr, uint16_t port) override;
 
@@ -25,13 +24,8 @@ public:
         return connected;
     }
 
-    void SetSocket(int fd);
-
-    int GetListenFd() const {
-        return listen_fd;
-    }
-
 private:
+    void SetSocket(int fd);
     bool SendRaw(const void* data, size_t size);
     bool RecvRaw(void* data, size_t size);
 
