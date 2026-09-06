@@ -11,16 +11,30 @@ void PrintUsage(const char* prog) {
     LOG_ERROR("  Open MPI:  mpirun -np <N> {}", prog);
 }
 
-bool GetOpenMPIEnv(int& rank, int& world_size) {
+// 通过环境变量依次为 config 各字段赋值（不存在该环境变量时保留默认值）。
+// 返回 true 表示检测到 OpenMPI 环境变量（由 mpirun 启动）。
+bool LoadConfigFromEnv(CommConfig& config) {
+    bool found = false;
+
     const char* ompi_rank = std::getenv("OMPI_COMM_WORLD_RANK");
     const char* ompi_size = std::getenv("OMPI_COMM_WORLD_SIZE");
     if (ompi_rank && ompi_size) {
-        rank = std::atoi(ompi_rank);
-        world_size = std::atoi(ompi_size);
-        return true;
+        config.rank = std::atoi(ompi_rank);
+        config.world_size = std::atoi(ompi_size);
+        found = true;
     }
 
-    return false;
+    const char* master_addr_env = std::getenv("OCCL_MASTER_ADDR");
+    if (master_addr_env && master_addr_env[0] != '\0') {
+        config.master_addr = master_addr_env;
+    }
+
+    const char* master_port_env = std::getenv("OCCL_MASTER_PORT");
+    if (master_port_env && master_port_env[0] != '\0') {
+        config.master_port = static_cast<uint16_t>(std::atoi(master_port_env));
+    }
+
+    return found;
 }
 
 bool TestAllReduce(Communicator& comm) {
@@ -53,34 +67,28 @@ bool TestAllReduce(Communicator& comm) {
 }
 
 int main(int argc, char* argv[]) {
-    int rank = 0;
-    int world_size = 1;
+    CommConfig config;
 
-    if (!GetOpenMPIEnv(rank, world_size)) {
+    if (!LoadConfigFromEnv(config)) {
         if (argc < 3) {
             PrintUsage(argv[0]);
             return 1;
         }
-        rank = std::atoi(argv[1]);
-        world_size = std::atoi(argv[2]);
+        config.rank = std::atoi(argv[1]);
+        config.world_size = std::atoi(argv[2]);
     }
 
-    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring", rank, world_size);
-
-    CommConfig config;
-    config.rank = rank;
-    config.world_size = world_size;
-    config.master_addr = "127.0.0.1";
-    config.master_port = 12321;
+    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring, master_addr={}, master_port={}",
+             config.rank, config.world_size, config.master_addr, config.master_port);
 
     Communicator comm;
     if (!comm.Init(config)) {
-        LOG_ERROR("Rank {}: Failed to init", rank);
+        LOG_ERROR("Rank {}: Failed to init", config.rank);
         return 1;
     }
-    LOG_INFO("Rank {}: Init", rank);
+    LOG_INFO("Rank {}: Init", config.rank);
 
-    LOG_INFO("Rank {}: Test AllReduce", rank);
+    LOG_INFO("Rank {}: Test AllReduce", config.rank);
     if (!TestAllReduce(comm)) {
         return 1;
     }
