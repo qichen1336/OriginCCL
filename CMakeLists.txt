@@ -9,9 +9,14 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -g")
 
 find_package(Threads REQUIRED)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/fmt/CMakeLists.txt")
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../third_party/fmt ${CMAKE_CURRENT_BINARY_DIR}/third_party/fmt EXCLUDE_FROM_ALL)
+# fmt is vendored inside the project (see third_party/fmt). This keeps the
+# dependency self-contained: anyone who clones this repo can build it offline.
+# Fall back to a system-installed fmt only if the vendored copy is missing.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt/CMakeLists.txt")
+    message(STATUS "Using vendored fmt: ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt ${CMAKE_CURRENT_BINARY_DIR}/third_party/fmt EXCLUDE_FROM_ALL)
 else()
+    message(STATUS "Vendored fmt not found, falling back to find_package(fmt)")
     find_package(fmt REQUIRED)
 endif()
 
