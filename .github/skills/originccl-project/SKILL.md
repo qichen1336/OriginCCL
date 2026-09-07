@@ -115,8 +115,8 @@ cmake --build build -j"$(nproc)"
 ```
 
 - 依赖 **fmt（必须 ≥9，logger.h 用了 `fmt::format_string` 编译期格式化检查）**，版本 10.2.1 已验证。
-- fmt 源码 **vendor 在项目内** `third_party/fmt/`（已 git 管理，clone 即可离线构建，无需系统预装）。
-- `CMakeLists.txt` 先查项目内 `third_party/fmt/CMakeLists.txt`，缺失才回落 `find_package(fmt REQUIRED)`（系统没装 fmt 时会失败）。
+- fmt 与 OpenMPI 一样是**系统依赖**：需预装并暴露 CMake package（`find_package(fmt)`），不再 vendor 进仓库。
+- `CMakeLists.txt` 直接 `find_package(fmt REQUIRED)`；系统没装 fmt（或版本 <9）时配置失败。
 - **OpenMPI 需预装**才能跑 mpirun 方式测试。
 - 产物：`build/liboriginccl.so`、`build/tests/test_allreduce`。
 
@@ -149,15 +149,16 @@ git diff --check
 
 - 本机：chenqi-VirtualBox，Ubuntu jammy（22.04），GCC 11.4，apt 源为内网镜像 rdsource.tp-link.com。
 - 已装 OpenMPI 4.1.2（`openmpi-bin` + `libopenmpi-dev`，`sudo apt-get install`）。
+- fmt 10.2.1 已从源码编译安装到 `/usr/local`（jammy 的 `libfmt-dev` 只有 8.1.1，过旧）。
 - sudo 需要密码（不能免密）；装系统包要提示用户在终端输入，不可经模型中转。
 - 网络：可达外网（GitHub 可下载）。
-- 迁移到新机器：`git clone` 后无需装 fmt（vendored），只需装 OpenMPI（`sudo apt-get install -y openmpi-bin libopenmpi-dev`）即可 `cmake .. && make`。
+- 迁移到新机器：`git clone` 后需预装 fmt ≥9 与 OpenMPI；jammy 需从 fmt 10.2.1 源码编译安装到 `/usr/local`（`cmake -S <fmt> -B build -DFMT_TEST=OFF -DFMT_DOC=OFF && cmake --build build && sudo cmake --install build`）。
 
 ## 常见排障
 
 | 症状 | 原因 / 处理 |
 |------|------|
-| `cmake ..` 报 `Could not find a package configuration file provided by "fmt"` | 项目内 `third_party/fmt/` 缺失或为空 → 从 fmt 官方 10.2.1 补全该目录（构建需 include/src/support/CMakeLists.txt） |
+| `cmake ..` 报 `Could not find a package configuration file provided by "fmt"` | 系统未装 fmt 或版本过低 → 从 fmt 官方 10.2.1 源码编译安装到 `/usr/local`（`cmake -S <fmt> -B build -DFMT_TEST=OFF -DFMT_DOC=OFF && cmake --build build && sudo cmake --install build`） |
 | `make run_test_allreduce` 不存在 | cmake 配置时 PATH 里没有 mpirun（`find_program` 失败）→ 安装 openmpi-bin 后重新 `cmake ..` |
 | 多进程跑起来后卡住/hang | rank0(master) 未先启动，或 bootstrap 端口（默认 12345）被占用；确认所有进程同时拉起 |
 | mpirun 下 `OMPI_COMM_WORLD_RANK` 读不到 | 用了非 Open MPI 的启动器（该测试只兼容 Open MPI） |

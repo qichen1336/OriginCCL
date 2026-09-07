@@ -9,16 +9,9 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -g")
 
 find_package(Threads REQUIRED)
 
-# fmt is vendored inside the project (see third_party/fmt). This keeps the
-# dependency self-contained: anyone who clones this repo can build it offline.
-# Fall back to a system-installed fmt only if the vendored copy is missing.
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt/CMakeLists.txt")
-    message(STATUS "Using vendored fmt: ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt")
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/fmt ${CMAKE_CURRENT_BINARY_DIR}/third_party/fmt EXCLUDE_FROM_ALL)
-else()
-    message(STATUS "Vendored fmt not found, falling back to find_package(fmt)")
-    find_package(fmt REQUIRED)
-endif()
+# fmt is a system dependency, managed the same way as OpenMPI: it must be
+# pre-installed and provide its CMake package (fmt >= 9 required, 10.2.1 verified).
+find_package(fmt REQUIRED)
 
 set(ORIGIN_CCL_SOURCES
     src/utils.cpp
