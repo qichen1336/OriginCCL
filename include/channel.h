@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 #include "transport.h"
 
 struct Ring {
@@ -20,20 +21,20 @@ class Channel {
 public:
     int id = 0;
     Ring ring;
-    Connector send;
-    Connector recv;
+    std::vector<Connector> send;
+    std::vector<Connector> recv;
 
     Connector* SendConnector(int peer) {
-        if (send.peer == peer) {
-            return &send;
+        if (peer < 0 || static_cast<size_t>(peer) >= send.size()) {
+            return nullptr;
         }
-        return nullptr;
+        return &send[static_cast<size_t>(peer)];
     }
 
     Connector* RecvConnector(int peer) {
-        if (recv.peer == peer) {
-            return &recv;
+        if (peer < 0 || static_cast<size_t>(peer) >= recv.size()) {
+            return nullptr;
         }
-        return nullptr;
+        return &recv[static_cast<size_t>(peer)];
     }
 };

@@ -68,13 +68,17 @@ void Communicator::Finalize() {
     executor.Shutdown();
 
     for (auto& channel : channels) {
-        if (channel.send.transport) {
-            channel.send.transport->Close();
-            channel.send.transport.reset();
+        for (auto& conn : channel.send) {
+            if (conn.transport) {
+                conn.transport->Close();
+                conn.transport.reset();
+            }
         }
-        if (channel.recv.transport) {
-            channel.recv.transport->Close();
-            channel.recv.transport.reset();
+        for (auto& conn : channel.recv) {
+            if (conn.transport) {
+                conn.transport->Close();
+                conn.transport.reset();
+            }
         }
     }
     channels.clear();

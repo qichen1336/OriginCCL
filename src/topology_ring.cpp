@@ -29,12 +29,17 @@ void TopologyRing::FillChannels(std::vector<Channel>& channels) const {
         channels[i].id = static_cast<int>(i);
         channels[i].ring.prev = GetPrevRank(rank);
         channels[i].ring.next = GetNextRank(rank);
-        channels[i].send.peer = channels[i].ring.next;
-        channels[i].send.channel_id = channels[i].id;
-        channels[i].send.is_send = true;
-        channels[i].recv.peer = channels[i].ring.prev;
-        channels[i].recv.channel_id = channels[i].id;
-        channels[i].recv.is_send = false;
+
+        channels[i].send.resize(static_cast<size_t>(world_size));
+        channels[i].recv.resize(static_cast<size_t>(world_size));
+        for (int peer = 0; peer < world_size; ++peer) {
+            channels[i].send[static_cast<size_t>(peer)].peer = peer;
+            channels[i].send[static_cast<size_t>(peer)].channel_id = channels[i].id;
+            channels[i].send[static_cast<size_t>(peer)].is_send = true;
+            channels[i].recv[static_cast<size_t>(peer)].peer = peer;
+            channels[i].recv[static_cast<size_t>(peer)].channel_id = channels[i].id;
+            channels[i].recv[static_cast<size_t>(peer)].is_send = false;
+        }
     }
 }
 
