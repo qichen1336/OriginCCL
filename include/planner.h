@@ -6,5 +6,5 @@ class Communicator;
 
 class Planner {
 public:
-    CollPlan Plan(const Communicator& comm, const CollTask& task) const;
+    CollPlan Plan(Communicator& comm, const CollTask& task) const;
 };

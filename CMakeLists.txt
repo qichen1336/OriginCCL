@@ -26,7 +26,7 @@ set(ORIGIN_CCL_SOURCES
     src/topology_ring.cpp
     src/bootstrap.cpp
     src/planner.cpp
-    src/ring_executor.cpp
+    src/multi_thread_executor.cpp
     src/communicator.cpp
 )
 

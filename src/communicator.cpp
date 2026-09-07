@@ -8,7 +8,7 @@
 #include "bootstrap.h"
 #include "transport_tcp.h"
 #include "topology_ring.h"
-#include "ring_executor.h"
+#include "multi_thread_executor.h"
 
 Communicator::Communicator() {}
 
@@ -65,6 +65,8 @@ bool Communicator::Init(const CommConfig& cfg) {
 }
 
 void Communicator::Finalize() {
+    executor.Shutdown();
+
     for (auto& channel : channels) {
         if (channel.send.transport) {
             channel.send.transport->Close();
@@ -99,7 +101,7 @@ bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count,
     task.op = op;
 
     CollPlan plan = planner.Plan(*this, task);
-    return RingExecutor::Run(*this, plan, task);
+    return executor.Run(plan);
 }
 
 Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {

@@ -3,7 +3,11 @@
 #include <string>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <vector>
+
+class Transport;
+class Topology;
 
 enum class DataType {
     FLOAT32,
@@ -21,10 +25,6 @@ enum class ReduceOp {
 
 enum class CollFunc {
     AllReduce
-};
-
-enum class Algorithm {
-    Ring
 };
 
 struct CommConfig {
@@ -54,14 +54,34 @@ struct CollTask {
     ReduceOp op = ReduceOp::SUM;
 };
 
-struct ChannelWork {
-    int channel_id = 0;
-    size_t elem_offset = 0;
+struct PlanTask {
+    CollFunc func = CollFunc::AllReduce;
+    const void* send_buf = nullptr;
+    void* recv_buf = nullptr;
     size_t elem_count = 0;
+    DataType dtype = DataType::FLOAT32;
+    ReduceOp reduce_op = ReduceOp::SUM;
+    int rank = 0;
+    int world_size = 1;
+    std::shared_ptr<Topology> topology;
+    std::shared_ptr<Transport> send_transport;
+    std::shared_ptr<Transport> recv_transport;
+};
+
+struct ChannelPlan {
+    explicit ChannelPlan(int id) : channel_id(id) {}
+
+    int channel_id;
+    std::vector<PlanTask> tasks;
 };
 
 struct CollPlan {
-    Algorithm algo = Algorithm::Ring;
-    int n_channels = 1;
-    std::vector<ChannelWork> works;
+    explicit CollPlan(int n_channels = 0) {
+        channels.reserve(static_cast<size_t>(n_channels));
+        for (int channel_id = 0; channel_id < n_channels; ++channel_id) {
+            channels.emplace_back(channel_id);
+        }
+    }
+
+    std::vector<ChannelPlan> channels;
 };

@@ -6,6 +6,7 @@
 #include "types.h"
 #include "channel.h"
 #include "planner.h"
+#include "multi_thread_executor.h"
 
 class Transport;
 class Topology;
@@ -26,6 +27,10 @@ public:
     }
     int GetNChannels() const {
         return static_cast<int>(channels.size());
+    }
+
+    std::shared_ptr<Topology> GetTopology() const {
+        return topology;
     }
 
     Channel& GetChannel(int channel_id);
@@ -58,4 +63,5 @@ private:
     std::shared_ptr<Topology> topology;
     std::vector<Channel> channels;
     Planner planner;
+    MultiThreadExecutor executor;
 };

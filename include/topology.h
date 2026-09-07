@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include "channel.h"
+#include "types.h"
 
 class Topology {
 public:
@@ -16,6 +17,8 @@ public:
     }
 
     virtual void FillChannels(std::vector<Channel>& channels) const = 0;
+
+    virtual bool AllReduce(const PlanTask& task) const = 0;
 
     virtual int DefaultChannelCount() const {
         return 1;

@@ -37,37 +37,39 @@ bool LoadConfigFromEnv(CommConfig& config) {
     return found;
 }
 
-bool TestAllReduce(Communicator& comm) {
+bool TestAllReduce(Communicator& comm, size_t count, ReduceOp op, const char* op_name) {
     int rank = comm.GetRank();
     int world_size = comm.GetWorldSize();
 
-    size_t count = 10;
-    std::vector<float> data(count);
+    std::vector<float> send_data(count);
+    std::vector<float> recv_data(count, 0.0f);
     for (size_t i = 0; i < count; ++i) {
-        data[i] = static_cast<float>(rank + 1);
+        send_data[i] = static_cast<float>(rank + 1);
     }
-    LOG_INFO("Rank {}: Original data filled with {} (count = {})", rank, data[0], count);
+    LOG_INFO("Rank {}: Original data filled with {} (count = {}, op = {})", rank, send_data[0], count, op_name);
 
-    if (!comm.AllReduce(data.data(), data.data(), count, DataType::FLOAT32, ReduceOp::SUM)) {
+    if (!comm.AllReduce(send_data.data(), recv_data.data(), count, DataType::FLOAT32, op)) {
         LOG_ERROR("Rank {}: Failed to AllReduce", rank);
         return false;
     }
 
-    float expected = static_cast<float>(world_size * (world_size + 1) / 2);
+    float expected = op == ReduceOp::AVG ? static_cast<float>(world_size + 1) / 2.0f
+                                         : static_cast<float>(world_size * (world_size + 1) / 2);
     for (size_t i = 0; i < count; ++i) {
-        if (data[i] != expected) {
+        if (recv_data[i] != expected) {
             LOG_ERROR("Rank {}: AllReduce verification failed at index {}, expected {}, got {}", rank, i, expected,
-                      data[i]);
+                      recv_data[i]);
             return false;
         }
     }
 
-    LOG_INFO("Rank {}: AllReduce verification passed (expected {})", rank, expected);
+    LOG_INFO("Rank {}: AllReduce {} verification passed (expected {})", rank, op_name, expected);
     return true;
 }
 
 int main(int argc, char* argv[]) {
     CommConfig config;
+    config.n_channels = 4;
 
     if (!LoadConfigFromEnv(config)) {
         if (argc < 3) {
@@ -88,9 +90,16 @@ int main(int argc, char* argv[]) {
     }
     LOG_INFO("Rank {}: Init", config.rank);
 
-    LOG_INFO("Rank {}: Test AllReduce", config.rank);
-    if (!TestAllReduce(comm)) {
+    if (!TestAllReduce(comm, 10, ReduceOp::SUM, "SUM")) {
         return 1;
+    }
+
+    for (int iteration = 0; iteration < 2; ++iteration) {
+        LOG_INFO("Rank {}: Test AllReduce iteration {}", config.rank, iteration);
+        if (!TestAllReduce(comm, 64 * 1024, ReduceOp::SUM, "SUM") ||
+            !TestAllReduce(comm, 64 * 1024, ReduceOp::AVG, "AVG")) {
+            return 1;
+        }
     }
 
     return 0;
