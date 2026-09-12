@@ -18,6 +18,7 @@
 #   --no-build         reuse the existing build directory as-is
 #   --build-dir <dir>  build directory (default: <repo>/build)
 #   --build-type <t>   CMAKE_BUILD_TYPE (coverage defaults to Debug, see below)
+#   --executor <name>  OCCL_EXECUTOR: multi_thread, epoll, or polling (default multi_thread)
 #   --timeout <secs>   per-tier timeout (default: 120)
 #   --allow-skip       a missing mpirun is a warning, not a failure exit
 #   -h, --help         this text
@@ -38,6 +39,7 @@ timeout_s=120
 do_build=1
 coverage=0
 allow_skip=0
+executor="multi_thread"
 
 usage() { sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -51,6 +53,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --build-type)
             build_type="$2"
+            shift
+            ;;
+        --executor)
+            executor="$2"
             shift
             ;;
         --timeout)
@@ -131,12 +137,12 @@ if [[ $do_build -eq 1 ]]; then
         cov_flag=OFF
     fi
 
-    configure_args=(-DOCCL_ENABLE_COVERAGE="$cov_flag")
+    configure_args=(-DOCCL_ENABLE_COVERAGE="$cov_flag" -DOCCL_EXECUTOR="$executor")
     if [[ -n "$build_type" ]]; then
         configure_args+=(-DCMAKE_BUILD_TYPE="$build_type")
     fi
 
-    echo "=== configuring (OCCL_ENABLE_COVERAGE=$cov_flag${build_type:+, CMAKE_BUILD_TYPE=$build_type})"
+    echo "=== configuring (OCCL_EXECUTOR=$executor, OCCL_ENABLE_COVERAGE=$cov_flag${build_type:+, CMAKE_BUILD_TYPE=$build_type})"
     cmake -S "$repo_root" -B "$build_dir" "${configure_args[@]}" > /dev/null
     echo "=== building with -j$n_cpu"
     cmake --build "$build_dir" -j"$n_cpu"

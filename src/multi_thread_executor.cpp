@@ -1,4 +1,5 @@
 #include <exception>
+#include <poll.h>
 #include "multi_thread_executor.h"
 #include "topology.h"
 #include "logger.h"
@@ -48,19 +49,71 @@ void MultiThreadExecutor::StopWorkers() {
     stop_ = false;
 }
 
-bool MultiThreadExecutor::ExecuteTask(int channel_id, const PlanTask& task) {
+bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
     if (!task.topology || !task.send_buf || !task.recv_buf || task.world_size <= 0) {
         LOG_ERROR("Executor received invalid task on channel {}", channel_id);
         return false;
     }
-
-    switch (task.func) {
-        case CollFunc::AllReduce:
-            return task.topology->AllReduce(task);
-        default:
-            LOG_ERROR("Executor received unsupported collective on channel {}", channel_id);
-            return false;
+    if (task.func != CollFunc::AllReduce) {
+        LOG_ERROR("Executor received unsupported collective on channel {}", channel_id);
+        return false;
     }
+
+    Topology* topo = task.topology.get();
+    if (!topo->AllreduceInit(task)) {
+        return false;
+    }
+
+    // Poll both the read and the write fd of this channel and feed each readiness event to
+    // AllreduceStep. Watching both means a blocked send never starves the matching recv,
+    // so no helper send thread is needed even when prev == next (2-rank degenerate).
+    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
+    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    while (!topo->AllreduceDone(task)) {
+        struct pollfd fds[2];
+        nfds_t nfds = 0;
+        if (read_fd >= 0) {
+            fds[nfds].fd = read_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            ++nfds;
+        }
+        if (write_fd >= 0 && write_fd != read_fd) {
+            fds[nfds].fd = write_fd;
+            fds[nfds].events = POLLOUT;
+            fds[nfds].revents = 0;
+            ++nfds;
+        }
+
+        if (nfds == 0) {
+            if (!topo->AllreduceStep(task, CollEvent::Readable)) {
+                return false;
+            }
+            continue;
+        }
+
+        int ready = poll(fds, nfds, -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG_ERROR("Executor poll failed on channel {}", channel_id);
+            return false;
+        }
+
+        // Feed every readiness event that fired. Within one step the send and the recv
+        // transfer proceed concurrently, so driving only one of them starves the other and
+        // deadlocks the 2-rank degenerate ring (prev == next).
+        for (nfds_t i = 0; i < nfds; ++i) {
+            if ((fds[i].revents & POLLOUT) != 0 && !topo->AllreduceStep(task, CollEvent::Writable)) {
+                return false;
+            }
+            if ((fds[i].revents & POLLIN) != 0 && !topo->AllreduceStep(task, CollEvent::Readable)) {
+                return false;
+            }
+        }
+    }
+    return topo->AllreduceSucceeded(task);
 }
 
 void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch_id) {
@@ -82,7 +135,8 @@ void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch
             const ChannelPlan& channel = plan->channels[channel_id];
             for (const PlanTask& task : channel.tasks) {
                 try {
-                    if (!ExecuteTask(channel.channel_id, task)) {
+                    // This worker exclusively owns its channel's task cursor for the batch.
+                    if (!ExecuteTask(channel.channel_id, const_cast<PlanTask&>(task))) {
                         success = false;
                         break;
                     }

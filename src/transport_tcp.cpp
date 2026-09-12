@@ -47,7 +47,7 @@ bool TransportTCP::Connect(const std::string& addr, uint16_t port) {
     }
 
     connected = true;
-    return true;
+    return SetNonBlocking();
 }
 
 bool TransportTCP::Send(const void* data, size_t size) {
@@ -83,6 +83,75 @@ void TransportTCP::Close() {
 void TransportTCP::SetSocket(int fd) {
     sockfd = fd;
     connected = true;
+    SetNonBlocking();
+}
+
+bool TransportTCP::SetNonBlocking() {
+    if (sockfd < 0) {
+        return false;
+    }
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        LOG_ERROR("Failed to set socket {} non-blocking", sockfd);
+        return false;
+    }
+    return true;
+}
+
+bool TransportTCP::TrySend(const void* data, size_t size, size_t* progress, bool* done) {
+    if (!connected || sockfd < 0) {
+        LOG_ERROR("Not connected to send");
+        return false;
+    }
+
+    const char* buffer = static_cast<const char*>(data);
+    while (*progress < size) {
+        ssize_t sent = send(sockfd, buffer + *progress, size - *progress, 0);
+        if (sent > 0) {
+            *progress += static_cast<size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            break;
+        }
+        if (sent == 0) {
+            LOG_INFO("Connection closed by peer when send");
+        } else {
+            LOG_ERROR("Failed to send: {}", strerror(errno));
+        }
+        return false;
+    }
+
+    *done = (*progress == size);
+    return true;
+}
+
+bool TransportTCP::TryRecv(void* data, size_t size, size_t* progress, bool* done) {
+    if (!connected || sockfd < 0) {
+        LOG_ERROR("Not connected to recv");
+        return false;
+    }
+
+    char* buffer = static_cast<char*>(data);
+    while (*progress < size) {
+        ssize_t recvd = recv(sockfd, buffer + *progress, size - *progress, 0);
+        if (recvd > 0) {
+            *progress += static_cast<size_t>(recvd);
+            continue;
+        }
+        if (recvd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            break;
+        }
+        if (recvd == 0) {
+            LOG_INFO("Connection closed by peer when recv");
+        } else {
+            LOG_ERROR("Failed to recv: {}", strerror(errno));
+        }
+        return false;
+    }
+
+    *done = (*progress == size);
+    return true;
 }
 
 bool TransportTCP::SendRaw(const void* data, size_t size) {
@@ -90,15 +159,19 @@ bool TransportTCP::SendRaw(const void* data, size_t size) {
     size_t total = 0;
     while (total < size) {
         ssize_t sent = send(sockfd, buffer + total, size - total, 0);
-        if (sent < 0) {
-            LOG_ERROR("Failed to send");
-            return false;
-        } else if (sent == 0) {
-            LOG_INFO("Connection closed by peer when send");
-            return false;
+        if (sent > 0) {
+            total += static_cast<size_t>(sent);
+            continue;
         }
-
-        total += sent;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            continue;
+        }
+        if (sent == 0) {
+            LOG_INFO("Connection closed by peer when send");
+        } else {
+            LOG_ERROR("Failed to send: {}", strerror(errno));
+        }
+        return false;
     }
 
     return true;
@@ -109,15 +182,19 @@ bool TransportTCP::RecvRaw(void* data, size_t size) {
     size_t total = 0;
     while (total < size) {
         ssize_t recvd = recv(sockfd, buffer + total, size - total, 0);
-        if (recvd < 0) {
-            LOG_ERROR("Failed to recv");
-            return false;
-        } else if (recvd == 0) {
-            LOG_INFO("Connection close by peer when recv");
-            return false;
+        if (recvd > 0) {
+            total += static_cast<size_t>(recvd);
+            continue;
         }
-
-        total += recvd;
+        if (recvd < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            continue;
+        }
+        if (recvd == 0) {
+            LOG_INFO("Connection close by peer when recv");
+        } else {
+            LOG_ERROR("Failed to recv: {}", strerror(errno));
+        }
+        return false;
     }
 
     return true;

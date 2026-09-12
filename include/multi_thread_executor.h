@@ -7,23 +7,25 @@
 #include <thread>
 #include <vector>
 #include "types.h"
+#include "executor.h"
+#include "topology.h"
 
-class MultiThreadExecutor {
+class MultiThreadExecutor : public Executor {
 public:
     MultiThreadExecutor() = default;
-    ~MultiThreadExecutor();
+    ~MultiThreadExecutor() override;
 
     MultiThreadExecutor(const MultiThreadExecutor&) = delete;
     MultiThreadExecutor& operator=(const MultiThreadExecutor&) = delete;
 
-    bool Run(const CollPlan& plan);
-    void Shutdown();
+    bool Run(const CollPlan& plan) override;
+    void Shutdown() override;
 
 private:
     bool EnsureWorkers(size_t channel_count);
     void StopWorkers();
     void WorkerLoop(size_t channel_id, uint64_t completed_batch_id);
-    bool ExecuteTask(int channel_id, const PlanTask& task);
+    bool ExecuteTask(int channel_id, PlanTask& task);
 
 private:
     std::vector<std::thread> workers_;

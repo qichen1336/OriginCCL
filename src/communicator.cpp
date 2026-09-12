@@ -8,7 +8,29 @@
 #include "bootstrap.h"
 #include "transport_tcp.h"
 #include "topology_ring.h"
+
+#if defined(OCCL_EXECUTOR_EPOLL)
+#include "epoll_executor.h"
+#elif defined(OCCL_EXECUTOR_POLLING)
+#include "polling_executor.h"
+#else
 #include "multi_thread_executor.h"
+#endif
+
+namespace {
+// The executor is a compile-time choice: exactly one OCCL_EXECUTOR_* macro is defined by
+// the build, so there is a single concrete type per library build and no runtime branch.
+#if defined(OCCL_EXECUTOR_EPOLL)
+constexpr const char* kExecutorName = "epoll";
+using DefaultExecutor = EpollExecutor;
+#elif defined(OCCL_EXECUTOR_POLLING)
+constexpr const char* kExecutorName = "polling";
+using DefaultExecutor = PollingExecutor;
+#else
+constexpr const char* kExecutorName = "multi_thread";
+using DefaultExecutor = MultiThreadExecutor;
+#endif
+} // namespace
 
 Communicator::Communicator() {}
 
@@ -29,8 +51,13 @@ bool Communicator::Init(const CommConfig& cfg) {
     channels.resize(static_cast<size_t>(n_channels));
     topology->FillChannels(channels);
 
-    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}", config.rank,
-             config.world_size, n_channels, topology->GetName());
+    if (!executor) {
+        executor = std::make_unique<DefaultExecutor>();
+    }
+
+    LOG_INFO(
+        "Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}, executor = {}",
+        config.rank, config.world_size, n_channels, topology->GetName(), kExecutorName);
 
     if (config.world_size <= 1) {
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
@@ -65,7 +92,9 @@ bool Communicator::Init(const CommConfig& cfg) {
 }
 
 void Communicator::Finalize() {
-    executor.Shutdown();
+    if (executor) {
+        executor->Shutdown();
+    }
 
     for (auto& channel : channels) {
         for (auto& conn : channel.send) {
@@ -105,7 +134,7 @@ bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count,
     task.op = op;
 
     CollPlan plan = planner.Plan(*this, task);
-    return executor.Run(plan);
+    return executor->Run(plan);
 }
 
 Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {

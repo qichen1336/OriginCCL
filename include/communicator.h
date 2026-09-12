@@ -6,7 +6,7 @@
 #include "types.h"
 #include "channel.h"
 #include "planner.h"
-#include "multi_thread_executor.h"
+#include "executor.h"
 
 class Transport;
 class Topology;
@@ -63,5 +63,5 @@ private:
     std::shared_ptr<Topology> topology;
     std::vector<Channel> channels;
     Planner planner;
-    MultiThreadExecutor executor;
+    std::unique_ptr<Executor> executor;
 };
