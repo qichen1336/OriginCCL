@@ -7,6 +7,18 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -g")
 
+# gcov instrumentation for the library and the tests. `--coverage` has to reach the
+# compile step, the shared-library link, and the executable link, otherwise the
+# counters are either absent or never flushed.
+# -fprofile-update=atomic is not optional here: MultiThreadExecutor runs one worker
+# thread per channel inside a single process and they all write the same .gcda.
+option(OCCL_ENABLE_COVERAGE "Build with gcov coverage instrumentation" OFF)
+if(OCCL_ENABLE_COVERAGE)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -fprofile-update=atomic")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --coverage")
+endif()
+
 find_package(Threads REQUIRED)
 
 # fmt is a system dependency, managed the same way as OpenMPI: it must be

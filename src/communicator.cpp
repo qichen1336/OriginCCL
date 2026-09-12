@@ -29,8 +29,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     channels.resize(static_cast<size_t>(n_channels));
     topology->FillChannels(channels);
 
-    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}",
-             config.rank, config.world_size, n_channels, topology->GetName());
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}", config.rank,
+             config.world_size, n_channels, topology->GetName());
 
     if (config.world_size <= 1) {
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
