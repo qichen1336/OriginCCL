@@ -131,6 +131,12 @@ relying on a summary here.
   with `LOG_ERROR` first, then `return false`.
 - Comments: `src/` and `include/` lean toward no comments — prefer names that carry the
   intent. This is a preference, not a ban.
+- Prefer modern C++17 idioms where they make intent clearer: `std::optional` for
+  values that may be absent, `std::variant` for type-safe alternatives, smart pointers
+  for ownership, and `std::promise` / `std::future` / `std::async` for async results.
+  The project is C++17, so avoid C++20-only features (`std::span`, `std::jthread`,
+  concepts, ranges). The rule above still holds: public entry points return `bool`, so
+  use `std::optional` and friends in internals.
 
 ## Names
 
