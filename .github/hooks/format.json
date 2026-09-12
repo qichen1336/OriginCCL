@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "bash .github/hooks/scripts/format-edited.sh",
+        "timeout": 20
+      }
+    ]
+  }
+}
