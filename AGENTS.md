@@ -167,6 +167,12 @@ If a change alters an architecture boundary, a build command, or the way tests a
 update `.github/skills/originccl-project/SKILL.md` in the same change. That file is the
 authority; this one is the map.
 
+An agent hook (`.github/hooks/skill.json`) enforces the habit: once a session has changed
+100+ lines under `src/`, `include/`, `tests/`, `CMakeLists.txt`, or `scripts/` without
+touching `.github/skills/`, it injects a reminder naming the reference file for each layer
+that changed. It only reminds — it never blocks. Editing any file under `.github/skills/`
+resets the counter.
+
 ## When in doubt
 
 - Match the style of the file you are editing. The tree is not perfectly uniform — for

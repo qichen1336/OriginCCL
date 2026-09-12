@@ -44,6 +44,16 @@ flowchart LR
 3. 删除被新实现取代的旧描述，避免互相矛盾。
 4. 保持精炼；优先更新既有条目，不追加流水账。
 
+### 自动提醒（`.github/hooks/skill.json`）
+
+`SessionStart` 记录 baseline commit，`PostToolUse` 按 session 累计度量。当 `src/`、`include/`、
+`tests/`、`CMakeLists.txt`、`scripts/` 的累计改动（增+删）达到 100 行，且 `.github/skills/` 全程未被
+改动时，hook 会向对话注入一段提醒，点名改动所在层应更新的 reference 文件。阈值可用环境变量
+`OCCL_SKILL_SYNC_LINES` 覆盖。
+
+一旦更新了本目录下任一文件，计数即重置；每次提醒后也重置，因此是「每满一批提醒一次」，不会逐次刷屏。
+这只是提醒，不阻塞操作——更新了知识库（哪怕是先补一句）它就会安静下来。
+
 ## 构建
 
 ```bash
