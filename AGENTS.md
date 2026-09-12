@@ -53,6 +53,12 @@ separation holds only if you keep it.
   concurrent `AllReduce` calls on the same `Communicator`. Do not assume it does.
 - **Keep the plan types in sync.** `PlanTask`, `ChannelPlan`, and `CollPlan` live in
   `include/types.h`. Changing a field means updating the planner and the executor both.
+- **Confirm before adding a class, especially a base class.** New classes — and above all
+  new abstract base classes — add architecture surface and coupling. Never introduce one
+  without explicit approval first. Prefer free functions or extending an existing type.
+- **Prefer the simplest design and implementation.** Make the smallest change that solves
+  the problem. Do not do large-scale rewrites, speculative abstractions, or drive-by
+  refactors unless explicitly asked.
 
 ## Performance (data path)
 
