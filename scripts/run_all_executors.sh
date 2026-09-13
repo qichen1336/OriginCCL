@@ -14,7 +14,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
-executors=(multi_thread epoll polling)
+executors=(multi_thread epoll polling reactor)
 failed=0
 
 for executor in "${executors[@]}"; do

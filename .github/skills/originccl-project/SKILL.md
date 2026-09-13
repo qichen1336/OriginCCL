@@ -35,7 +35,7 @@ flowchart LR
 
 核心分层原则：
 - **Topology 只做事件处理**（`AllreduceInit`/`AllreduceStep`/`AllreduceDone`/`AllreduceSucceeded`，非阻塞），**Executor 只决定如何等待 socket 就绪**。
-- 三种 executor 编译期选定：`MultiThreadExecutor`（默认）、`EpollExecutor`、`PollingExecutor`。
+- **四种 executor 编译期选定**：`MultiThreadExecutor`（默认）、`EpollExecutor`、`PollingExecutor`、`ReactorExecutor`。
 
 ## 使用后必须维护本 Skill
 
@@ -60,6 +60,7 @@ flowchart LR
 cmake -S . -B build                          # 默认 multi_thread executor
 cmake -S . -B build-epoll -DOCCL_EXECUTOR=epoll
 cmake -S . -B build-polling -DOCCL_EXECUTOR=polling
+cmake -S . -B build-reactor -DOCCL_EXECUTOR=reactor
 cmake --build build -j"$(nproc)"
 ```
 
@@ -72,7 +73,7 @@ cmake --build build -j"$(nproc)"
 ## 运行测试
 
 ```bash
-scripts/run_all_executors.sh    # 三种 executor × 1/2/4 rank 全矩阵（推荐）
+scripts/run_all_executors.sh    # 四种 executor × 1/2/4 rank 全矩阵（推荐）
 scripts/run_tests.sh --executor epoll --build-dir build-epoll   # 单种 executor
 mpirun -np 2 build/tests/test_allreduce
 mpirun -np 4 build/tests/test_allreduce

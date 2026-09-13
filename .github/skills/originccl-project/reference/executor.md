@@ -11,13 +11,14 @@
 
 ## 编译期选定
 
-由 CMake `OCCL_EXECUTOR`（`multi_thread`/`epoll`/`polling`，默认 `multi_thread`）→ 编译宏 → `Communicator` 用 `#ifdef` 构造。一次构建一种，**无运行时切换接口**。
+由 CMake `OCCL_EXECUTOR`（`multi_thread`/`epoll`/`polling`/`reactor`，默认 `multi_thread`）→ 编译宏 → `Communicator` 用 `#ifdef` 构造。一次构建一种，**无运行时切换接口**。
 
-## 三种 executor
+## 四种 executor
 
 - **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；新 worker 以当前 batch id 初始化。每 worker `poll()` 自己 channel 的 read+write fd。
 - **EpollExecutor**：单线程把每 channel 队首 task 的 read+write fd 注册进一个 epoll；channel 内多 task 顺序推进。
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
+- **ReactorExecutor**：调用线程只跑 epoll，全部 `Allreduce*` 调用在 worker 池执行；worker 数由 `ReactorExecutor(size_t worker_count = 4)` 决定，`Communicator` 用默认 4。主线程用 mutex + condition_variable 的 FIFO 队列下发 job，worker 用 mutex + completion 队列加 eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
 
 ## 关键不变式（都曾踩过坑，勿回退）
 
@@ -25,6 +26,7 @@
 2. **epoll fd 跨 plan 复用**：task 完成必须 `EPOLL_CTL_DEL`，否则下个 plan `ADD` 报 EEXIST。
 3. **单 rank（无数据面）task 立即完成**：epoll 不注册 fd；启动时循环结算立即完成的 task，只有真等网络的才计入 active，否则 `epoll_wait(-1)` 永久阻塞。
 4. **生命周期**：`Communicator::Finalize` 先 `executor->Shutdown()`（多线程还需 join worker），再关闭 channel transport。
+5. **Reactor 的派发期间必须注销 fd**：fd 交给 worker 前 `EPOLL_CTL_DEL`，completion 返回 Waiting 后再注册。既避免 level-triggered epoll 在 worker 推进同一 task 时反复唤醒 reactor，也保证 `PlanTask.state` 单写者。`Run` 返回前必须 drain 完所有 in-flight job（异常路径用 `StopWorkers()` 兜底），否则 worker 会引用已销毁的局部 `CollPlan`。
 
 ## 文件
 
@@ -34,3 +36,4 @@
 | `src/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
 | `src/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `src/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
+| `src/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |

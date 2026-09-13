@@ -13,6 +13,8 @@
 #include "epoll_executor.h"
 #elif defined(OCCL_EXECUTOR_POLLING)
 #include "polling_executor.h"
+#elif defined(OCCL_EXECUTOR_REACTOR)
+#include "reactor_executor.h"
 #else
 #include "multi_thread_executor.h"
 #endif
@@ -26,6 +28,9 @@ using DefaultExecutor = EpollExecutor;
 #elif defined(OCCL_EXECUTOR_POLLING)
 constexpr const char* kExecutorName = "polling";
 using DefaultExecutor = PollingExecutor;
+#elif defined(OCCL_EXECUTOR_REACTOR)
+constexpr const char* kExecutorName = "reactor";
+using DefaultExecutor = ReactorExecutor;
 #else
 constexpr const char* kExecutorName = "multi_thread";
 using DefaultExecutor = MultiThreadExecutor;

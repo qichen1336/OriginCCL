@@ -1,0 +1,394 @@
+#include <errno.h>
+#include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <exception>
+#include <vector>
+#include "reactor_executor.h"
+#include "topology.h"
+#include "logger.h"
+
+namespace {
+// Channel slots are small indices, so a saturated tag can never collide with one.
+constexpr uint32_t kNotifyTag = 0xFFFFFFFFu;
+} // namespace
+
+ReactorExecutor::ReactorExecutor(size_t worker_count)
+    : worker_count_(worker_count > 0 ? worker_count : kDefaultWorkers) {}
+
+ReactorExecutor::~ReactorExecutor() {
+    Shutdown();
+}
+
+void ReactorExecutor::Shutdown() {
+    StopWorkers();
+    if (notify_fd_ >= 0) {
+        close(notify_fd_);
+        notify_fd_ = -1;
+    }
+    if (epoll_fd_ >= 0) {
+        close(epoll_fd_);
+        epoll_fd_ = -1;
+    }
+}
+
+// Stop and join every worker, then drop anything still queued. Run() calls this on a
+// fatal wait failure so that no worker can still hold a PlanTask pointer once Run
+// returns; Shutdown() relies on it too, before the channel transports go away.
+void ReactorExecutor::StopWorkers() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_ = true;
+    }
+    work_ready_.notify_all();
+
+    for (std::thread& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    workers_.clear();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::queue<WorkItem> no_work;
+    std::swap(work_queue_, no_work);
+    std::queue<Completion> no_completion;
+    std::swap(completions_, no_completion);
+    stop_ = false;
+}
+
+bool ReactorExecutor::EnsureEpoll() {
+    if (epoll_fd_ >= 0) {
+        return true;
+    }
+
+    epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) {
+        LOG_ERROR("Failed to create epoll instance: {}", strerror(errno));
+        return false;
+    }
+
+    // The completion eventfd shares the epoll instance with the transport fds, so one
+    // epoll_wait covers both readiness and worker results.
+    notify_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (notify_fd_ < 0) {
+        LOG_ERROR("Failed to create reactor eventfd: {}", strerror(errno));
+        close(epoll_fd_);
+        epoll_fd_ = -1;
+        return false;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.u32 = kNotifyTag;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, notify_fd_, &ev) < 0) {
+        LOG_ERROR("Failed to register reactor eventfd: {}", strerror(errno));
+        close(notify_fd_);
+        notify_fd_ = -1;
+        close(epoll_fd_);
+        epoll_fd_ = -1;
+        return false;
+    }
+    return true;
+}
+
+bool ReactorExecutor::EnsureWorkers() {
+    if (!workers_.empty()) {
+        return true;
+    }
+
+    try {
+        workers_.reserve(worker_count_);
+        for (size_t i = 0; i < worker_count_; ++i) {
+            workers_.emplace_back(&ReactorExecutor::WorkerLoop, this);
+        }
+    } catch (const std::system_error& error) {
+        LOG_ERROR("Failed to create reactor worker: {}", error.what());
+        StopWorkers();
+        return false;
+    }
+    return true;
+}
+
+// Register a task's fds in epoll. Both read and write are always watched; the fired event
+// is forwarded to the worker running the step. The slot index travels in data.u32 so an
+// event maps straight back to its channel without any lookup structure.
+bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
+    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
+    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+
+    if (read_fd >= 0) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        if (write_fd == read_fd) {
+            ev.events |= EPOLLOUT;
+        }
+        ev.data.u32 = static_cast<uint32_t>(slot);
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, read_fd, &ev) < 0) {
+            LOG_ERROR("epoll_ctl ADD read fd {} failed: {}", read_fd, strerror(errno));
+            return false;
+        }
+    }
+    if (write_fd >= 0 && write_fd != read_fd) {
+        struct epoll_event ev;
+        ev.events = EPOLLOUT;
+        ev.data.u32 = static_cast<uint32_t>(slot);
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, write_fd, &ev) < 0) {
+            LOG_ERROR("epoll_ctl ADD write fd {} failed: {}", write_fd, strerror(errno));
+            return false;
+        }
+    }
+    return true;
+}
+
+// Remove a task's fds from epoll. Channel transports are reused across plans, so a
+// finished or in-flight task must be deregistered before the fds are registered again,
+// otherwise EPOLL_CTL_ADD fails with EEXIST.
+void ReactorExecutor::UnregisterTask(const PlanTask& task) {
+    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
+    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    if (read_fd >= 0) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, read_fd, nullptr);
+    }
+    if (write_fd >= 0 && write_fd != read_fd) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, write_fd, nullptr);
+    }
+}
+
+void ReactorExecutor::PostWork(const WorkItem& item) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        work_queue_.push(item);
+    }
+    work_ready_.notify_one();
+}
+
+// The completion must reach the queue before the eventfd is written: the reactor drains
+// the eventfd first, so a wakeup without a visible completion would be lost.
+void ReactorExecutor::PostCompletion(const Completion& completion) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        completions_.push(completion);
+    }
+    uint64_t one = 1;
+    ssize_t written = write(notify_fd_, &one, sizeof(one));
+    (void)written;
+}
+
+void ReactorExecutor::DrainNotify() {
+    uint64_t value = 0;
+    while (read(notify_fd_, &value, sizeof(value)) > 0) {}
+}
+
+void ReactorExecutor::WorkerLoop() {
+    while (true) {
+        WorkItem item;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            work_ready_.wait(lock, [this]() { return stop_ || !work_queue_.empty(); });
+            if (stop_) {
+                return;
+            }
+            item = work_queue_.front();
+            work_queue_.pop();
+        }
+
+        Completion completion;
+        completion.slot = item.slot;
+        completion.init = item.init;
+
+        try {
+            Topology* topo = item.task->topology.get();
+            bool ok = topo != nullptr;
+            if (ok && item.init) {
+                ok = topo->AllreduceInit(*item.task);
+            } else if (ok) {
+                // Feed every readiness bit carried by this job. A single step's send and
+                // recv transfers must both advance: 2-rank rings degenerate to
+                // prev == next, so starving the matching recv deadlocks.
+                if ((item.events & EPOLLOUT) != 0) {
+                    ok = topo->AllreduceStep(*item.task, CollEvent::Writable);
+                }
+                if (ok && (item.events & EPOLLIN) != 0) {
+                    ok = topo->AllreduceStep(*item.task, CollEvent::Readable);
+                }
+            }
+
+            if (!ok) {
+                completion.state = JobState::Failed;
+            } else if (topo->AllreduceDone(*item.task)) {
+                completion.state = topo->AllreduceSucceeded(*item.task) ? JobState::Done : JobState::Failed;
+            } else {
+                completion.state = JobState::Waiting;
+            }
+        } catch (const std::exception& error) {
+            LOG_ERROR("Reactor worker failed on channel {}: {}", item.slot, error.what());
+            completion.state = JobState::Failed;
+        } catch (...) {
+            LOG_ERROR("Reactor worker failed on channel {} with an unknown exception", item.slot);
+            completion.state = JobState::Failed;
+        }
+
+        PostCompletion(completion);
+    }
+}
+
+bool ReactorExecutor::Run(const CollPlan& plan) {
+    if (plan.channels.empty()) {
+        return true;
+    }
+    if (!EnsureEpoll() || !EnsureWorkers()) {
+        return false;
+    }
+
+    // One outstanding task per channel keeps the loop free of cross-channel head-of-line
+    // blocking. The reactor thread owns these cursors and is the only writer; a worker
+    // sees a task only through the WorkItem it was handed.
+    const size_t channel_count = plan.channels.size();
+    std::vector<PlanTask*> current(channel_count, nullptr);
+    std::vector<size_t> task_index(channel_count, 0);
+    std::vector<bool> channel_ok(channel_count, true);
+    size_t active = 0;
+    size_t in_flight = 0;
+    bool failed = false;
+
+    // Queue a channel's front task. AllreduceInit runs on a worker like any other step,
+    // so the reactor thread never calls into a topology itself.
+    auto start_next = [&](size_t slot) {
+        while (channel_ok[slot] && task_index[slot] < plan.channels[slot].tasks.size()) {
+            PlanTask& task = const_cast<PlanTask&>(plan.channels[slot].tasks[task_index[slot]]);
+            if (!task.topology) {
+                LOG_ERROR("Reactor executor received a task without topology on channel {}", slot);
+                channel_ok[slot] = false;
+                return;
+            }
+            ++task_index[slot];
+            current[slot] = &task;
+            ++in_flight;
+            PostWork(WorkItem{slot, &task, true, 0});
+            return;
+        }
+    };
+
+    for (size_t slot = 0; slot < channel_count; ++slot) {
+        start_next(slot);
+    }
+
+    std::vector<struct epoll_event> events(channel_count * 2 + 1);
+    while (active > 0 || in_flight > 0) {
+        int ready = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG_ERROR("Reactor epoll_wait failed: {}", strerror(errno));
+            // There is no safe way to keep waiting. The plan is local to this call, so
+            // tear the workers down before returning rather than leave a job holding a
+            // PlanTask pointer.
+            failed = true;
+            StopWorkers();
+            in_flight = 0;
+            break;
+        }
+
+        // Merge readiness per slot first: the read and write fds of one channel are
+        // separate epoll entries that carry the same slot tag, and a single step must
+        // feed every bit that fired.
+        std::vector<uint32_t> ready_mask(channel_count, 0);
+        bool notify = false;
+        for (int e = 0; e < ready; ++e) {
+            uint32_t tag = events[e].data.u32;
+            if (tag == kNotifyTag) {
+                notify = true;
+                continue;
+            }
+            if (tag >= channel_count) {
+                continue;
+            }
+            ready_mask[tag] |= events[e].events;
+        }
+
+        // Hand every ready channel to the pool. The fds leave epoll for the duration of
+        // the step, so level-triggered epoll cannot keep reporting a writable socket
+        // while a worker is already advancing that task.
+        for (size_t slot = 0; slot < channel_count; ++slot) {
+            if (ready_mask[slot] == 0 || current[slot] == nullptr || !channel_ok[slot]) {
+                continue;
+            }
+            UnregisterTask(*current[slot]);
+            ++in_flight;
+            PostWork(WorkItem{slot, current[slot], false, ready_mask[slot]});
+        }
+
+        if (!notify) {
+            continue;
+        }
+
+        DrainNotify();
+
+        std::queue<Completion> completed;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::swap(completed, completions_);
+        }
+        while (!completed.empty()) {
+            Completion completion = completed.front();
+            completed.pop();
+            --in_flight;
+
+            size_t slot = completion.slot;
+            // A step job belongs to a channel already counted in `active`. An init job
+            // only joins that count once it turns out to need the network, which is what
+            // keeps a single-rank plan (every task completes immediately) out of an
+            // empty epoll_wait. Every path that retires the channel's current task has to
+            // return the count, or a lone channel keeps the loop alive forever.
+            const bool counted = !completion.init;
+
+            if (completion.state == JobState::Failed) {
+                if (counted) {
+                    --active;
+                }
+                channel_ok[slot] = false;
+                current[slot] = nullptr;
+                failed = true;
+                continue;
+            }
+
+            if (completion.state == JobState::Waiting) {
+                if (!RegisterTask(slot, *current[slot])) {
+                    if (counted) {
+                        --active;
+                    }
+                    channel_ok[slot] = false;
+                    current[slot] = nullptr;
+                    failed = true;
+                    continue;
+                }
+                if (!counted) {
+                    ++active;
+                }
+                continue;
+            }
+
+            // JobState::Done: settle this task and queue the channel's next one.
+            if (counted) {
+                --active;
+            }
+            current[slot] = nullptr;
+            start_next(slot);
+        }
+    }
+
+    // A channel still registered when the loop ends (reachable through the wait failure
+    // above) must be removed, or the next Run's EPOLL_CTL_ADD fails with EEXIST.
+    for (size_t slot = 0; slot < channel_count; ++slot) {
+        if (current[slot] != nullptr && channel_ok[slot]) {
+            UnregisterTask(*current[slot]);
+        }
+        if (!channel_ok[slot]) {
+            failed = true;
+        }
+    }
+    return !failed;
+}

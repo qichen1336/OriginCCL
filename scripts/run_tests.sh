@@ -18,7 +18,7 @@
 #   --no-build         reuse the existing build directory as-is
 #   --build-dir <dir>  build directory (default: <repo>/build)
 #   --build-type <t>   CMAKE_BUILD_TYPE (coverage defaults to Debug, see below)
-#   --executor <name>  OCCL_EXECUTOR: multi_thread, epoll, or polling (default multi_thread)
+#   --executor <name>  OCCL_EXECUTOR: multi_thread, epoll, polling, or reactor (default multi_thread)
 #   --timeout <secs>   per-tier timeout (default: 120)
 #   --allow-skip       a missing mpirun is a warning, not a failure exit
 #   -h, --help         this text
