@@ -179,3 +179,20 @@ resets the counter.
   example, `Communicator`'s private members carry no trailing `_` while
   `MultiThreadExecutor`'s do. Don't use that as an excuse for a drive-by refactor.
 - Read the skill before inventing a new pattern.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/<feature-slug>/` in this repo.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five labels, default names: `needs-triage`, `needs-info`, `ready-for-agent`,
+`ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See
+`docs/agents/domain.md`.
