@@ -196,3 +196,21 @@ Five labels, default names: `needs-triage`, `needs-info`, `ready-for-agent`,
 
 Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See
 `docs/agents/domain.md`.
+
+### Code navigation
+
+`.github/skills/originccl-project/SKILL.md` remains the authority on architecture and
+rules. This subsection is only about looking code up.
+
+When `graphify-out/graph.json` exists, answer "where is X", "what calls Y", "how does A
+reach B", and "explain the executor" from the graph before grepping:
+`python3 -m graphify query "<question>"`, `python3 -m graphify path "A" "B"`, or
+`python3 -m graphify explain "<concept>"`. They return a scoped subgraph, far smaller
+than raw search output. Use `python3 -m graphify`, not bare `graphify` — the console
+script is not on `PATH`.
+
+Fall back to ordinary search when the graph is absent, stale, or silent, when the
+question is about a line you are about to edit, or when the answer must quote code. Do
+not build or rebuild the graph on your own initiative: a full build is LLM-backed and
+expensive. Ask the user to run `/graphify`. `python3 -m graphify update .` is the
+code-only incremental path and costs no LLM calls.
