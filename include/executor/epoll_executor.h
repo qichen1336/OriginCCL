@@ -3,7 +3,7 @@
 #include <memory>
 #include <vector>
 #include "types.h"
-#include "executor.h"
+#include "executor/executor.h"
 #include "topology.h"
 
 // Single-threaded event-driven executor. One thread registers every channel's current

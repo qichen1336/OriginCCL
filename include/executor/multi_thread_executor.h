@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 #include "types.h"
-#include "executor.h"
+#include "executor/executor.h"
 #include "topology.h"
 
 class MultiThreadExecutor : public Executor {

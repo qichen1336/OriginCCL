@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 #include "types.h"
-#include "executor.h"
+#include "executor/executor.h"
 
 // Reactor executor: the calling thread only waits for readiness in epoll, and a pool of
 // worker threads runs every topology call. The reactor thread owns fd registration, the

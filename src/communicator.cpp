@@ -10,13 +10,13 @@
 #include "topology_ring.h"
 
 #if defined(OCCL_EXECUTOR_EPOLL)
-#include "epoll_executor.h"
+#include "executor/epoll_executor.h"
 #elif defined(OCCL_EXECUTOR_POLLING)
-#include "polling_executor.h"
+#include "executor/polling_executor.h"
 #elif defined(OCCL_EXECUTOR_REACTOR)
-#include "reactor_executor.h"
+#include "executor/reactor_executor.h"
 #else
-#include "multi_thread_executor.h"
+#include "executor/multi_thread_executor.h"
 #endif
 
 namespace {

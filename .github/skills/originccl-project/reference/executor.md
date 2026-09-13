@@ -1,6 +1,9 @@
-# Executor 层（`include/executor.h`、`*_executor.*`）
+# Executor 层（`include/executor/*.h`、`src/executor/*.cpp`）
 
 执行策略层。**只决定如何等待 socket 就绪**，算法推进交给 `Topology::AllreduceStep`。改动 executor 前阅读本文件。
+
+其他层仍是 `include/`、`src/` 平铺，只有 executor 单独成目录。头文件从 include 根限定引用，
+形如 `#include "executor/executor.h"`、`#include "executor/epoll_executor.h"`。
 
 ## 核心职责边界
 
@@ -32,8 +35,8 @@
 
 | 文件 | 职责 |
 |------|------|
-| `include/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
-| `src/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
-| `src/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
-| `src/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
-| `src/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |
+| `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
+| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
+| `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
+| `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
+| `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |

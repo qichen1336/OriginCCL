@@ -31,10 +31,10 @@ set(ORIGIN_CCL_SOURCES
     src/topology_ring.cpp
     src/bootstrap.cpp
     src/planner.cpp
-    src/multi_thread_executor.cpp
-    src/epoll_executor.cpp
-    src/polling_executor.cpp
-    src/reactor_executor.cpp
+    src/executor/multi_thread_executor.cpp
+    src/executor/epoll_executor.cpp
+    src/executor/polling_executor.cpp
+    src/executor/reactor_executor.cpp
     src/communicator.cpp
 )
 

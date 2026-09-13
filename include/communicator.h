@@ -6,7 +6,7 @@
 #include "types.h"
 #include "channel.h"
 #include "planner.h"
-#include "executor.h"
+#include "executor/executor.h"
 
 class Transport;
 class Topology;
