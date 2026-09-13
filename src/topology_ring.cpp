@@ -84,8 +84,7 @@ void CompleteStep(PlanTask& task) {
     if (s.phase == kPhaseReduceScatter) {
         size_t recv_count = ChunkElemCount(task.elem_count, chunk, RecvChunk(task));
         Utils::PerformReduce(s.temp_buffer.data(), data + static_cast<size_t>(RecvChunk(task)) * chunk * type_size,
-                             recv_count, task.dtype,
-                             task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
+                             recv_count, task.dtype, task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
     }
 
     ++s.step;
