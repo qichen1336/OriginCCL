@@ -7,6 +7,8 @@
 namespace Utils {
 std::string GetLocalIPAddress();
 
+std::string GetHostname();
+
 int CreateListenSocket(uint16_t port, uint16_t* actual_port = nullptr);
 
 int AcceptConnection(int listen_fd);

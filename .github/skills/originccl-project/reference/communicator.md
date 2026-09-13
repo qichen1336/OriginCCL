@@ -15,7 +15,17 @@ flowchart LR
 - **双端口分工**：`master_port`（默认与测试均 12345）只用于 bootstrap 握手；数据面每个进程临时 `Listen(0)` 取随机空闲 `data_port` 再广播。
 - **连边方向**：每 channel 连 prev/next 两条边；按 `rank < peer` 决定主动 connect、否则被动 accept（`InitChannels` 附近），避免启动死锁。**改这个方向会重新引入死锁**。
 - `n_channels` 默认 4（`config.n_channels<=0` 时取 `DefaultChannelCount()`）；初始化建全部 channel 连接，planner 按消息大小选用本次实际数量。
-- `world_size<=1` 时跳过数据面建连。
+- `world_size<=1` 时跳过数据面建连，并就地赋 local 默认值（见下）。
+
+## Local rank 视图
+
+`Communicator` 暴露本机视角：`GetLocalRank()`、`GetLocalSize()`、`GetLocalRanks()`、`IsSingleMachine()`。
+
+- **机器身份 = hostname**（`Utils::GetHostname()` → `gethostname()`），不是 IP：IP 有 `127.0.0.1` 特判且属数据面语义，hostname 与网络无关、单机多进程天然一致。
+- `NodeInfo` 携带 `hostname`（`EncodeNodeInfo`/`DecodeNodeInfo` 同步编解码），master 与 worker 各自在 bootstrap 时填入 `Utils::GetHostname()`，随节点信息广播给所有人。
+- `Init` 在 bootstrap 成功后**内联**分组（不抽纯函数）：取 `all_nodes[config.rank].hostname`，收集 hostname 相同的 rank、升序排序得 `local_ranks`；`local_size = local_ranks.size()`；`local_rank` = 自身 rank 在该向量中的下标；`is_single_machine = (local_size == world_size)`。
+- `world_size<=1` 提前返回路径赋默认值 `local_rank=0, local_size=1, local_ranks={0}, is_single_machine=true`——这是唯一拿不到 `all_nodes` 的分支。
+
 
 ## 执行链路
 
@@ -29,11 +39,11 @@ flowchart LR
 
 ## Bootstrap（`src/bootstrap.cpp`）
 
-rank0 为 master 监听 `config.master_port`，收齐各 rank 的 `NodeInfo`(rank/ip/data_port) 后广播给所有人。
+rank0 为 master 监听 `config.master_port`，收齐各 rank 的 `NodeInfo`(rank/ip/hostname/data_port) 后广播给所有人。
 
 ## 文件
 
 | 文件 | 职责 |
 |------|------|
-| `src/communicator.cpp` | `Init`（选 data_port → bootstrap → InitChannels）+ `#ifdef` 构造 executor + `Finalize` 顺序 |
-| `src/bootstrap.cpp` | master/节点信息交换 |
+| `src/communicator.cpp` | `Init`（选 data_port → bootstrap → local 分组 → InitChannels）+ `#ifdef` 构造 executor + `Finalize` 顺序 |
+| `src/bootstrap.cpp` | master/节点信息交换（含 hostname 采集） |

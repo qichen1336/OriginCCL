@@ -2,6 +2,7 @@
 #include <chrono>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 #include "communicator.h"
 #include "logger.h"
 #include "utils.h"
@@ -65,6 +66,10 @@ bool Communicator::Init(const CommConfig& cfg) {
         config.rank, config.world_size, n_channels, topology->GetName(), kExecutorName);
 
     if (config.world_size <= 1) {
+        local_rank = 0;
+        local_size = 1;
+        local_ranks = {0};
+        is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
         return true;
     }
@@ -86,6 +91,21 @@ bool Communicator::Init(const CommConfig& cfg) {
         return false;
     }
     LOG_INFO("Rank {}: Bootstrap is ready, get {} nodes info", config.rank, all_nodes.size());
+
+    const std::string& my_hostname = all_nodes[config.rank].hostname;
+    local_ranks.clear();
+    for (const auto& node : all_nodes) {
+        if (node.hostname == my_hostname) {
+            local_ranks.push_back(node.rank);
+        }
+    }
+    std::sort(local_ranks.begin(), local_ranks.end());
+    local_size = static_cast<int>(local_ranks.size());
+    auto self = std::find(local_ranks.begin(), local_ranks.end(), config.rank);
+    local_rank = static_cast<int>(std::distance(local_ranks.begin(), self));
+    is_single_machine = (local_size == config.world_size);
+    LOG_INFO("Rank {}: local_rank = {}, local_size = {}, single_machine = {}, hostname = {}", config.rank, local_rank,
+             local_size, is_single_machine, my_hostname);
 
     if (!InitChannels(all_nodes)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);

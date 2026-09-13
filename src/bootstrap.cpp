@@ -23,8 +23,10 @@ bool Bootstrap::RunMaster(const CommConfig& config, uint16_t data_port, std::vec
     all_nodes.resize(config.world_size);
 
     std::string local_ip = (config.master_addr == "127.0.0.1") ? "127.0.0.1" : Utils::GetLocalIPAddress();
-    all_nodes[0] = NodeInfo(0, local_ip, data_port);
-    LOG_INFO("Bootstrap - Master: Node Info - rank = 0, IP = {}, port = {}", local_ip, data_port);
+    std::string hostname = Utils::GetHostname();
+    all_nodes[0] = NodeInfo(0, local_ip, data_port, hostname);
+    LOG_INFO("Bootstrap - Master: Node Info - rank = 0, IP = {}, port = {}, hostname = {}", local_ip, data_port,
+             hostname);
 
     int listen_fd = Utils::CreateListenSocket(config.master_port);
     if (listen_fd < 0) {
@@ -78,14 +80,15 @@ bool Bootstrap::RunWorker(const CommConfig& config, uint16_t data_port, std::vec
     LOG_INFO("Bootstrap - Worker: Connect to master {}:{}", config.master_addr, config.master_port);
 
     std::string local_ip = (config.master_addr == "127.0.0.1") ? "127.0.0.1" : Utils::GetLocalIPAddress();
-    NodeInfo node_info(config.rank, local_ip, data_port);
+    std::string hostname = Utils::GetHostname();
+    NodeInfo node_info(config.rank, local_ip, data_port, hostname);
     if (!SendNodeInfo(sockfd, node_info)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to send Node Info to master", config.rank);
         close(sockfd);
         return false;
     }
-    LOG_INFO("Bootstrap - Worker: Send Node Info to master - rank = {}, IP = {}, port = {}", config.rank, local_ip,
-             data_port);
+    LOG_INFO("Bootstrap - Worker: Send Node Info to master - rank = {}, IP = {}, port = {}, hostname = {}",
+             config.rank, local_ip, data_port, hostname);
 
     if (!RecvAllNodes(sockfd, all_nodes)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to recv all Node Info from master", config.rank);

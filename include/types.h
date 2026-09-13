@@ -39,10 +39,12 @@ struct NodeInfo {
     int rank = 0;
     std::string ip_addr;
     uint16_t data_port = 0;
+    std::string hostname;
 
     NodeInfo() = default;
 
-    NodeInfo(int r, const std::string& ip, uint16_t port) : rank(r), ip_addr(ip), data_port(port) {}
+    NodeInfo(int r, const std::string& ip, uint16_t port, const std::string& host = std::string())
+        : rank(r), ip_addr(ip), data_port(port), hostname(host) {}
 };
 
 struct CollTask {

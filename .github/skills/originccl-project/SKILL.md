@@ -68,7 +68,7 @@ cmake --build build -j"$(nproc)"
 - fmt 与 OpenMPI 是**系统依赖**：需预装并暴露 CMake package（`find_package(fmt REQUIRED)`），不 vendor。
 - **OpenMPI 需预装**才能跑 mpirun 测试。
 - `OCCL_EXECUTOR` 取值非法时 cmake 配置即 `FATAL_ERROR`。
-- 产物：`build/liboriginccl.so`、`build/tests/test_allreduce`。
+- 产物：`build/liboriginccl.so`、`build/tests/test_allreduce`、`build/tests/test_local_info`。
 
 ## 运行测试
 
@@ -84,6 +84,10 @@ build/tests/test_allreduce <rank> <world_size>   # 手动模式，rank0 先启�
 - 独立 send/recv buffer 覆盖 out-of-place copy；两轮验证 SUM 与 AVG。rank i 填 `i+1`，SUM=`ws*(ws+1)/2`，AVG=`(ws+1)/2`。
 - 单进程 `0 1` 走无数据面路径（task 立即完成，epoll 不注册 fd）。
 - 测试只兼容 Open MPI（读 `OMPI_COMM_WORLD_RANK/SIZE`），否则回落 `argv[1]`=rank、`argv[2]`=world_size。
+
+`build/tests/test_local_info`（`make run_test_local_info`）单独验证本机视图：`Init` 后断言
+`local_rank == rank`、`local_size == world_size`、`single_machine == true`、`local_ranks == {0..ws-1}`，
+即单机场景下 local 视图退化为全局视图。多机正确性只能在真实多机环境验证，本地跑不出来。
 
 架构或并发改动后的最低验证矩阵：
 

@@ -8,6 +8,18 @@ target_include_directories(test_allreduce
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# Single-host assertions on the local rank view (local_rank / local_size / local_ranks /
+# single_machine). Multi-machine correctness is only meaningful on real multi-host setups.
+add_executable(test_local_info test_local_info.cpp)
+target_link_libraries(test_local_info
+    originccl
+    fmt::fmt
+)
+target_include_directories(test_local_info
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 # Rank/world_size come from Open MPI (OMPI_COMM_WORLD_RANK / OMPI_COMM_WORLD_SIZE).
 #   mpirun -np 2 ./test_allreduce
 # Or pass them manually:
@@ -22,5 +34,11 @@ if(MPIRUN_EXECUTABLE)
         DEPENDS test_allreduce originccl
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMENT "Run AllReduce test with Open MPI (2-rank tier only; run_tests.sh covers 1/2/4)"
+    )
+    add_custom_target(run_test_local_info
+        COMMAND ${MPIRUN_EXECUTABLE} -np 2 $<TARGET_FILE:test_local_info>
+        DEPENDS test_local_info originccl
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Run local-rank info test with Open MPI (single-host assertions)"
     )
 endif()

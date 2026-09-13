@@ -42,6 +42,16 @@ std::string GetLocalIPAddress() {
     return ret;
 }
 
+std::string GetHostname() {
+    char buffer[256] = {0};
+    if (gethostname(buffer, sizeof(buffer) - 1) != 0) {
+        LOG_ERROR("Failed to get hostname");
+        return std::string();
+    }
+    buffer[sizeof(buffer) - 1] = '\0';
+    return std::string(buffer);
+}
+
 int CreateListenSocket(uint16_t port, uint16_t* actual_port) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) {
@@ -259,6 +269,7 @@ void EncodeNodeInfo(std::vector<char>& buffer, const NodeInfo& node) {
     EncodeInt(buffer, node.rank);
     EncodeString(buffer, node.ip_addr);
     EncodeInt(buffer, node.data_port);
+    EncodeString(buffer, node.hostname);
 }
 
 NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
@@ -266,6 +277,7 @@ NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
     node.rank = DecodeInt(buffer, offset);
     node.ip_addr = DecodeString(buffer, offset);
     node.data_port = DecodeInt(buffer, offset);
+    node.hostname = DecodeString(buffer, offset);
     return node;
 }
 

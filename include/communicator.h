@@ -29,6 +29,19 @@ public:
         return static_cast<int>(channels.size());
     }
 
+    int GetLocalRank() const {
+        return local_rank;
+    }
+    int GetLocalSize() const {
+        return local_size;
+    }
+    const std::vector<int>& GetLocalRanks() const {
+        return local_ranks;
+    }
+    bool IsSingleMachine() const {
+        return is_single_machine;
+    }
+
     std::shared_ptr<Topology> GetTopology() const {
         return topology;
     }
@@ -64,4 +77,8 @@ private:
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;
+    int local_rank = 0;
+    int local_size = 1;
+    std::vector<int> local_ranks;
+    bool is_single_machine = true;
 };
