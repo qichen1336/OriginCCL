@@ -1,4 +1,6 @@
 /build/
 /build-*/
 
+.cache/
+
 graphify-out/
