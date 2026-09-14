@@ -87,6 +87,9 @@ struct PlanTask {
     const void* send_buf = nullptr;
     void* recv_buf = nullptr;
     size_t elem_count = 0;
+    // Elements per ring chunk for this slice: ceil(elem_count / world_size). The planner
+    // computes it once; the ring topology only reads it.
+    size_t chunk_size = 0;
     DataType dtype = DataType::FLOAT32;
     ReduceOp reduce_op = ReduceOp::SUM;
     int rank = 0;

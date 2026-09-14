@@ -18,10 +18,6 @@ size_t ChunkElemCount(size_t count, size_t chunk_size, int chunk_index) {
     return start >= count ? 0 : std::min(chunk_size, count - start);
 }
 
-size_t ChunkSize(const PlanTask& task) {
-    return (task.elem_count + static_cast<size_t>(task.world_size) - 1) / static_cast<size_t>(task.world_size);
-}
-
 // Recompute the current step's chunk indices from the cursor. Everything about a step's
 // layout is derivable from phase/step/rank, so the cursor does not store it.
 int SendChunk(const PlanTask& task) {
@@ -41,11 +37,11 @@ int RecvChunk(const PlanTask& task) {
 }
 
 size_t SendBytes(const PlanTask& task) {
-    return ChunkElemCount(task.elem_count, ChunkSize(task), SendChunk(task)) * Utils::GetDataTypeSize(task.dtype);
+    return ChunkElemCount(task.elem_count, task.chunk_size, SendChunk(task)) * Utils::GetDataTypeSize(task.dtype);
 }
 
 size_t RecvBytes(const PlanTask& task) {
-    return ChunkElemCount(task.elem_count, ChunkSize(task), RecvChunk(task)) * Utils::GetDataTypeSize(task.dtype);
+    return ChunkElemCount(task.elem_count, task.chunk_size, RecvChunk(task)) * Utils::GetDataTypeSize(task.dtype);
 }
 
 // ReduceScatter receives into the scratch buffer (folded in on completion); AllGather
@@ -56,12 +52,12 @@ char* RecvPtr(const PlanTask& task) {
         return const_cast<char*>(s.temp_buffer.data());
     }
     return static_cast<char*>(task.recv_buf) +
-           static_cast<size_t>(RecvChunk(task)) * ChunkSize(task) * Utils::GetDataTypeSize(task.dtype);
+           static_cast<size_t>(RecvChunk(task)) * task.chunk_size * Utils::GetDataTypeSize(task.dtype);
 }
 
 const char* SendPtr(const PlanTask& task) {
     return static_cast<const char*>(task.recv_buf) +
-           static_cast<size_t>(SendChunk(task)) * ChunkSize(task) * Utils::GetDataTypeSize(task.dtype);
+           static_cast<size_t>(SendChunk(task)) * task.chunk_size * Utils::GetDataTypeSize(task.dtype);
 }
 
 // Reset the per-step transfer progress in the cursor for the step just entered.
@@ -78,7 +74,7 @@ void BeginStep(PlanTask& task) {
 void CompleteStep(PlanTask& task) {
     CollOpState& s = task.state;
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
-    size_t chunk = ChunkSize(task);
+    size_t chunk = task.chunk_size;
     char* data = static_cast<char*>(task.recv_buf);
 
     if (s.phase == kPhaseReduceScatter) {
@@ -157,7 +153,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const {
         return false;
     }
 
-    s.temp_buffer.resize(ChunkSize(task) * type_size);
+    s.temp_buffer.resize(task.chunk_size * type_size);
     s.phase = kPhaseReduceScatter;
     s.step = 0;
     BeginStep(task);

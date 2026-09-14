@@ -41,6 +41,8 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
         plantask.reduce_op = task.op;
         plantask.rank = comm.GetRank();
         plantask.world_size = comm.GetWorldSize();
+        plantask.chunk_size =
+            (elem_count + static_cast<size_t>(plantask.world_size) - 1) / static_cast<size_t>(plantask.world_size);
         plantask.send_transport = send_conn ? send_conn->transport : nullptr;
         plantask.recv_transport = recv_conn ? recv_conn->transport : nullptr;
         channel.tasks.push_back(std::move(plantask));
