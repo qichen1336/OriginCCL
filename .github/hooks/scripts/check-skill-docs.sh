@@ -237,8 +237,8 @@ targets="$(changed_paths "${baseline}" \
 
 message="$(printf '%s\n' \
     "[skill-sync] 本会话已累计改动 ${delta} 行代码（阈值 ${kLineThreshold}），但 .github/skills/ 尚未更新。" \
-    "请按改动所在层更新对应知识库：${targets}" \
-    "规则见 .github/skills/originccl-project/SKILL.md 的「使用后必须维护本 Skill」。")"
+    "请按四段检查对应 reference：${targets}（核心职责边界 / 不变式与设计区间 / 文件介绍 / 修改原则）。" \
+    "规则见 .github/skills/originccl-project/SKILL.md 的「自我更新流程」。")"
 
 if [ "${have_jq}" -eq 1 ]; then
     jq -n --arg msg "${message}" \
