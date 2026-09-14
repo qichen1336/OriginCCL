@@ -58,7 +58,11 @@ separation holds only if you keep it.
   without explicit approval first. Prefer free functions or extending an existing type.
 - **Prefer the simplest design and implementation.** Make the smallest change that solves
   the problem. Do not do large-scale rewrites, speculative abstractions, or drive-by
-  refactors unless explicitly asked.
+  refactors unless explicitly asked. Write the direct, readable version: straight-line
+  logic beats an extra layer of functions. A helper called once, with no meaning of its
+  own, is indirection, not abstraction. Do not add `try`/`catch` for errors you cannot
+  handle, and do not use exceptions as control flow. Public entry points log with
+  `LOG_ERROR` and `return false`; internals return `bool` or `std::optional`.
 
 ## Performance (data path)
 
