@@ -29,7 +29,7 @@ flowchart LR
 
 ### 设计区间
 
-- `n_channels` 默认值可调：`config.n_channels<=0` 时取 `DefaultChannelCount()`（当前 4）；初始化建全部 channel 连接，planner 按消息大小选用本次实际数量。
+- `n_channels` 默认值可调：`config.n_channels<=0` 时取 `kDefaultChannelCount`（当前 4）；初始化建全部 channel 连接，planner 按消息大小选用本次实际数量。
 - 初始化内部步骤可重构，守住生命周期顺序即可。
 - local 分组可内联实现（现已在 `Init` 内联，不抽纯函数）：取 `all_nodes[config.rank].hostname`，收集 hostname 相同的 rank、升序排序得 `local_ranks`；`local_size = local_ranks.size()`；`local_rank` = 自身 rank 下标；`is_single_machine = (local_size == world_size)`。`world_size<=1` 提前返回赋 `local_rank=0, local_size=1, local_ranks={0}, is_single_machine=true`（唯一拿不到 `all_nodes` 的分支）。
 - executor 由编译宏选定（见 [executor.md](executor.md)），`Communicator` 用 `#ifdef` 构造，无运行时注入接口。

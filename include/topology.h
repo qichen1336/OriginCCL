@@ -31,10 +31,6 @@ public:
     virtual bool AllreduceStep(PlanTask& task, CollEvent event) const = 0;
     virtual bool AllreduceDone(const PlanTask& task) const = 0;
 
-    virtual int DefaultChannelCount() const {
-        return 1;
-    }
-
     const char* GetName() const {
         return topo_name.c_str();
     }

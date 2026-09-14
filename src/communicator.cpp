@@ -36,6 +36,9 @@ using DefaultExecutor = ReactorExecutor;
 constexpr const char* kExecutorName = "multi_thread";
 using DefaultExecutor = MultiThreadExecutor;
 #endif
+
+// Default number of channels when config.n_channels is unset or non-positive.
+constexpr int kDefaultChannelCount = 4;
 } // namespace
 
 Communicator::Communicator() {}
@@ -48,7 +51,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     config = cfg;
 
     topology = std::make_shared<TopologyRing>();
-    int n_channels = config.n_channels > 0 ? config.n_channels : topology->DefaultChannelCount();
+    int n_channels = config.n_channels > 0 ? config.n_channels : kDefaultChannelCount;
     if (!topology->Init(config.rank, config.world_size, n_channels)) {
         LOG_ERROR("Rank {}: Failed to init Topology", config.rank);
         return false;

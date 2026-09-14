@@ -31,7 +31,7 @@
 | 文件 | 职责 |
 |------|------|
 | `include/topology.h` | `Topology` 抽象基类 + 状态机接口 |
-| `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`、`DefaultChannelCount()=4` |
+| `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws` |
 
 ## 修改原则
 
