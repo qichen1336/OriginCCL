@@ -86,8 +86,18 @@ bool EpollExecutor::Run(const CollPlan& plan) {
     // executor owns each channel's cursor, so it steps tasks through a mutable reference.
     std::vector<PlanTask*> current(plan.channels.size(), nullptr);
     std::vector<size_t> task_index(plan.channels.size(), 0);
-    std::vector<bool> channel_ok(plan.channels.size(), true);
     size_t active = 0;
+
+    // A failure abandons the whole plan. Every fd still registered must leave epoll
+    // first: they belong to channel transports reused across plans, so a leftover
+    // registration makes the next plan's EPOLL_CTL_ADD fail with EEXIST.
+    auto abort_plan = [&]() {
+        for (PlanTask* task : current) {
+            if (task) {
+                UnregisterTask(*task);
+            }
+        }
+    };
 
     // Start a channel's front task and, while tasks complete immediately (the no-data-
     // plane single-rank path), keep advancing. Only a task that genuinely waits on the
@@ -102,7 +112,6 @@ bool EpollExecutor::Run(const CollPlan& plan) {
             }
             ++task_index[slot];
             if (topo->AllreduceDone(task)) {
-                channel_ok[slot] = channel_ok[slot] && topo->AllreduceSucceeded(task);
                 continue;
             }
             current[slot] = &task;
@@ -137,32 +146,32 @@ bool EpollExecutor::Run(const CollPlan& plan) {
             }
             Topology* topo = task->topology.get();
             // Feed every readiness bit that fired (a single event can carry both EPOLLIN
-            // and EPOLLOUT). Send and recv proceed concurrently within a step.
+            // and EPOLLOUT). Send and recv proceed concurrently within a step. A false
+            // return is the failure channel, so abandon the plan there and then instead of
+            // spinning on a task that can never reach a done state.
             if ((events[e].events & EPOLLOUT) != 0 && !topo->AllreduceStep(*task, CollEvent::Writable)) {
-                channel_ok[slot] = false;
+                LOG_ERROR("EpollExecutor step failed on channel {}", slot);
+                abort_plan();
+                return false;
             }
-            if (channel_ok[slot] && (events[e].events & EPOLLIN) != 0 &&
-                !topo->AllreduceStep(*task, CollEvent::Readable)) {
-                channel_ok[slot] = false;
+            if ((events[e].events & EPOLLIN) != 0 && !topo->AllreduceStep(*task, CollEvent::Readable)) {
+                LOG_ERROR("EpollExecutor step failed on channel {}", slot);
+                abort_plan();
+                return false;
             }
             if (!topo->AllreduceDone(*task)) {
                 continue;
             }
 
-            channel_ok[slot] = channel_ok[slot] && topo->AllreduceSucceeded(*task);
             --active;
             UnregisterTask(*task);
             current[slot] = nullptr;
-            if (channel_ok[slot] && !start(slot)) {
-                channel_ok[slot] = false;
+            if (!start(slot)) {
+                abort_plan();
+                return false;
             }
         }
     }
 
-    for (size_t i = 0; i < plan.channels.size(); ++i) {
-        if (!channel_ok[i]) {
-            return false;
-        }
-    }
     return true;
 }

@@ -76,7 +76,6 @@ bool PollingExecutor::Run(const CollPlan& plan) {
                 continue;
             }
 
-            channel_ok[i] = channel_ok[i] && topo->AllreduceSucceeded(*task);
             --active;
             current[i] = nullptr;
             progressed = true;

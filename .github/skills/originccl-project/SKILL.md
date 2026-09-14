@@ -34,7 +34,7 @@ flowchart LR
 两条独立链路：**执行**（上图）与**初始化**（`Communicator::Init` → TopologyRing → Bootstrap → InitChannels）。
 
 核心分层原则：
-- **Topology 只做事件处理**（`AllreduceInit`/`AllreduceStep`/`AllreduceDone`/`AllreduceSucceeded`，非阻塞），**Executor 只决定如何等待 socket 就绪**。
+- **Topology 只做事件处理**（`AllreduceInit`/`AllreduceStep`/`AllreduceDone`，非阻塞；失败经返回值上报），**Executor 只决定如何等待 socket 就绪**。
 - **四种 executor 编译期选定**：`MultiThreadExecutor`（默认）、`EpollExecutor`、`PollingExecutor`、`ReactorExecutor`。
 
 ## 使用后必须维护本 Skill

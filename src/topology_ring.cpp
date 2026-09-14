@@ -136,7 +136,6 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const {
 
     if (!task.send_buf || !task.recv_buf || task.world_size <= 0) {
         LOG_ERROR("Ring AllReduce received invalid task");
-        s.failed = true;
         return false;
     }
 
@@ -155,7 +154,6 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const {
 
     if (!task.send_transport || !task.recv_transport) {
         LOG_ERROR("Ring AllReduce received task without transports");
-        s.failed = true;
         return false;
     }
 
@@ -168,9 +166,6 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const {
 
 bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const {
     CollOpState& s = task.state;
-    if (s.failed) {
-        return false;
-    }
     if (s.phase == kPhaseUnstarted) {
         if (!AllreduceInit(task)) {
             return false;
@@ -182,14 +177,15 @@ bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const {
 
     // Advance only the transfer whose readiness fired. A send-fd writable event drives the
     // send; a recv-fd readable event drives the recv. Both run concurrently within a step.
+    // A false return is the failure channel; the executor abandons the collective on it.
     if (event == CollEvent::Writable && !s.send_done) {
         if (!task.send_transport->TrySend(SendPtr(task), SendBytes(task), &s.send_progress, &s.send_done)) {
-            s.failed = true;
+            LOG_ERROR("Ring AllReduce send failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
             return false;
         }
     } else if (event == CollEvent::Readable && !s.recv_done) {
         if (!task.recv_transport->TryRecv(RecvPtr(task), RecvBytes(task), &s.recv_progress, &s.recv_done)) {
-            s.failed = true;
+            LOG_ERROR("Ring AllReduce recv failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
             return false;
         }
     }
@@ -201,9 +197,5 @@ bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const {
 }
 
 bool TopologyRing::AllreduceDone(const PlanTask& task) const {
-    return task.state.phase == kPhaseDone || task.state.failed;
-}
-
-bool TopologyRing::AllreduceSucceeded(const PlanTask& task) const {
-    return task.state.phase == kPhaseDone && !task.state.failed;
+    return task.state.phase == kPhaseDone;
 }

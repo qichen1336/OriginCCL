@@ -113,7 +113,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
             }
         }
     }
-    return topo->AllreduceSucceeded(task);
+    return true;
 }
 
 void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch_id) {
