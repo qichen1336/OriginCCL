@@ -27,6 +27,7 @@
 失败不存于游标（Init/Step 返回值即错误通道）。
 
 chunk 布局/指针/字节数由 `phase/step/rank` **现算**（`SendChunk`/`RecvChunk`/`SendPtr`/`RecvPtr`/`SendBytes`/`RecvBytes` helper 在 `topology_ring.cpp` 匿名命名空间）。
+每 chunk 元素数 `task.chunk_size = ceil(elem_count / world_size)` 不是现算项：由 planner 计算并填入 `PlanTask`，拓扑只读。
 
 ## 关键不变式：一步内 send 与 recv 并发
 

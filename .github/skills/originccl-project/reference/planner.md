@@ -12,6 +12,7 @@
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`；planner 不重复赋值。
 - 每个 `ChannelPlan` 当前只含一条 `PlanTask`，携带 `CollFunc` 与 `shared_ptr<Topology>`。
 - `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、topology 指针、对应 channel 的 send/recv transport。
+- `PlanTask.chunk_size`（每 chunk 元素数 = `ceil(elem_count / world_size)`）由 planner 计算填入，拓扑只读。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
 - `PlanTask.topology` 复用 `comm.GetTopology()`；planner 不新建拓扑。
 
