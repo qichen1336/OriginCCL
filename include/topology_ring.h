@@ -15,10 +15,6 @@ public:
     bool AllreduceStep(PlanTask& task, CollEvent event) const override;
     bool AllreduceDone(const PlanTask& task) const override;
 
-    int DefaultChannelCount() const override {
-        return 4;
-    }
-
     int GetPrevRank(int r) const;
     int GetNextRank(int r) const;
 };
