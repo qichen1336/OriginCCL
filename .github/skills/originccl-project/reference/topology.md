@@ -15,13 +15,16 @@
   - `CollEvent::Writable` → 推进 send（`TrySend`）。
   - `CollEvent::Readable` → 推进 recv（`TryRecv`）。
   - 只推进对应传输，不盲目两试。一步的 send+recv 都完成则 `CompleteStep`。
-- `AllreduceDone` / `AllreduceSucceeded`：完成与结果查询。
+- `AllreduceDone`：**仅表示成功完成**（`phase == kPhaseDone`）。失败的 task 永远不会 done。
+- **错误只有一个通道**：`AllreduceInit`/`AllreduceStep` 返回 `false` 即失败，拓扑内已 `LOG_ERROR`；
+  executor 见到 false 立即放弃该次集合，而不是等一个永不到来的 done。故没有单独的"结果查询"接口。
 - Topology 不暴露 WantRead/WantWrite——executor 默认对 read+write fd 都监听。
 
 ## 算法游标 `CollOpState`（`include/types.h`）
 
 纯数据、无回调、无 mutable。只存不可现算的最小状态：
-`phase, step, failed, send_progress, recv_progress, send_done, recv_done, temp_buffer`。
+`phase, step, send_progress, recv_progress, send_done, recv_done, temp_buffer`。
+失败不存于游标（Init/Step 返回值即错误通道）。
 
 chunk 布局/指针/字节数由 `phase/step/rank` **现算**（`SendChunk`/`RecvChunk`/`SendPtr`/`RecvPtr`/`SendBytes`/`RecvBytes` helper 在 `topology_ring.cpp` 匿名命名空间）。
 

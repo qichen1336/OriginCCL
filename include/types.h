@@ -70,10 +70,11 @@ enum class CollEvent {
 // prev == next, so serializing them deadlocks), hence each has its own byte progress and
 // done flag. Everything else (chunk layout, pointers, byte counts) is recomputed from
 // phase/step/rank on demand. No callbacks, so the plan stays free of std::function.
+// Failure is not part of the cursor: AllreduceInit/AllreduceStep return false and the
+// executor abandons the collective, so a cursor only ever holds a progressing operation.
 struct CollOpState {
     int phase = 0; // 0 = unstarted, 1 = reduce-scatter, 2 = all-gather, 3 = done
     int step = 0;
-    bool failed = false;
     size_t send_progress = 0;
     size_t recv_progress = 0;
     bool send_done = false;

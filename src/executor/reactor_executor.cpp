@@ -218,7 +218,7 @@ void ReactorExecutor::WorkerLoop() {
             if (!ok) {
                 completion.state = JobState::Failed;
             } else if (topo->AllreduceDone(*item.task)) {
-                completion.state = topo->AllreduceSucceeded(*item.task) ? JobState::Done : JobState::Failed;
+                completion.state = JobState::Done;
             } else {
                 completion.state = JobState::Waiting;
             }
