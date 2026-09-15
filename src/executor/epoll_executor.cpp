@@ -123,6 +123,7 @@ bool EpollExecutor::Run(const CollPlan& plan) {
 
     for (size_t i = 0; i < plan.channels.size(); ++i) {
         if (!start(i)) {
+            abort_plan();
             return false;
         }
     }
@@ -135,6 +136,7 @@ bool EpollExecutor::Run(const CollPlan& plan) {
                 continue;
             }
             LOG_ERROR("epoll_wait failed: {}", strerror(errno));
+            abort_plan();
             return false;
         }
 

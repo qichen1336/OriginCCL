@@ -27,8 +27,8 @@ public:
     // Init and Step report failure through their return value — that is the only error
     // channel, and the executor must abandon the collective as soon as it sees false.
     // Done therefore means "completed successfully"; a failed task never becomes done.
-    virtual bool AllreduceInit(PlanTask& task) const = 0;
-    virtual bool AllreduceStep(PlanTask& task, CollEvent event) const = 0;
+    virtual bool AllreduceInit(PlanTask& task) const noexcept = 0;
+    virtual bool AllreduceStep(PlanTask& task, CollEvent event) const noexcept = 0;
     virtual bool AllreduceDone(const PlanTask& task) const = 0;
 
     const char* GetName() const {

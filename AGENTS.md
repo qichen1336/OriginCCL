@@ -65,9 +65,14 @@ relying on a summary here.
   with fmt `{}` placeholders.
 - Public entry points return `bool` and do not throw across the API. On failure, log
   with `LOG_ERROR` first, then `return false`.
-- Comments: good code is self-documenting — prefer names that carry the intent, and do
-  not add long comment blocks unless necessary. `src/` and `include/` lean toward no
-  comments. This is a preference, not a ban.
+- **Comments: do not add comment blocks — good code is self-documenting.** This is the
+  most common way code added to this tree drifts from it. Prefer names that carry the
+  intent; `src/` and `include/` lean toward no comments at all. One short line is fine
+  when a non-obvious *why* must be recorded (a past deadlock, a system-call quirk, a
+  deliberate ordering constraint). What is not fine: restating what the adjacent code
+  already says, narrating the change you just made, or attaching a paragraph to a
+  function you touched. If a block feels necessary, the usual fix is a better name or a
+  smaller function.
 - Prefer modern C++17 idioms where they make intent clearer: `std::optional` for
   values that may be absent, `std::variant` for type-safe alternatives, smart pointers
   for ownership, and `std::promise` / `std::future` / `std::async` for async results.
@@ -113,6 +118,12 @@ Cross-layer rules:
   own, is indirection, not abstraction. Do not add `try`/`catch` for errors you cannot
   handle, and do not use exceptions as control flow. Public entry points log with
   `LOG_ERROR` and `return false`; internals return `bool` or `std::optional`.
+- **Do not add comment blocks.** Good code is self-documenting: let names carry the
+  intent instead of comments. `src/` and `include/` lean toward no comments. A single
+  short line is acceptable for a non-obvious *why* — a past deadlock, a kernel or
+  system-call quirk, a load-bearing ordering constraint. Explaining what the code
+  plainly does, or narrating the edit you just made, is not. When in doubt, delete the
+  comment and make the code say it.
 - **When adding code, reconsider what it can replace.** Before adding a feature, check
   whether existing code can be removed or simplified. Constrain the project's
   complexity: avoid over-engineering and over-encapsulation when there is no need.

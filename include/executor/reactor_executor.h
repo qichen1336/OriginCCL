@@ -57,7 +57,7 @@ private:
     };
 
     bool EnsureEpoll();
-    bool EnsureWorkers();
+    void EnsureWorkers();
     bool RegisterTask(size_t slot, const PlanTask& task);
     void UnregisterTask(const PlanTask& task);
     void PostWork(const WorkItem& item);

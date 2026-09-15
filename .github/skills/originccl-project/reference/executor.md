@@ -53,3 +53,5 @@
 - 勿回退：Finalize 先 `Shutdown()` 再关 transport。
 - 新增 executor 须实现 `Run`/`Shutdown`，只推进 `AllreduceStep`，不展开算法步骤。
 - executor 不改 `PlanTask` 的算法语义字段，只推进 `state`。
+- `AllreduceInit`/`AllreduceStep` 是 `noexcept`，`false` 是唯一可恢复失败通道：executor 见到 false 立即补打 channel + init/step 上下文日志，停止派发后续任务，清理自有资源（注销 fd、join worker）并让 `Run()` 返回 `false`，不调用 `exit()`。
+- worker 线程创建失败不再 try/catch 转换：`std::thread` 构造异常直接逃逸或终止，属不可恢复资源错误；epoll/eventfd 等系统调用失败仍是 `return false`。多线程执行器不提供在途 `poll` 的抢占式取消，已阻塞的 worker 需自然返回。

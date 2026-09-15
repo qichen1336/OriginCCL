@@ -17,7 +17,7 @@
 ### 不变式
 
 - **一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等对方 recv → **死锁**。所以"一步"不是原子状态：send/recv 各有独立 progress + done 标志。
-- **错误只有一个通道**：`AllreduceInit`/`AllreduceStep` 返回 `false` 即失败，拓扑内已 `LOG_ERROR`；executor 见到 false 立即放弃该次集合，而非等一个永不到来的 done。
+- **错误只有一个通道**：`AllreduceInit`/`AllreduceStep` 声明为 `noexcept`，返回 `false` 即失败，拓扑内已 `LOG_ERROR`；executor 见到 false 立即放弃该次集合，而非等一个永不到来的 done。可恢复失败只经 `false` 表达；意外抛出的 C++ 异常（如 `bad_alloc`）是致命错误，不再转换。
 - 状态机三件套接口固定（`AllreduceInit`/`AllreduceStep`/`AllreduceDone`），算法推进必须经由它们。
 
 ### 设计区间
