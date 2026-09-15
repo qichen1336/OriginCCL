@@ -47,7 +47,8 @@ private:
         size_t slot = 0;
         PlanTask* task = nullptr;
         bool init = false;
-        uint32_t events = 0;
+        bool readable = false;
+        bool writable = false;
     };
 
     struct Completion {
@@ -58,6 +59,7 @@ private:
 
     bool EnsureEpoll();
     void EnsureWorkers();
+    bool AddFd(int fd, uint32_t events, uint32_t tag);
     bool RegisterTask(size_t slot, const PlanTask& task);
     void UnregisterTask(const PlanTask& task);
     void PostWork(const WorkItem& item);

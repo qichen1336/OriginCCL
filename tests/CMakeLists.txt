@@ -8,6 +8,19 @@ target_include_directories(test_allreduce
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# Direct protocol test for the shared-memory transport: it forks a passive and an active
+# side, so it needs neither MPI nor a peer rank, and it covers the fd hand-over, streaming
+# a payload larger than the ring, backpressure and close propagation.
+add_executable(test_transport_shm test_transport_shm.cpp)
+target_link_libraries(test_transport_shm
+    originccl
+    fmt::fmt
+)
+target_include_directories(test_transport_shm
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 # Single-host assertions on the local rank view (local_rank / local_size / local_ranks /
 # single_machine). Multi-machine correctness is only meaningful on real multi-host setups.
 add_executable(test_local_info test_local_info.cpp)

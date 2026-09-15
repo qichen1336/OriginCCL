@@ -1,5 +1,7 @@
 #include <thread>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <atomic>
 #include <algorithm>
@@ -8,6 +10,7 @@
 #include "utils.h"
 #include "bootstrap.h"
 #include "transport_tcp.h"
+#include "transport_shm.h"
 #include "topology_ring.h"
 
 #if defined(OCCL_EXECUTOR_EPOLL)
@@ -64,9 +67,15 @@ bool Communicator::Init(const CommConfig& cfg) {
         executor = std::make_unique<DefaultExecutor>();
     }
 
-    LOG_INFO(
-        "Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = TCP, topology = {}, executor = {}",
-        config.rank, config.world_size, n_channels, topology->GetName(), kExecutorName);
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = auto (SHM on the same host, TCP "
+             "across hosts), topology = {}, executor = {}",
+             config.rank, config.world_size, n_channels, topology->GetName(), kExecutorName);
+
+    const char* disable_shm = std::getenv("OCCL_DISABLE_SHM");
+    shm_disabled = (disable_shm != nullptr && std::strcmp(disable_shm, "1") == 0);
+    if (shm_disabled) {
+        LOG_INFO("Rank {}: OCCL_DISABLE_SHM=1, every edge uses TCP", config.rank);
+    }
 
     if (config.world_size <= 1) {
         local_rank = 0;
@@ -77,15 +86,17 @@ bool Communicator::Init(const CommConfig& cfg) {
         return true;
     }
 
-    auto temp_transport = std::make_shared<TransportTCP>();
-    if (!temp_transport->Listen(0)) {
+    // This listener is kept for the whole initialization: it carries the TCP edges that are
+    // accepted passively, and while it stays bound nothing else can take this rank's data
+    // port, which is what makes the shared-memory rendezvous name derived from it unique.
+    auto data_listener = std::make_shared<TransportTCP>();
+    if (!data_listener->Listen(0)) {
         LOG_ERROR("Rank {}: Failed to listen to get the available port", config.rank);
         return false;
     }
 
-    uint16_t data_port = temp_transport->GetListenPort();
+    uint16_t data_port = data_listener->GetListenPort();
     LOG_INFO("Rank {}: Will use port {} for data plane", config.rank, data_port);
-    temp_transport->Close();
 
     Bootstrap bootstrap;
     std::vector<NodeInfo> all_nodes;
@@ -110,7 +121,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     LOG_INFO("Rank {}: local_rank = {}, local_size = {}, single_machine = {}, hostname = {}", config.rank, local_rank,
              local_size, is_single_machine, my_hostname);
 
-    if (!InitChannels(all_nodes)) {
+    if (!InitChannels(all_nodes, data_listener)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);
         return false;
     }
@@ -176,38 +187,47 @@ Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {
     return channel.RecvConnector(peer);
 }
 
-bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes) {
+bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
+                                const std::shared_ptr<Transport>& tcp_listener) {
+    const NodeInfo& my_info = all_nodes[config.rank];
+    const std::string& my_hostname = my_info.hostname;
+
     std::vector<ChannelEdge> connect_edges;
-    std::vector<ChannelEdge> accept_edges;
+    std::vector<ChannelEdge> accept_tcp_edges;
+    std::vector<ChannelEdge> accept_shm_edges;
 
     for (auto& channel : channels) {
-        ChannelEdge send_edge{channel.id, channel.ring.next, true};
-        ChannelEdge recv_edge{channel.id, channel.ring.prev, false};
-        if (config.rank < send_edge.peer) {
-            connect_edges.push_back(send_edge);
-        } else {
-            accept_edges.push_back(send_edge);
-        }
-        if (config.rank < recv_edge.peer) {
-            connect_edges.push_back(recv_edge);
-        } else {
-            accept_edges.push_back(recv_edge);
+        const ChannelEdge edges[2] = {{channel.id, channel.ring.next, true, false},
+                                      {channel.id, channel.ring.prev, false, false}};
+        for (const ChannelEdge& edge : edges) {
+            ChannelEdge classified = edge;
+            // An edge can carry a shared-memory ring only when both ranks run on this
+            // machine, and only when the whole job left that enabled: the switch is read
+            // per rank, so a job that sets it inconsistently is a configuration error
+            // rather than something to negotiate here.
+            classified.local = !shm_disabled && all_nodes[edge.peer].hostname == my_hostname;
+            LOG_INFO("Rank {}: channel {} {} edge to rank {} uses transport={}", config.rank, edge.channel_id,
+                     edge.is_send ? "send" : "recv", edge.peer, classified.local ? "SHM" : "TCP");
+            if (config.rank < edge.peer) {
+                connect_edges.push_back(classified);
+            } else if (classified.local) {
+                accept_shm_edges.push_back(classified);
+            } else {
+                accept_tcp_edges.push_back(classified);
+            }
         }
     }
 
-    LOG_INFO("Rank {}: will actively connect {} edges, passively accept {} edges", config.rank, connect_edges.size(),
-             accept_edges.size());
+    LOG_INFO("Rank {}: will actively connect {} edges, passively accept {} TCP and {} SHM edges", config.rank,
+             connect_edges.size(), accept_tcp_edges.size(), accept_shm_edges.size());
 
-    const NodeInfo& my_info = all_nodes[config.rank];
-    std::shared_ptr<Transport> listen_transport;
-    if (!accept_edges.empty()) {
-        listen_transport = std::make_shared<TransportTCP>();
-        if (!listen_transport->Listen(my_info.data_port)) {
-            LOG_ERROR("Rank {}: Failed to create listen transport on port {}", config.rank, my_info.data_port);
+    std::shared_ptr<Transport> shm_listener;
+    if (!accept_shm_edges.empty()) {
+        shm_listener = std::make_shared<TransportSHM>();
+        if (!shm_listener->Listen(my_info.data_port)) {
+            LOG_ERROR("Rank {}: Failed to listen for shared-memory edges on port {}", config.rank, my_info.data_port);
             return false;
         }
-        LOG_INFO("Rank {}: Listening on port {} for {} accept edges", config.rank, my_info.data_port,
-                 accept_edges.size());
     }
 
     std::atomic<bool> error_occurred(false);
@@ -218,17 +238,25 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes) {
             }
         }
     });
-    std::thread accept_thread([&]() {
-        if (!accept_edges.empty() && listen_transport) {
-            if (!AcceptPassiveEdges(listen_transport, accept_edges.size(), error_occurred)) {
-                error_occurred = true;
-            }
+    std::thread accept_tcp_thread([&]() {
+        if (!accept_tcp_edges.empty() && !AcceptPassiveEdges(tcp_listener, accept_tcp_edges.size(), error_occurred)) {
+            error_occurred = true;
+        }
+    });
+    std::thread accept_shm_thread([&]() {
+        if (!accept_shm_edges.empty() && !AcceptPassiveEdges(shm_listener, accept_shm_edges.size(), error_occurred)) {
+            error_occurred = true;
         }
     });
     connect_thread.join();
-    accept_thread.join();
-    if (listen_transport) {
-        listen_transport->Close();
+    accept_tcp_thread.join();
+    accept_shm_thread.join();
+    if (shm_listener) {
+        shm_listener->Close();
+    }
+    if (tcp_listener) {
+        // Nothing else accepted passively; the port lease is no longer needed either.
+        tcp_listener->Close();
     }
     if (error_occurred) {
         return false;
@@ -250,7 +278,14 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
             }
 
             const auto& peer_info = all_nodes[edge.peer];
-            auto transport = std::make_shared<TransportTCP>();
+            // A same-host edge carries a shared-memory ring, whose Connect() only needs the
+            // peer's data port: the rendezvous endpoint is host-local, named after it.
+            std::shared_ptr<Transport> transport;
+            if (edge.local) {
+                transport = std::make_shared<TransportSHM>();
+            } else {
+                transport = std::make_shared<TransportTCP>();
+            }
             bool connected = false;
             for (int retry = 0; retry < 30; ++retry) {
                 if (transport->Connect(peer_info.ip_addr, peer_info.data_port)) {

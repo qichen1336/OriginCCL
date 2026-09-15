@@ -3,7 +3,34 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include "executor/epoll_executor.h"
+#include "transport.h"
 #include "logger.h"
+
+namespace {
+// epoll carries only one u32 tag per registered fd, so the tag packs the channel slot
+// together with the direction(s) that fd drives. An event can then be turned back into the
+// logical CollEvent without any lookup structure.
+constexpr uint32_t kDirRecv = 1u;
+constexpr uint32_t kDirSend = 2u;
+constexpr uint32_t kDirMask = kDirRecv | kDirSend;
+constexpr uint32_t kDirShift = 2;
+
+uint32_t Tag(size_t slot, uint32_t dir) {
+    return (static_cast<uint32_t>(slot) << kDirShift) | dir;
+}
+
+uint32_t WaitInterest(WaitCondition condition) {
+    return condition == WaitCondition::Writable ? EPOLLOUT : EPOLLIN;
+}
+
+WaitDescriptor RecvWait(const PlanTask& task) {
+    return task.recv_transport ? task.recv_transport->RecvWait() : WaitDescriptor{};
+}
+
+WaitDescriptor SendWait(const PlanTask& task) {
+    return task.send_transport ? task.send_transport->SendWait() : WaitDescriptor{};
+}
+} // namespace
 
 EpollExecutor::~EpollExecutor() {
     Shutdown();
@@ -28,33 +55,37 @@ bool EpollExecutor::EnsureEpoll() {
     return true;
 }
 
-// Register a task's fds in epoll. Both read and write are always watched; the fired event
-// is forwarded to AllreduceStep. The slot index travels in data.u32 so an event maps
-// straight back to its task without any lookup structure.
-bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-
-    if (read_fd >= 0) {
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        if (write_fd == read_fd) {
-            ev.events |= EPOLLOUT;
-        }
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, read_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD read fd {} failed: {}", read_fd, strerror(errno));
-            return false;
-        }
+bool EpollExecutor::AddFd(int fd, uint32_t events, uint32_t tag) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.u32 = tag;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));
+        return false;
     }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, write_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD write fd {} failed: {}", write_fd, strerror(errno));
-            return false;
-        }
+    return true;
+}
+
+// Register a task's fds in epoll. Interest comes from each transport's readiness handle, so
+// a socket and a shared-memory notification fd are registered the same way. Both directions
+// are always watched; the fired event is forwarded to AllreduceStep.
+bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
+    const WaitDescriptor recv_wait = RecvWait(task);
+    const WaitDescriptor send_wait = SendWait(task);
+
+    // A transport may expose one fd for both directions. epoll accepts a single
+    // registration per fd, so those interests merge into one ADD tagged for both.
+    if (recv_wait.fd >= 0 && recv_wait.fd == send_wait.fd) {
+        return AddFd(recv_wait.fd, WaitInterest(recv_wait.condition) | WaitInterest(send_wait.condition),
+                     Tag(static_cast<size_t>(slot), kDirRecv | kDirSend));
+    }
+    if (recv_wait.fd >= 0 &&
+        !AddFd(recv_wait.fd, WaitInterest(recv_wait.condition), Tag(static_cast<size_t>(slot), kDirRecv))) {
+        return false;
+    }
+    if (send_wait.fd >= 0 &&
+        !AddFd(send_wait.fd, WaitInterest(send_wait.condition), Tag(static_cast<size_t>(slot), kDirSend))) {
+        return false;
     }
     return true;
 }
@@ -63,13 +94,13 @@ bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
 // so a finished task must be deregistered before the next plan re-adds them, otherwise
 // EPOLL_CTL_ADD fails with EEXIST.
 void EpollExecutor::UnregisterTask(const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-    if (read_fd >= 0) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, read_fd, nullptr);
+    const WaitDescriptor recv_wait = RecvWait(task);
+    const WaitDescriptor send_wait = SendWait(task);
+    if (recv_wait.fd >= 0) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, recv_wait.fd, nullptr);
     }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, write_fd, nullptr);
+    if (send_wait.fd >= 0 && send_wait.fd != recv_wait.fd) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, send_wait.fd, nullptr);
     }
 }
 
@@ -141,22 +172,31 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         }
 
         for (int e = 0; e < ready; ++e) {
-            size_t slot = events[e].data.u32;
+            const uint32_t tag = events[e].data.u32;
+            const size_t slot = tag >> kDirShift;
+            const uint32_t dir = tag & kDirMask;
+            if (slot >= plan.channels.size()) {
+                continue;
+            }
             PlanTask* task = current[slot];
             if (!task) {
                 continue;
             }
             Topology* topo = task->topology.get();
-            // Feed every readiness bit that fired (a single event can carry both EPOLLIN
-            // and EPOLLOUT). Send and recv proceed concurrently within a step. A false
-            // return is the failure channel, so abandon the plan there and then instead of
-            // spinning on a task that can never reach a done state.
-            if ((events[e].events & EPOLLOUT) != 0 && !topo->AllreduceStep(*task, CollEvent::Writable)) {
+            // Feed every direction carried by this registration whose readiness actually
+            // fired (one registration can carry both, and one event can set both bits). Send
+            // and recv proceed concurrently within a step. A false return is the failure
+            // channel, so abandon the plan there and then instead of spinning on a task that
+            // can never reach a done state.
+            const uint32_t fired = events[e].events;
+            if ((dir & kDirSend) != 0 && (fired & WaitInterest(SendWait(*task).condition)) != 0 &&
+                !topo->AllreduceStep(*task, CollEvent::Writable)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);
                 abort_plan();
                 return false;
             }
-            if ((events[e].events & EPOLLIN) != 0 && !topo->AllreduceStep(*task, CollEvent::Readable)) {
+            if ((dir & kDirRecv) != 0 && (fired & WaitInterest(RecvWait(*task).condition)) != 0 &&
+                !topo->AllreduceStep(*task, CollEvent::Readable)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);
                 abort_plan();
                 return false;

@@ -3,6 +3,20 @@
 #include "topology.h"
 #include "logger.h"
 
+namespace {
+short WaitInterest(WaitCondition condition) {
+    return condition == WaitCondition::Writable ? POLLOUT : POLLIN;
+}
+
+WaitDescriptor RecvWait(const PlanTask& task) {
+    return task.recv_transport ? task.recv_transport->RecvWait() : WaitDescriptor{};
+}
+
+WaitDescriptor SendWait(const PlanTask& task) {
+    return task.send_transport ? task.send_transport->SendWait() : WaitDescriptor{};
+}
+} // namespace
+
 MultiThreadExecutor::~MultiThreadExecutor() {
     StopWorkers();
 }
@@ -57,26 +71,40 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return false;
     }
 
-    // Poll both the read and the write fd of this channel and feed each readiness event to
-    // AllreduceStep. Watching both means a blocked send never starves the matching recv,
-    // so no helper send thread is needed even when prev == next (2-rank degenerate).
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    // Wait on each transport's readiness handle rather than a raw socket fd, so this loop
+    // drives a socket (send fd writable, recv fd readable) and a shared-memory ring (a
+    // readable notification fd in both directions) without knowing which one it got.
+    // Watching both means a blocked send never starves the matching recv, so no helper send
+    // thread is needed even when prev == next (2-rank degenerate).
+    const WaitDescriptor recv_wait = RecvWait(task);
+    const WaitDescriptor send_wait = SendWait(task);
     while (!topo->AllreduceDone(task)) {
         struct pollfd fds[2];
+        bool recv_on[2] = {false, false};
+        bool send_on[2] = {false, false};
         nfds_t nfds = 0;
-        if (read_fd >= 0) {
-            fds[nfds].fd = read_fd;
-            fds[nfds].events = POLLIN;
+        // Both directions may report the same fd (one handle for the whole edge); poll
+        // takes one entry per fd, so the interests are merged and the entry remembers which
+        // directions it drives.
+        auto add_wait = [&](const WaitDescriptor& wait, bool is_send) {
+            if (wait.fd < 0) {
+                return;
+            }
+            for (nfds_t i = 0; i < nfds; ++i) {
+                if (fds[i].fd == wait.fd) {
+                    fds[i].events |= WaitInterest(wait.condition);
+                    (is_send ? send_on[i] : recv_on[i]) = true;
+                    return;
+                }
+            }
+            fds[nfds].fd = wait.fd;
+            fds[nfds].events = WaitInterest(wait.condition);
             fds[nfds].revents = 0;
+            (is_send ? send_on[nfds] : recv_on[nfds]) = true;
             ++nfds;
-        }
-        if (write_fd >= 0 && write_fd != read_fd) {
-            fds[nfds].fd = write_fd;
-            fds[nfds].events = POLLOUT;
-            fds[nfds].revents = 0;
-            ++nfds;
-        }
+        };
+        add_wait(recv_wait, false);
+        add_wait(send_wait, true);
 
         if (nfds == 0) {
             if (!topo->AllreduceStep(task, CollEvent::Readable)) {
@@ -99,11 +127,16 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         // transfer proceed concurrently, so driving only one of them starves the other and
         // deadlocks the 2-rank degenerate ring (prev == next).
         for (nfds_t i = 0; i < nfds; ++i) {
-            if ((fds[i].revents & POLLOUT) != 0 && !topo->AllreduceStep(task, CollEvent::Writable)) {
+            if (fds[i].revents == 0) {
+                continue;
+            }
+            if (send_on[i] && (fds[i].revents & WaitInterest(send_wait.condition)) != 0 &&
+                !topo->AllreduceStep(task, CollEvent::Writable)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
-            if ((fds[i].revents & POLLIN) != 0 && !topo->AllreduceStep(task, CollEvent::Readable)) {
+            if (recv_on[i] && (fds[i].revents & WaitInterest(recv_wait.condition)) != 0 &&
+                !topo->AllreduceStep(task, CollEvent::Readable)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }

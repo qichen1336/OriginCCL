@@ -21,8 +21,12 @@ public:
 
     bool TrySend(const void* data, size_t size, size_t* progress, bool* done) override;
     bool TryRecv(void* data, size_t size, size_t* progress, bool* done) override;
-    int GetFd() const override {
-        return sockfd;
+    WaitDescriptor SendWait() const override {
+        return WaitDescriptor{sockfd, WaitCondition::Writable};
+    }
+
+    WaitDescriptor RecvWait() const override {
+        return WaitDescriptor{sockfd, WaitCondition::Readable};
     }
 
     void Close() override;

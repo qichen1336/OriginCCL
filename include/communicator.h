@@ -62,9 +62,10 @@ private:
         int channel_id = -1;
         int peer = -1;
         bool is_send = false;
+        bool local = false;
     };
 
-    bool InitChannels(const std::vector<NodeInfo>& all_nodes);
+    bool InitChannels(const std::vector<NodeInfo>& all_nodes, const std::shared_ptr<Transport>& tcp_listener);
     bool ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges,
                             std::atomic<bool>& error_occurred);
     bool AcceptPassiveEdges(const std::shared_ptr<Transport>& listen_transport, size_t accept_count,
@@ -81,4 +82,5 @@ private:
     int local_size = 1;
     std::vector<int> local_ranks;
     bool is_single_machine = true;
+    bool shm_disabled = false;
 };

@@ -22,6 +22,8 @@
 3. **单 rank（无数据面）task 立即完成**：epoll 不注册 fd；启动时循环结算立即完成的 task，只有真等网络的才计入 active，否则 `epoll_wait(-1)` 永久阻塞。
 4. **生命周期**：`Communicator::Finalize` 先 `executor->Shutdown()`（多线程还需 join worker），再关闭 channel transport。
 5. **Reactor 的派发期间必须注销 fd**：fd 交给 worker 前 `EPOLL_CTL_DEL`，completion 返回 Waiting 后再注册。既避免 level-triggered epoll 在 worker 推进同一 task 时反复唤醒 reactor，也保证 `PlanTask.state` 单写者。`Run` 返回前必须 drain 完所有 in-flight job（异常路径用 `StopWorkers()` 兜底），否则 worker 会引用已销毁的局部 `CollPlan`。
+6. **只认描述符，不认 fd 语义**：等待句柄来自 `task.recv_transport->RecvWait()` / `task.send_transport->SendWait()`，各返回 `{fd, condition}`；executor 把 condition 翻成 poll/epoll interest，把「该方向触发了」翻成 `CollEvent::Readable`/`Writable`。不得假设 fd 是 socket，也不得用 EPOLLIN/EPOLLOUT 反推方向（共享内存的发送方向也是「可读」）。
+7. **同一 fd 可能承载两个方向**：注册时按 fd 合并 interest，tag 里带上方向位（epoll 的 `data.u32 = slot << 2 | dir`），注销时对 fd 去重。
 
 ### 设计区间
 
@@ -31,8 +33,8 @@
 
 四种 executor 现状：
 
-- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；新 worker 以当前 batch id 初始化。每 worker `poll()` 自己 channel 的 read+write fd。
-- **EpollExecutor**：单线程把每 channel 队首 task 的 read+write fd 注册进一个 epoll；channel 内多 task 顺序推进。
+- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；新 worker 以当前 batch id 初始化。每 worker 把该 channel 两个方向的描述符合成 pollfd（同 fd 合并 interest）后 `poll()`。
+- **EpollExecutor**：单线程把每 channel 队首 task 的两个方向注册进一个 epoll（tag = slot + 方向位）；channel 内多 task 顺序推进。
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Allreduce*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job，worker 用 mutex + completion 队列加 eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
 
@@ -41,10 +43,10 @@
 | 文件 | 职责 |
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
-| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
-| `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
+| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，按描述符合并 interest，就绪事件全喂 Step，批次同步与错误汇总 |
+| `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，按描述符注册/注销与方向 tag 映射，就绪事件喂 Step |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
-| `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |
+| `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job（job 带逻辑 readiness 而非裸 event bits），eventfd 回收 completion |
 
 ## 修改原则
 

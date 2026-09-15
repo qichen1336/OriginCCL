@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <vector>
+#include <cstdint>
 #include "types.h"
 #include "executor/executor.h"
 #include "topology.h"
@@ -22,6 +23,7 @@ public:
 
 private:
     bool EnsureEpoll();
+    bool AddFd(int fd, uint32_t events, uint32_t tag);
     bool RegisterTask(int slot, const PlanTask& task);
     void UnregisterTask(const PlanTask& task);
 

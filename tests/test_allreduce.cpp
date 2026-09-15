@@ -80,7 +80,7 @@ int main(int argc, char* argv[]) {
         config.world_size = std::atoi(argv[2]);
     }
 
-    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring, master_addr={}, master_port={}",
+    LOG_INFO("Configuration: rank={}, world_size={}, transport=auto, topology=Ring, master_addr={}, master_port={}",
              config.rank, config.world_size, config.master_addr, config.master_port);
 
     Communicator comm;
@@ -100,6 +100,12 @@ int main(int argc, char* argv[]) {
             !TestAllReduce(comm, 64 * 1024, ReduceOp::AVG, "AVG")) {
             return 1;
         }
+    }
+
+    // With 4 channels and 4 ranks this leaves ~1.25 MiB per ring step, so a same-host edge
+    // has to stream through its ring instead of fitting every step in a single write.
+    if (!TestAllReduce(comm, 5 * 1024 * 1024, ReduceOp::SUM, "SUM")) {
+        return 1;
     }
 
     return 0;

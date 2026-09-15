@@ -5,12 +5,37 @@
 #include <unistd.h>
 #include <vector>
 #include "executor/reactor_executor.h"
+#include "transport.h"
 #include "topology.h"
 #include "logger.h"
 
 namespace {
 // Channel slots are small indices, so a saturated tag can never collide with one.
 constexpr uint32_t kNotifyTag = 0xFFFFFFFFu;
+
+// epoll carries only one u32 tag per registered fd, so the tag packs the channel slot
+// together with the direction(s) that fd drives. An event can then be turned back into the
+// logical CollEvent without any lookup structure.
+constexpr uint32_t kDirRecv = 1u;
+constexpr uint32_t kDirSend = 2u;
+constexpr uint32_t kDirMask = kDirRecv | kDirSend;
+constexpr uint32_t kDirShift = 2;
+
+uint32_t Tag(size_t slot, uint32_t dir) {
+    return (static_cast<uint32_t>(slot) << kDirShift) | dir;
+}
+
+uint32_t WaitInterest(WaitCondition condition) {
+    return condition == WaitCondition::Writable ? EPOLLOUT : EPOLLIN;
+}
+
+WaitDescriptor RecvWait(const PlanTask& task) {
+    return task.recv_transport ? task.recv_transport->RecvWait() : WaitDescriptor{};
+}
+
+WaitDescriptor SendWait(const PlanTask& task) {
+    return task.send_transport ? task.send_transport->SendWait() : WaitDescriptor{};
+}
 } // namespace
 
 ReactorExecutor::ReactorExecutor(size_t worker_count)
@@ -103,33 +128,35 @@ void ReactorExecutor::EnsureWorkers() {
     }
 }
 
-// Register a task's fds in epoll. Both read and write are always watched; the fired event
-// is forwarded to the worker running the step. The slot index travels in data.u32 so an
-// event maps straight back to its channel without any lookup structure.
-bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-
-    if (read_fd >= 0) {
-        struct epoll_event ev;
-        ev.events = EPOLLIN;
-        if (write_fd == read_fd) {
-            ev.events |= EPOLLOUT;
-        }
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, read_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD read fd {} failed: {}", read_fd, strerror(errno));
-            return false;
-        }
+bool ReactorExecutor::AddFd(int fd, uint32_t events, uint32_t tag) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.u32 = tag;
+    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));
+        return false;
     }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, write_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD write fd {} failed: {}", write_fd, strerror(errno));
-            return false;
-        }
+    return true;
+}
+
+// Register a task's fds in epoll. Interest comes from each transport's readiness handle, so
+// a socket and a shared-memory notification fd are registered the same way. Both directions
+// are always watched; the fired event is forwarded to the worker running the step.
+bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
+    const WaitDescriptor recv_wait = RecvWait(task);
+    const WaitDescriptor send_wait = SendWait(task);
+
+    // A transport may expose one fd for both directions. epoll accepts a single
+    // registration per fd, so those interests merge into one ADD tagged for both.
+    if (recv_wait.fd >= 0 && recv_wait.fd == send_wait.fd) {
+        return AddFd(recv_wait.fd, WaitInterest(recv_wait.condition) | WaitInterest(send_wait.condition),
+                     Tag(slot, kDirRecv | kDirSend));
+    }
+    if (recv_wait.fd >= 0 && !AddFd(recv_wait.fd, WaitInterest(recv_wait.condition), Tag(slot, kDirRecv))) {
+        return false;
+    }
+    if (send_wait.fd >= 0 && !AddFd(send_wait.fd, WaitInterest(send_wait.condition), Tag(slot, kDirSend))) {
+        return false;
     }
     return true;
 }
@@ -138,13 +165,13 @@ bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
 // finished or in-flight task must be deregistered before the fds are registered again,
 // otherwise EPOLL_CTL_ADD fails with EEXIST.
 void ReactorExecutor::UnregisterTask(const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-    if (read_fd >= 0) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, read_fd, nullptr);
+    const WaitDescriptor recv_wait = RecvWait(task);
+    const WaitDescriptor send_wait = SendWait(task);
+    if (recv_wait.fd >= 0) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, recv_wait.fd, nullptr);
     }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, write_fd, nullptr);
+    if (send_wait.fd >= 0 && send_wait.fd != recv_wait.fd) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, send_wait.fd, nullptr);
     }
 }
 
@@ -200,13 +227,13 @@ void ReactorExecutor::WorkerLoop() {
                 LOG_ERROR("Reactor worker failed to init task on channel {}", item.slot);
             }
         } else {
-            // Feed every readiness bit carried by this job. A single step's send and
-            // recv transfers must both advance: 2-rank rings degenerate to
-            // prev == next, so starving the matching recv deadlocks.
-            if ((item.events & EPOLLOUT) != 0) {
+            // Feed every direction this job was dispatched for. A single step's send and
+            // recv transfers must both advance: 2-rank rings degenerate to prev == next, so
+            // starving the matching recv deadlocks.
+            if (item.writable) {
                 ok = topo->AllreduceStep(*item.task, CollEvent::Writable);
             }
-            if (ok && (item.events & EPOLLIN) != 0) {
+            if (ok && item.readable) {
                 ok = topo->AllreduceStep(*item.task, CollEvent::Readable);
             }
             if (!ok) {
@@ -265,7 +292,7 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             ++task_index[slot];
             current[slot] = &task;
             ++in_flight;
-            PostWork(WorkItem{slot, &task, true, 0});
+            PostWork(WorkItem{slot, &task, true, false, false});
             return true;
         }
         return true;
@@ -291,33 +318,43 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             return false;
         }
 
-        // Merge readiness per slot first: the read and write fds of one channel are
-        // separate epoll entries that carry the same slot tag, and a single step must
-        // feed every bit that fired.
-        std::vector<uint32_t> ready_mask(channel_count, 0);
+        // Merge readiness per slot first: the two directions of one channel are separate
+        // epoll entries that carry the same slot tag, and a single step must feed every
+        // direction that actually became ready.
+        std::vector<bool> read_ready(channel_count, false);
+        std::vector<bool> write_ready(channel_count, false);
         bool notify = false;
         for (int e = 0; e < ready; ++e) {
-            uint32_t tag = events[e].data.u32;
+            const uint32_t tag = events[e].data.u32;
             if (tag == kNotifyTag) {
                 notify = true;
                 continue;
             }
-            if (tag >= channel_count) {
+            const size_t slot = tag >> kDirShift;
+            const uint32_t dir = tag & kDirMask;
+            if (slot >= channel_count || current[slot] == nullptr) {
                 continue;
             }
-            ready_mask[tag] |= events[e].events;
+            const PlanTask& task = *current[slot];
+            const uint32_t fired = events[e].events;
+            if ((dir & kDirRecv) != 0 && (fired & WaitInterest(RecvWait(task).condition)) != 0) {
+                read_ready[slot] = true;
+            }
+            if ((dir & kDirSend) != 0 && (fired & WaitInterest(SendWait(task).condition)) != 0) {
+                write_ready[slot] = true;
+            }
         }
 
         // Hand every ready channel to the pool. The fds leave epoll for the duration of
         // the step, so level-triggered epoll cannot keep reporting a writable socket
         // while a worker is already advancing that task.
         for (size_t slot = 0; slot < channel_count; ++slot) {
-            if (ready_mask[slot] == 0 || current[slot] == nullptr) {
+            if ((!read_ready[slot] && !write_ready[slot]) || current[slot] == nullptr) {
                 continue;
             }
             UnregisterTask(*current[slot]);
             ++in_flight;
-            PostWork(WorkItem{slot, current[slot], false, ready_mask[slot]});
+            PostWork(WorkItem{slot, current[slot], false, read_ready[slot], write_ready[slot]});
         }
 
         if (!notify) {

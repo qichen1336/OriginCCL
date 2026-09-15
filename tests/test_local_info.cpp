@@ -86,7 +86,7 @@ int main(int argc, char* argv[]) {
         config.world_size = std::atoi(argv[2]);
     }
 
-    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring, master_addr={}, master_port={}",
+    LOG_INFO("Configuration: rank={}, world_size={}, transport=auto, topology=Ring, master_addr={}, master_port={}",
              config.rank, config.world_size, config.master_addr, config.master_port);
 
     Communicator comm;

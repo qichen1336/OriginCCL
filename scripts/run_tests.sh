@@ -3,9 +3,15 @@
 # Verification matrix for OriginCCL. Runs every tier AGENTS.md documents, because
 # they are different code paths and not just "more of the same":
 #
+#   tier 0  test_transport_shm   forked pair, drives one shared-memory ring directly
 #   tier 1  <test> 0 1     single rank, takes the no-data-plane path (no sockets)
 #   tier 2  mpirun -np 2   the ring degenerates, prev == next
 #   tier 3  mpirun -np 4   all four channels, lazy worker expansion
+#
+# Tiers 2 and 3 run twice, once with automatic routing (same-host edges over shared
+# memory) and once with OCCL_DISABLE_SHM=1 (every edge over TCP), and each run's log is
+# checked for the routing it was supposed to use. Without that check a regression that
+# silently fell back to TCP would still look green.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -80,6 +86,7 @@ done
 # Absolute, so that --build-dir with a relative path still resolves from here.
 build_dir=$(cd "$repo_root" && mkdir -p "$build_dir" && cd "$build_dir" && pwd)
 test_bin="$build_dir/tests/test_allreduce"
+shm_test_bin="$build_dir/tests/test_transport_shm"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
 
@@ -119,14 +126,63 @@ run_tier() {
 
 # mpirun needs one slot per rank; below that it refuses to start rather than
 # reporting an error we can read.
+#
+# One tier in one routing mode. The log is kept because the mode decides which transport
+# the edges must have used, and that is only visible in the output.
 run_mpi_tier() {
     local np="$1"
+    local mode="$2"
     local -a extra=()
+    local -a prefix=()
     if [[ "$n_cpu" -lt "$np" ]]; then
         extra+=(--oversubscribe)
     fi
-    run_tier "tier $np: mpirun -np $np${extra:+ (${extra[*]})}" \
-        mpirun "${extra[@]}" -np "$np" "$test_bin"
+    if [[ "$mode" == tcp ]]; then
+        prefix=(env OCCL_DISABLE_SHM=1)
+    fi
+
+    local label="tier $np $mode: mpirun -np $np${extra:+ (${extra[*]})}"
+    local log="$build_dir/tier-$np-$mode.log"
+    echo
+    echo "--- $label"
+    local rc=0
+    timeout "$timeout_s" "${prefix[@]}" mpirun "${extra[@]}" -np "$np" "$test_bin" > "$log" 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if [[ $rc -eq 124 ]]; then
+            echo ">>> FAIL: $label timed out after ${timeout_s}s (bootstrap or data-plane hang?)" >&2
+        else
+            echo ">>> FAIL: $label exited with $rc" >&2
+        fi
+        tail -n 20 "$log" >&2
+        failed=1
+        return 1
+    fi
+
+    local shm_edges tcp_edges
+    shm_edges=$(grep -c 'transport=SHM' "$log" || true)
+    tcp_edges=$(grep -c 'transport=TCP' "$log" || true)
+    if [[ "$mode" == auto ]]; then
+        if [[ "$shm_edges" -eq 0 ]]; then
+            echo ">>> FAIL: $label took no shared-memory edge; same-host edges must route through SHM" >&2
+            failed=1
+            return 1
+        fi
+    else
+        if [[ "$shm_edges" -ne 0 ]]; then
+            echo ">>> FAIL: $label took $shm_edges shared-memory edges despite OCCL_DISABLE_SHM=1" >&2
+            failed=1
+            return 1
+        fi
+        if [[ "$tcp_edges" -eq 0 ]]; then
+            echo ">>> FAIL: $label took no TCP edge" >&2
+            failed=1
+            return 1
+        fi
+    fi
+
+    echo ">>> PASS: $label (shm edges: $shm_edges, tcp edges: $tcp_edges)"
+    echo "          log: $log"
+    return 0
 }
 
 if [[ $do_build -eq 1 ]]; then
@@ -154,6 +210,10 @@ if [[ ! -x "$test_bin" ]]; then
     echo "error: $test_bin not found; drop --no-build or build first" >&2
     exit 1
 fi
+if [[ ! -x "$shm_test_bin" ]]; then
+    echo "error: $shm_test_bin not found; drop --no-build or build first" >&2
+    exit 1
+fi
 
 # .gcda counters accumulate across runs, so a stale file from an earlier partial
 # run would inflate the report. Start from zero.
@@ -161,14 +221,21 @@ if [[ $coverage -eq 1 ]]; then
     find "$build_dir" -name '*.gcda' -delete
 fi
 
+# Tier 0 is a forked pair inside one process, so it works without MPI and without a peer
+# rank; it drives the shared-memory ring past its capacity and through a close.
+run_tier "tier 0: shared-memory transport (forked producer/consumer)" \
+    "$shm_test_bin" || true
+
 # Tier 1 must not inherit OMPI_COMM_WORLD_*: the harness prefers those over argv, so
 # running this script inside an mpirun job would silently turn tier 1 into ws=N.
 run_tier "tier 1: single rank (no data plane)" \
     env -u OMPI_COMM_WORLD_RANK -u OMPI_COMM_WORLD_SIZE "$test_bin" 0 1 || true
 
 if command -v mpirun > /dev/null 2>&1; then
-    run_mpi_tier 2 || true
-    run_mpi_tier 4 || true
+    run_mpi_tier 2 auto || true
+    run_mpi_tier 2 tcp || true
+    run_mpi_tier 4 auto || true
+    run_mpi_tier 4 tcp || true
 else
     echo
     echo ">>> SKIP: mpirun not found, tiers 2 and 3 were NOT run" >&2
