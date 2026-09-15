@@ -22,7 +22,7 @@ public:
     void Shutdown() override;
 
 private:
-    bool EnsureWorkers(size_t channel_count);
+    void EnsureWorkers(size_t channel_count);
     void StopWorkers();
     void WorkerLoop(size_t channel_id, uint64_t completed_batch_id);
     bool ExecuteTask(int channel_id, PlanTask& task);

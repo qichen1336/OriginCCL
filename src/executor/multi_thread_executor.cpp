@@ -1,4 +1,3 @@
-#include <exception>
 #include <poll.h>
 #include "executor/multi_thread_executor.h"
 #include "topology.h"
@@ -12,25 +11,18 @@ void MultiThreadExecutor::Shutdown() {
     StopWorkers();
 }
 
-bool MultiThreadExecutor::EnsureWorkers(size_t channel_count) {
+void MultiThreadExecutor::EnsureWorkers(size_t channel_count) {
     uint64_t completed_batch_id = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         completed_batch_id = batch_id_;
     }
 
-    try {
-        workers_.reserve(channel_count);
-        while (workers_.size() < channel_count) {
-            size_t channel_id = workers_.size();
-            workers_.emplace_back(&MultiThreadExecutor::WorkerLoop, this, channel_id, completed_batch_id);
-        }
-    } catch (const std::system_error& error) {
-        LOG_ERROR("Failed to create executor worker: {}", error.what());
-        StopWorkers();
-        return false;
+    workers_.reserve(channel_count);
+    while (workers_.size() < channel_count) {
+        size_t channel_id = workers_.size();
+        workers_.emplace_back(&MultiThreadExecutor::WorkerLoop, this, channel_id, completed_batch_id);
     }
-    return true;
 }
 
 void MultiThreadExecutor::StopWorkers() {
@@ -61,6 +53,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
 
     Topology* topo = task.topology.get();
     if (!topo->AllreduceInit(task)) {
+        LOG_ERROR("MultiThreadExecutor failed to init task on channel {}", channel_id);
         return false;
     }
 
@@ -87,6 +80,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
 
         if (nfds == 0) {
             if (!topo->AllreduceStep(task, CollEvent::Readable)) {
+                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
             continue;
@@ -106,9 +100,11 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         // deadlocks the 2-rank degenerate ring (prev == next).
         for (nfds_t i = 0; i < nfds; ++i) {
             if ((fds[i].revents & POLLOUT) != 0 && !topo->AllreduceStep(task, CollEvent::Writable)) {
+                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
             if ((fds[i].revents & POLLIN) != 0 && !topo->AllreduceStep(task, CollEvent::Readable)) {
+                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
         }
@@ -134,18 +130,8 @@ void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch
         if (channel_id < plan->channels.size()) {
             const ChannelPlan& channel = plan->channels[channel_id];
             for (const PlanTask& task : channel.tasks) {
-                try {
-                    // This worker exclusively owns its channel's task cursor for the batch.
-                    if (!ExecuteTask(channel.channel_id, const_cast<PlanTask&>(task))) {
-                        success = false;
-                        break;
-                    }
-                } catch (const std::exception& error) {
-                    LOG_ERROR("Executor failed on channel {}: {}", channel.channel_id, error.what());
-                    success = false;
-                    break;
-                } catch (...) {
-                    LOG_ERROR("Executor failed on channel {} with an unknown exception", channel.channel_id);
+                // This worker exclusively owns its channel's task cursor for the batch.
+                if (!ExecuteTask(channel.channel_id, const_cast<PlanTask&>(task))) {
                     success = false;
                     break;
                 }
@@ -165,9 +151,7 @@ void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch
 }
 
 bool MultiThreadExecutor::Run(const CollPlan& plan) {
-    if (!EnsureWorkers(plan.channels.size())) {
-        return false;
-    }
+    EnsureWorkers(plan.channels.size());
 
     if (!plan.channels.empty()) {
         std::unique_lock<std::mutex> lock(mutex_);

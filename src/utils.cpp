@@ -168,7 +168,7 @@ void SetReuseAddr(int sockfd) {
 bool SendAll(int sockfd, const void* data, size_t size) {
 
     uint32_t net_size = htonl(static_cast<uint32_t>(size));
-    ssize_t sent = send(sockfd, &net_size, sizeof(uint32_t), 0);
+    ssize_t sent = send(sockfd, &net_size, sizeof(uint32_t), MSG_NOSIGNAL);
     if (sent != sizeof(uint32_t)) {
         LOG_ERROR("Failed to send size prefix");
         return false;
@@ -177,7 +177,7 @@ bool SendAll(int sockfd, const void* data, size_t size) {
     size_t total_sent = 0;
     const char* ptr = static_cast<const char*>(data);
     while (total_sent < size) {
-        ssize_t n = send(sockfd, ptr + total_sent, size - total_sent, 0);
+        ssize_t n = send(sockfd, ptr + total_sent, size - total_sent, MSG_NOSIGNAL);
         if (n <= 0) {
             LOG_ERROR("Failed to send data (sent {}/{})", total_sent, size);
             return false;

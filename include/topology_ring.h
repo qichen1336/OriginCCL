@@ -11,8 +11,8 @@ public:
 
     void FillChannels(std::vector<Channel>& channels) const override;
 
-    bool AllreduceInit(PlanTask& task) const override;
-    bool AllreduceStep(PlanTask& task, CollEvent event) const override;
+    bool AllreduceInit(PlanTask& task) const noexcept override;
+    bool AllreduceStep(PlanTask& task, CollEvent event) const noexcept override;
     bool AllreduceDone(const PlanTask& task) const override;
 
     int GetPrevRank(int r) const;

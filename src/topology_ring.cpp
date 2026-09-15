@@ -126,7 +126,7 @@ int TopologyRing::GetNextRank(int r) const {
     return (r + 1) % world_size;
 }
 
-bool TopologyRing::AllreduceInit(PlanTask& task) const {
+bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
     CollOpState& s = task.state;
     s = CollOpState{};
 
@@ -160,7 +160,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const {
     return true;
 }
 
-bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const {
+bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const noexcept {
     CollOpState& s = task.state;
     if (s.phase == kPhaseUnstarted) {
         if (!AllreduceInit(task)) {

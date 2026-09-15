@@ -106,7 +106,7 @@ bool TransportTCP::TrySend(const void* data, size_t size, size_t* progress, bool
 
     const char* buffer = static_cast<const char*>(data);
     while (*progress < size) {
-        ssize_t sent = send(sockfd, buffer + *progress, size - *progress, 0);
+        ssize_t sent = send(sockfd, buffer + *progress, size - *progress, MSG_NOSIGNAL);
         if (sent > 0) {
             *progress += static_cast<size_t>(sent);
             continue;
@@ -158,7 +158,7 @@ bool TransportTCP::SendRaw(const void* data, size_t size) {
     const char* buffer = static_cast<const char*>(data);
     size_t total = 0;
     while (total < size) {
-        ssize_t sent = send(sockfd, buffer + total, size - total, 0);
+        ssize_t sent = send(sockfd, buffer + total, size - total, MSG_NOSIGNAL);
         if (sent > 0) {
             total += static_cast<size_t>(sent);
             continue;
