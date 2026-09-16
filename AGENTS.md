@@ -110,6 +110,12 @@ Cross-layer rules:
   own, is indirection, not abstraction. Do not add `try`/`catch` for errors you cannot
   handle, and do not use exceptions as control flow. Public entry points log with
   `LOG_ERROR` and `return false`; internals return `bool` or `std::optional`.
+- **Prioritize the main path over defensive coding.** Get the core functionality
+  working first — that matters more than guarding every edge case. Avoid
+  over-engineering error handling, fallbacks, and defensive checks: don't add retries,
+  speculative validation, or recovery paths for failures that can't happen in normal
+  use. Handle the errors that can actually occur, log them, and fail cleanly; don't
+  build speculative defenses.
 - **Do not add comment blocks — good code is self-documenting.** Let names carry the
   intent; `src/` and `include/` lean toward no comments at all. One short line is fine
   for a non-obvious *why* — a past deadlock, a kernel or system-call quirk, a
