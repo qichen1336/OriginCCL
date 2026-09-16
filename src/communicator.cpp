@@ -1,6 +1,5 @@
 #include <thread>
 #include <chrono>
-#include <mutex>
 #include <atomic>
 #include <algorithm>
 #include "communicator.h"
@@ -240,67 +239,53 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes) {
 
 bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges,
                                       std::atomic<bool>& error_occurred) {
-    std::mutex connector_mutex;
-    std::vector<std::thread> threads;
-
     for (const ChannelEdge& edge : edges) {
-        threads.emplace_back([&, edge]() {
-            if (error_occurred) {
-                return;
-            }
-
-            const auto& peer_info = all_nodes[edge.peer];
-            auto transport = std::make_shared<TransportTCP>();
-            bool connected = false;
-            for (int retry = 0; retry < 30; ++retry) {
-                if (transport->Connect(peer_info.ip_addr, peer_info.data_port)) {
-                    connected = true;
-                    break;
-                }
-                LOG_DEBUG("Rank {}: Failed to connect to rank {} channel {} retry {}/30", config.rank, edge.peer,
-                          edge.channel_id, retry);
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
-
-            if (!connected) {
-                LOG_ERROR("Rank {}: Failed to connect to rank {}:{} after 30 retries", config.rank, peer_info.ip_addr,
-                          peer_info.data_port);
-                error_occurred = true;
-                return;
-            }
-
-            ConnHandshake handshake;
-            handshake.rank = config.rank;
-            handshake.channel_id = edge.channel_id;
-            handshake.is_send = edge.is_send ? 1 : 0;
-            if (!transport->Send(&handshake, sizeof(handshake))) {
-                LOG_ERROR("Rank {}: Failed to send handshake to rank {} channel {}", config.rank, edge.peer,
-                          edge.channel_id);
-                error_occurred = true;
-                return;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(connector_mutex);
-                Connector* connector = FindConnector(edge.channel_id, edge.peer, edge.is_send);
-                if (!connector) {
-                    LOG_ERROR("Rank {}: No connector for peer {} channel {} is_send {}", config.rank, edge.peer,
-                              edge.channel_id, edge.is_send);
-                    error_occurred = true;
-                    return;
-                }
-                connector->transport = transport;
-            }
-        });
-    }
-
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
+        if (error_occurred) {
+            return false;
         }
+
+        const auto& peer_info = all_nodes[edge.peer];
+        auto transport = std::make_shared<TransportTCP>();
+        bool connected = false;
+        for (int retry = 0; retry < 30; ++retry) {
+            if (transport->Connect(peer_info.ip_addr, peer_info.data_port)) {
+                connected = true;
+                break;
+            }
+            LOG_DEBUG("Rank {}: Failed to connect to rank {} channel {} retry {}/30", config.rank, edge.peer,
+                      edge.channel_id, retry);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+
+        if (!connected) {
+            LOG_ERROR("Rank {}: Failed to connect to rank {}:{} after 30 retries", config.rank, peer_info.ip_addr,
+                      peer_info.data_port);
+            error_occurred = true;
+            return false;
+        }
+
+        ConnHandshake handshake;
+        handshake.rank = config.rank;
+        handshake.channel_id = edge.channel_id;
+        handshake.is_send = edge.is_send ? 1 : 0;
+        if (!transport->Send(&handshake, sizeof(handshake))) {
+            LOG_ERROR("Rank {}: Failed to send handshake to rank {} channel {}", config.rank, edge.peer,
+                      edge.channel_id);
+            error_occurred = true;
+            return false;
+        }
+
+        Connector* connector = FindConnector(edge.channel_id, edge.peer, edge.is_send);
+        if (!connector) {
+            LOG_ERROR("Rank {}: No connector for peer {} channel {} is_send {}", config.rank, edge.peer,
+                      edge.channel_id, edge.is_send);
+            error_occurred = true;
+            return false;
+        }
+        connector->transport = transport;
     }
 
-    return !error_occurred;
+    return true;
 }
 
 bool Communicator::AcceptPassiveEdges(const std::shared_ptr<Transport>& listen_transport, size_t accept_count,
