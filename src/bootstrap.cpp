@@ -87,8 +87,8 @@ bool Bootstrap::RunWorker(const CommConfig& config, uint16_t data_port, std::vec
         close(sockfd);
         return false;
     }
-    LOG_INFO("Bootstrap - Worker: Send Node Info to master - rank = {}, IP = {}, port = {}, hostname = {}",
-             config.rank, local_ip, data_port, hostname);
+    LOG_INFO("Bootstrap - Worker: Send Node Info to master - rank = {}, IP = {}, port = {}, hostname = {}", config.rank,
+             local_ip, data_port, hostname);
 
     if (!RecvAllNodes(sockfd, all_nodes)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to recv all Node Info from master", config.rank);

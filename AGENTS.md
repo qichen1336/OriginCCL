@@ -5,9 +5,8 @@ Guidance for AI coding agents (and the humans driving them) working on OriginCCL
 This file is an *orientation map*, not the full rulebook. It holds the cross-layer
 rules, build/test thresholds, style, and commit conventions. Per-layer guidance on how
 to write and modify each layer's code — its responsibilities, invariants, design space,
-and modification rules — lives in `.github/skills/originccl-project/reference/`, indexed
-by [`.github/skills/originccl-project/SKILL.md`](.github/skills/originccl-project/SKILL.md).
-When this file and a reference disagree, **the reference wins** — and please fix this file.
+and modification rules — lives in `docs/layers/`.
+When this file and a layer doc disagree, **the layer doc wins** — and please fix this file.
 
 ## Overview
 
@@ -23,7 +22,7 @@ it was first tried in.
 
 ## Architecture
 
-Two chains, deliberately independent. See the skill for the diagrams.
+Two chains, deliberately independent.
 
 - **Execution:** `CollTask` → `Planner::Plan` → `CollPlan` → `ChannelPlan` → `PlanTask`
   → `MultiThreadExecutor` → `Topology::AllReduce`
@@ -36,8 +35,8 @@ separation holds only if you keep it.
 
 ## Project Layout
 
-Key directories. Per-file responsibilities live in each layer's `reference/*.md`
-"file map" section, not here.
+Key directories. Per-file responsibilities live in each layer doc's "file map"
+section under `docs/layers/`, not here.
 
 | Path | Purpose |
 |------|---------|
@@ -46,9 +45,7 @@ Key directories. Per-file responsibilities live in each layer's `reference/*.md`
 | `include/executor/`, `src/executor/` | The only layer in its own subdirectory; headers are included with a qualified path, e.g. `#include "executor/executor.h"` |
 | `tests/` | Test harness (`test_allreduce`, `test_local_info`) |
 | `scripts/` | `run_all_executors.sh`, `run_tests.sh` |
-| `docs/agents/` | Agent-facing docs (issue tracker, triage labels, domain docs) |
-| `.github/skills/originccl-project/` | `SKILL.md` index + per-layer `reference/*.md` |
-| `graphify-out/` | Generated code-navigation graph (see Agent Skills) |
+| `docs/layers/` | Per-layer docs: responsibilities, invariants, design space, file map, modification rules |
 | `build*/` | Generated build directories (see Do NOT touch) |
 
 ## Code Conventions
@@ -88,11 +85,10 @@ relying on a summary here.
 
 ## Golden Rules (Do and Don't)
 
-Layer-specific rules live in the per-layer reference files, not here. Before touching a
-layer's code, read its reference under `.github/skills/originccl-project/reference/`
-(`transport.md`, `topology.md`, `executor.md`, `planner.md`, `communicator.md`). Each
-file has four sections: core responsibility boundary, invariants & design space, file
-map, and modification rules.
+Layer-specific rules live in the per-layer docs, not here. Before touching a layer's
+code, read its doc under `docs/layers/` (`transport.md`, `topology.md`, `executor.md`,
+`planner.md`, `communicator.md`). Each file has four sections: core responsibility
+boundary, invariants & design space, file map, and modification rules.
 
 Cross-layer rules:
 
@@ -125,7 +121,7 @@ Cross-layer rules:
 - **When adding code, reconsider what it can replace.** Before adding a feature, check
   whether existing code can be removed or simplified. Constrain the project's
   complexity: avoid over-engineering and over-encapsulation when there is no need.
-- Read the skill before inventing a new pattern.
+- Read the relevant `docs/layers/` file before inventing a new pattern.
 
 ### Performance (data path)
 
@@ -217,47 +213,5 @@ env`. No Conventional Commits prefixes, and no AI-tool attribution. If you fix a
 unrelated bug along the way, land it as its own commit.
 
 If a change alters an architecture boundary, a build command, or the way tests are run,
-update the corresponding per-layer reference file (or `SKILL.md` for cross-layer changes)
-in the same change. `SKILL.md` indexes the references; the references are the authority
-on how to write and modify each layer.
-
-An agent hook (`.github/hooks/skill.json`) enforces the habit: once a session has changed
-100+ lines under `src/`, `include/`, `tests/`, `CMakeLists.txt`, or `scripts/` without
-touching `.github/skills/`, it injects a reminder naming the reference file for each layer
-that changed. It only reminds — it never blocks. Editing any file under `.github/skills/`
-resets the counter.
-
-## Agent Skills
-
-### Issue tracker
-
-Issues and specs live as markdown files under `.scratch/<feature-slug>/` in this repo.
-See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-Five labels, default names: `needs-triage`, `needs-info`, `ready-for-agent`,
-`ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: one `CONTEXT.md` and `docs/adr/` at the repo root. See
-`docs/agents/domain.md`.
-
-### Code navigation
-
-`.github/skills/originccl-project/SKILL.md` remains the authority on architecture and
-rules. This subsection is only about looking code up.
-
-When `graphify-out/graph.json` exists, answer "where is X", "what calls Y", "how does A
-reach B", and "explain the executor" from the graph before grepping:
-`python3 -m graphify query "<question>"`, `python3 -m graphify path "A" "B"`, or
-`python3 -m graphify explain "<concept>"`. They return a scoped subgraph, far smaller
-than raw search output. Use `python3 -m graphify`, not bare `graphify` — the console
-script is not on `PATH`.
-
-Fall back to ordinary search when the graph is absent, stale, or silent, when the
-question is about a line you are about to edit, or when the answer must quote code. Do
-not build or rebuild the graph on your own initiative: a full build is LLM-backed and
-expensive. Ask the user to run `/graphify`. `python3 -m graphify update .` is the
-code-only incremental path and costs no LLM calls.
+update the corresponding layer doc under `docs/layers/` in the same change. Those docs
+are the authority on how to write and modify each layer.
