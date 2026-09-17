@@ -55,10 +55,6 @@ void TransportShm::RingResources::Close() {
     }
 }
 
-TransportShm::TransportShm() {
-    shared_memory_ = true;
-}
-
 TransportShm::~TransportShm() {
     Close();
 }

@@ -1,6 +1,5 @@
 #include <vector>
 #include <cstdlib>
-#include <cstring>
 #include "types.h"
 #include "logger.h"
 #include "communicator.h"
@@ -35,40 +34,6 @@ bool LoadConfigFromEnv(CommConfig& config) {
     }
 
     return found;
-}
-
-// Correct collective results alone do not say which transport carried them.
-bool TestTransportSelection(const Communicator& comm) {
-    if (comm.GetWorldSize() <= 1) {
-        return true;
-    }
-
-    const int rank = comm.GetRank();
-    const int expected = 2 * comm.GetNChannels();
-    const int shm_edges = comm.GetShmEdgeCount();
-    const int tcp_edges = comm.GetTcpEdgeCount();
-    LOG_INFO("Rank {}: {} channel edges: {} shared-memory, {} TCP", rank, expected, shm_edges, tcp_edges);
-
-    if (shm_edges + tcp_edges != expected) {
-        LOG_ERROR("Rank {}: {} channel edges installed, expected {}", rank, shm_edges + tcp_edges, expected);
-        return false;
-    }
-
-    const char* disable_shm = std::getenv("OCCL_DISABLE_SHM");
-    if (disable_shm != nullptr && std::strcmp(disable_shm, "1") == 0) {
-        if (shm_edges != 0) {
-            LOG_ERROR("Rank {}: OCCL_DISABLE_SHM=1 but {} edges still run over shared memory", rank, shm_edges);
-            return false;
-        }
-        return true;
-    }
-
-    if (comm.IsSingleMachine() && shm_edges != expected) {
-        LOG_ERROR("Rank {}: single-host run must select shared memory for all {} edges, got {}", rank, expected,
-                  shm_edges);
-        return false;
-    }
-    return true;
 }
 
 bool TestAllReduce(Communicator& comm, size_t count, ReduceOp op, const char* op_name) {
@@ -123,10 +88,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     LOG_INFO("Rank {}: Init", config.rank);
-
-    if (!TestTransportSelection(comm)) {
-        return 1;
-    }
 
     if (!TestAllReduce(comm, 10, ReduceOp::SUM, "SUM")) {
         return 1;

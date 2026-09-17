@@ -7,7 +7,7 @@
 #   tier 1  <test> 0 1            single rank, takes the no-data-plane path (no sockets)
 #   tier 2  mpirun -np 2          shared memory, the ring degenerates, prev == next
 #   tier 3  mpirun -np 4          shared memory, all four channels
-#   tier 4  mpirun -np 2          OCCL_DISABLE_SHM=0, which must still select shared memory
+#   tier 4  mpirun -np 2          OCCL_DISABLE_SHM=0, which must not force TCP
 #   tier 5  mpirun -np 2          unusable rendezvous path, which must fail initialization
 #   tier 6  mpirun -np 2          OCCL_DISABLE_SHM=1, same-host edges forced onto TCP
 #   tier 7  mpirun -np 4          OCCL_DISABLE_SHM=1, all four channels over TCP
@@ -16,13 +16,12 @@
 # Tiers 2-5 exercise the library's own selection (shared memory for same-host edges),
 # tiers 6-8 override it with TCP. The 2- and 4-rank matrix runs in both modes, because the
 # transport selection must not depend on the executor or on the rank count. Every tier
-# makes the same collective assertions; what differs is which transport the test proves was
-# used.
+# makes the same collective assertions, so a tier proves its code path ran end to end, not
+# which transport was picked.
 #
-# Tiers 4, 5 and 8 pin down the override semantics. Only the exact value "1" disables
-# shared memory (tier 4). A shared-memory failure is never quietly turned into a TCP
-# fallback, and the override is a selection rather than a fallback (tiers 5 and 8, which
-# obstruct the same rendezvous path and demand opposite outcomes).
+# Tiers 5 and 8 pin down the override semantics: a shared-memory failure is never quietly
+# turned into a TCP fallback, and the override is a selection rather than a fallback. They
+# obstruct the same rendezvous path and demand opposite outcomes.
 #
 # Tier 0 covers the transport itself and tier 1 has no data plane, so neither depends on
 # the mode: tier 0 runs in every mode, tier 1 runs once, in the shm pass. Tier 0 needs

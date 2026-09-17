@@ -49,15 +49,9 @@ public:
         return direction_;
     }
 
-    // Which implementation this is, so a type-agnostic caller can report what it installed.
-    bool IsSharedMemory() const {
-        return shared_memory_;
-    }
-
     virtual void Close() = 0;
     virtual bool IsConnected() const = 0;
 
 protected:
     TransportDirection direction_ = TransportDirection::Bidirectional;
-    bool shared_memory_ = false;
 };

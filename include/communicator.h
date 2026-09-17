@@ -42,14 +42,6 @@ public:
         return is_single_machine;
     }
 
-    // Channel edges installed per transport, so a test can prove which transport ran.
-    int GetShmEdgeCount() const {
-        return shm_edges;
-    }
-    int GetTcpEdgeCount() const {
-        return tcp_edges;
-    }
-
     std::shared_ptr<Topology> GetTopology() const {
         return topology;
     }
@@ -90,7 +82,4 @@ private:
     int local_size = 1;
     std::vector<int> local_ranks;
     bool is_single_machine = true;
-    // Written by the connect and accept threads during channel init; read after join.
-    std::atomic<int> shm_edges{0};
-    std::atomic<int> tcp_edges{0};
 };

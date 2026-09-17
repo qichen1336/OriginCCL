@@ -251,8 +251,7 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
         return false;
     }
 
-    LOG_INFO("Rank {}: All channel connections are init ({} shared-memory edges, {} TCP edges)", config.rank,
-             shm_edges.load(), tcp_edges.load());
+    LOG_INFO("Rank {}: All channel connections are init", config.rank);
     return true;
 }
 
@@ -323,11 +322,6 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
             return false;
         }
         connector->transport = transport;
-        if (transport->IsSharedMemory()) {
-            ++shm_edges;
-        } else {
-            ++tcp_edges;
-        }
     }
 
     return true;
@@ -389,11 +383,6 @@ bool Communicator::AcceptPassiveEdges(const std::vector<std::shared_ptr<Transpor
         }
         transport->SetDirection(local_is_send ? TransportDirection::Send : TransportDirection::Receive);
         connector->transport = transport;
-        if (transport->IsSharedMemory()) {
-            ++shm_edges;
-        } else {
-            ++tcp_edges;
-        }
     }
 
     return true;

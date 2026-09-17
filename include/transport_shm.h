@@ -34,7 +34,6 @@ constexpr size_t kShmRingMapSize = sizeof(ShmRingCursors) + kShmRingCapacity;
 // sends and a consumer endpoint only receives.
 class TransportShm : public Transport {
 public:
-    TransportShm();
     ~TransportShm() override;
 
     bool ListenPath(const std::string& rendezvous_path);
