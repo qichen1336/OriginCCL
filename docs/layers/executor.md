@@ -18,8 +18,8 @@
 
 ### 不变式（都曾踩过坑，勿回退）
 
-1. **多事件必须全喂**：一次 poll/epoll 等待返回多个就绪（或同一 fd 上的多个注册同时就绪）时，send 和 recv 都要喂 `AllreduceStep`。只喂一个会饿死对方 → 2 rank（`prev == next`）死锁。
-2. **就绪位不是方向**：哪些位代表可推进、代表发送还是接收，全由 transport 给的注册决定（见 `executor/transport_wait.h`）。同一 fd 上出现两个方向时合并成一次注册并同时喂两者，否则同样饿死 2 rank 环。
+1. **多事件必须全喂**：一次 poll/epoll 等待可能同时返回 recv 和 send 两个就绪，两者都要喂 `AllreduceStep`。只喂一个会饿死对方 → 2 rank（`prev == next`）死锁。
+2. **就绪位不是方向，方向由位置决定**：`send_transport` 的就绪推进 Writable（send）、`recv_transport` 的推进 Readable（recv）。两者一定是不同的描述符（每条 channel edge 是独立有向连接），所以每个注册只推进一个操作；executor 不把就绪位当方向（共享内存发送端等的是可读 eventfd），也不硬编码 `EPOLLIN`/`EPOLLOUT`。
 3. **epoll fd 跨 plan 复用**：task 完成必须 `EPOLL_CTL_DEL`，否则下个 plan `ADD` 报 EEXIST。
 4. **单 rank（无数据面）task 立即完成**：epoll 不注册 fd；启动时循环结算立即完成的 task，只有真等网络的才计入 active，否则 `epoll_wait(-1)` 永久阻塞。
 5. **生命周期**：`Communicator::Finalize` 先 `executor->Shutdown()`（多线程还需 join worker），再关闭 channel transport。
@@ -29,7 +29,7 @@
 
 - 允许新增第五种 executor：须在 CMake `OCCL_EXECUTOR`、编译宏、`Communicator` 的 `#ifdef` 构造处同步注册。
 - 各 executor 内部等待策略自由（poll / epoll / 轮询 / 线程池）。
-- task 的就绪注册统一由 `include/executor/transport_wait.h` 的 `BuildTransportWaits()` 生成（最多 `kTransportWaitMax` 条，含 fd、就绪掩码、可写/可读标志）；executor 只负责等待与喂事件，不自己拼 fd 与掩码。
+- task 的就绪注册由各 executor 直接用 `GetFd()` + `GetPollEvents()` 拼出（最多 2 条：recv、send，二者 fd 必不同）；executor 只负责等待与喂事件，不硬编码 `EPOLLIN`/`EPOLLOUT`。
 - worker 数等参数自由（如 `ReactorExecutor(size_t worker_count = 4)`）。
 
 四种 executor 现状：
@@ -44,7 +44,6 @@
 | 文件 | 职责 |
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
-| `include/executor/transport_wait.h` | `TransportWait` + `BuildTransportWaits()`：把 task 的两个 transport 翻译成 fd/就绪掩码/逻辑方向 |
 | `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
 | `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
@@ -53,7 +52,7 @@
 ## 修改原则
 
 - 勿回退：多事件必须全喂（只喂一个 → 2 rank 死锁）。
-- 勿回退：禁止在 executor 里硬编码 `EPOLLIN`/`EPOLLOUT` 或「读 fd/写 fd」——一律用 `BuildTransportWaits()`；`epoll`/`reactor` 的事件 tag 为 `slot * kTransportWaitMax + 注册序号`。
+- 勿回退：禁止在 executor 里硬编码 `EPOLLIN`/`EPOLLOUT` 或「读 fd/写 fd」——一律用 transport 的 `GetPollEvents()`；`epoll`/`reactor` 的事件 tag 为 `slot * 2 + side`（side 0 = recv、side 1 = send）。
 - 勿回退：task 完成必须 `EPOLL_CTL_DEL`。
 - 勿回退：Finalize 先 `Shutdown()` 再关 transport。
 - 新增 executor 须实现 `Run`/`Shutdown`，只推进 `AllreduceStep`，不展开算法步骤。

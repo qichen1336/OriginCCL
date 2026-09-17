@@ -6,7 +6,6 @@
 #include <unistd.h>
 #include <vector>
 #include "executor/reactor_executor.h"
-#include "executor/transport_wait.h"
 #include "topology.h"
 #include "logger.h"
 
@@ -108,20 +107,35 @@ void ReactorExecutor::EnsureWorkers() {
     }
 }
 
-// Register the readiness a task's transports ask to be waited on. The tag carries the slot
-// and the wait index within it, so an event maps back to its channel.
+// Register the readiness a task's transports ask to be waited on. Each task registers up to
+// two distinct descriptors: recv at side 0, send at side 1. The tag carries slot and side,
+// so an event maps back to its channel and operation.
 bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
-    TransportWait waits[kTransportWaitMax];
-    size_t count = BuildTransportWaits(task, waits);
-    const uint32_t tag_base = static_cast<uint32_t>(slot) * static_cast<uint32_t>(kTransportWaitMax);
-
-    for (size_t i = 0; i < count; ++i) {
-        struct epoll_event ev;
-        ev.events = waits[i].events;
-        ev.data.u32 = tag_base + static_cast<uint32_t>(i);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, waits[i].fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD fd {} failed: {}", waits[i].fd, strerror(errno));
-            return false;
+    const uint32_t tag_base = static_cast<uint32_t>(slot) * 2u;
+    if (task.recv_transport) {
+        int fd = task.recv_transport->GetFd();
+        uint32_t events = task.recv_transport->GetPollEvents();
+        if (fd >= 0 && events != 0) {
+            struct epoll_event ev;
+            ev.events = events;
+            ev.data.u32 = tag_base;
+            if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+                LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));
+                return false;
+            }
+        }
+    }
+    if (task.send_transport) {
+        int fd = task.send_transport->GetFd();
+        uint32_t events = task.send_transport->GetPollEvents();
+        if (fd >= 0 && events != 0) {
+            struct epoll_event ev;
+            ev.events = events;
+            ev.data.u32 = tag_base + 1u;
+            if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+                LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));
+                return false;
+            }
         }
     }
     return true;
@@ -130,10 +144,17 @@ bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
 // Remove a task's registrations. Transports are reused across plans, so a finished or
 // in-flight task must be deregistered or the next EPOLL_CTL_ADD fails with EEXIST.
 void ReactorExecutor::UnregisterTask(const PlanTask& task) {
-    TransportWait waits[kTransportWaitMax];
-    size_t count = BuildTransportWaits(task, waits);
-    for (size_t i = 0; i < count; ++i) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, waits[i].fd, nullptr);
+    if (task.recv_transport) {
+        int fd = task.recv_transport->GetFd();
+        if (fd >= 0) {
+            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        }
+    }
+    if (task.send_transport) {
+        int fd = task.send_transport->GetFd();
+        if (fd >= 0) {
+            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+        }
     }
 }
 
@@ -267,7 +288,7 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
         }
     }
 
-    std::vector<struct epoll_event> events(channel_count * kTransportWaitMax + 1);
+    std::vector<struct epoll_event> events(channel_count * 2 + 1);
     // Reused across wakeups: the readiness accumulated for this batch, in logical steps.
     std::vector<uint32_t> ready_steps(channel_count, 0);
     while (active > 0 || in_flight > 0) {
@@ -293,22 +314,23 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
                 notify = true;
                 continue;
             }
-            size_t slot = tag / kTransportWaitMax;
+            size_t slot = tag / 2u;
             if (slot >= channel_count || current[slot] == nullptr) {
                 continue;
             }
 
-            TransportWait waits[kTransportWaitMax];
-            size_t count = BuildTransportWaits(*current[slot], waits);
-            size_t side = tag % kTransportWaitMax;
-            if (side >= count || (events[e].events & waits[side].events) == 0) {
+            // Side 0 is the recv registration, side 1 the send one; each advances exactly
+            // one logical step.
+            size_t side = tag % 2u;
+            Transport* transport = (side == 0) ? current[slot]->recv_transport.get()
+                                               : current[slot]->send_transport.get();
+            if (!transport || (events[e].events & transport->GetPollEvents()) == 0) {
                 continue;
             }
-            if (waits[side].writable) {
-                ready_steps[slot] |= kStepWritable;
-            }
-            if (waits[side].readable) {
+            if (side == 0) {
                 ready_steps[slot] |= kStepReadable;
+            } else {
+                ready_steps[slot] |= kStepWritable;
             }
         }
 
@@ -354,8 +376,8 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             }
 
             if (completion.state == JobState::Waiting) {
-                // current[slot] stays set on failure: RegisterTask may have added the read
-                // fd before the write fd failed, so abort_plan must still see the task to
+                // current[slot] stays set on failure: RegisterTask may have added the recv
+                // fd before the send fd failed, so abort_plan must still see the task to
                 // deregister that half-registered pair.
                 if (!RegisterTask(slot, *current[slot])) {
                     abort_plan();

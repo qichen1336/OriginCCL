@@ -1,6 +1,5 @@
 #include <poll.h>
 #include "executor/multi_thread_executor.h"
-#include "executor/transport_wait.h"
 #include "topology.h"
 #include "logger.h"
 
@@ -58,20 +57,33 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return false;
     }
 
-    // Wait on the readiness each transport provides: readiness on the send transport
-    // advances the send, readiness on the receive transport the recv. Waiting on both keeps
-    // a blocked send from starving the matching recv even when prev == next (2-rank
-    // degenerate). Poll and epoll share bit values on Linux, so the mask is used as-is.
-    TransportWait waits[kTransportWaitMax];
-    size_t wait_count = BuildTransportWaits(task, waits);
+    // Wait on the readiness each transport provides: readiness on the receive transport
+    // advances the recv, readiness on the send transport the send. The two transports are
+    // always distinct descriptors (each channel edge is its own directed connection), so
+    // each registration advances exactly one operation. Poll and epoll share bit values on
+    // Linux, so the mask is used as-is.
     while (!topo->AllreduceDone(task)) {
-        struct pollfd fds[kTransportWaitMax];
+        struct pollfd fds[2];
+        CollEvent ops[2];
         nfds_t nfds = 0;
-        for (size_t i = 0; i < wait_count; ++i) {
-            fds[nfds].fd = waits[i].fd;
-            fds[nfds].events = static_cast<short>(waits[i].events);
-            fds[nfds].revents = 0;
-            ++nfds;
+
+        if (task.recv_transport) {
+            int fd = task.recv_transport->GetFd();
+            uint32_t events = task.recv_transport->GetPollEvents();
+            if (fd >= 0 && events != 0) {
+                fds[nfds] = {fd, static_cast<short>(events), 0};
+                ops[nfds] = CollEvent::Readable;
+                ++nfds;
+            }
+        }
+        if (task.send_transport) {
+            int fd = task.send_transport->GetFd();
+            uint32_t events = task.send_transport->GetPollEvents();
+            if (fd >= 0 && events != 0) {
+                fds[nfds] = {fd, static_cast<short>(events), 0};
+                ops[nfds] = CollEvent::Writable;
+                ++nfds;
+            }
         }
 
         if (nfds == 0) {
@@ -91,17 +103,12 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
             return false;
         }
 
-        // Feed every registration that fired; a registration on a shared descriptor carries
-        // both directions. Driving only one starves the other and deadlocks the 2-rank ring.
+        // Feed every registration that fired; each advances exactly one operation.
         for (nfds_t i = 0; i < nfds; ++i) {
-            if ((fds[i].revents & static_cast<short>(waits[i].events)) == 0) {
+            if ((fds[i].revents & fds[i].events) == 0) {
                 continue;
             }
-            if (waits[i].writable && !topo->AllreduceStep(task, CollEvent::Writable)) {
-                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
-                return false;
-            }
-            if (waits[i].readable && !topo->AllreduceStep(task, CollEvent::Readable)) {
+            if (!topo->AllreduceStep(task, ops[i])) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
