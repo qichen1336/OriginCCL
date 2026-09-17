@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 #
-# Run the full 1/2/4-rank verification matrix once per executor strategy. The executor
-# is a compile-time choice (OCCL_EXECUTOR), so each strategy gets its own build directory
-# and its own invocation of run_tests.sh.
+# Run the full verification matrix once per executor strategy, in both transport modes.
+# The executor is a compile-time choice (OCCL_EXECUTOR), so each strategy gets its own
+# build directory and its own invocation of run_tests.sh; that one invocation runs the
+# 2/4-rank tiers with the default transport selection and with OCCL_DISABLE_SHM=1, plus the
+# rank-free and single-rank tiers.
 #
 # Usage:
 #   scripts/run_all_executors.sh [extra run_tests.sh options...]

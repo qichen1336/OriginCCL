@@ -178,17 +178,22 @@ build/tests/test_allreduce 0 1
 
 **Tier 4 — multi-rank.** These are *different code paths*, not just more of the same:
 at 2 ranks the ring degenerates (`prev == next`), which exercises the split between
-`Channel::send` and `Channel::recv`.
+`Channel::send` and `Channel::recv`. Same-host channel edges use shared memory by
+default and cross-host ones use TCP, so the override run is what proves those same edges
+also carry the collectives over TCP:
 
 ```sh
 mpirun -np 2 build/tests/test_allreduce
 mpirun -np 4 build/tests/test_allreduce
+OCCL_DISABLE_SHM=1 mpirun -np 2 build/tests/test_allreduce
+OCCL_DISABLE_SHM=1 mpirun -np 4 build/tests/test_allreduce
 ```
 
-For architecture or concurrency changes, run the full executor matrix:
+For architecture or concurrency changes, run the full executor matrix — both transport
+modes, since `scripts/run_tests.sh --transport` only narrows it:
 
 ```sh
-scripts/run_all_executors.sh    # four executors × 1/2/4 ranks
+scripts/run_all_executors.sh    # four executors × 2/4 ranks × both transports
 ```
 
 Finish with `git diff --check`. After a clean build, `git status` must be clean; an

@@ -21,6 +21,7 @@
 - 控制面同样按角色设限：主动端（建环并发出 rendezvous 的那一端）只能发出握手、被动端只能接收握手。否则 producer 未握手时的第一个 `Recv` 会把握手字节当成数据，绕过方向约束。
 - 就绪：`GetFd()` listening 返回 rendezvous fd，建立后返回本端 eventfd（producer 等 space-ready，consumer 等 data-ready）；`GetPollEvents()` 恒为 `EPOLLIN`（eventfd 的可读就是就绪）。space-ready 初值 1，所以事件驱动 producer 首发送不必先轮询；data-ready 初值 0。建立到握手完成之间真正可推进的是 control socket，但该窗口内 executor 不会运行（握手在 channel init 阶段完成），executor 拿到的始终是 eventfd。
 - 阻塞 `Send`/`Recv` 在环上靠 `poll()` 等本端 eventfd 完成；`TrySend`/`TryRecv` 绝不阻塞：推不动时先排空本端 eventfd 再复检环状态，然后才报「无进展」，一次成功调用最多通知对端一次。
+- **Linux 专属**：实现依赖 `memfd_create`、`eventfd`、Unix domain socket（`SOCK_SEQPACKET`）、`SCM_RIGHTS`、`poll`/`epoll`。非 Linux 平台不提供该实现，也不加条件编译下的降级路径。
 
 ## 不变式与设计区间
 
@@ -57,3 +58,4 @@
 - 勿回退：executor 不得硬编码 `EPOLLIN`/`EPOLLOUT`，一律取 `GetPollEvents()`。
 - 共享内存实现不得引入自动回退到 TCP：任何建立/映射/传描述符/握手失败都直接让 communicator 初始化失败（`LOG_ERROR` + `false`）。
 - 环容量固定 2 MiB，不做可配置/动态扩容；一个环只允许单 producer + 单 consumer，不新增双向或多生产者模型。
+- 改动本层后跑 `scripts/run_tests.sh`：tier 0 只测传输本身（fork 端点对，无需 mpirun）；2/4 rank 的集合通信档位在默认选择与 `OCCL_DISABLE_SHM=1` 两种模式下各跑一遍（1 rank 无数据面，只跑一次）。

@@ -5,11 +5,28 @@
 #
 #   tier 0  test_transport_shm    shared-memory transport, forked endpoint pair, no ranks
 #   tier 1  <test> 0 1            single rank, takes the no-data-plane path (no sockets)
-#   tier 2  mpirun -np 2          the ring degenerates, prev == next
-#   tier 3  mpirun -np 4          all four channels, lazy worker expansion
+#   tier 2  mpirun -np 2          shared memory, the ring degenerates, prev == next
+#   tier 3  mpirun -np 4          shared memory, all four channels
+#   tier 4  mpirun -np 2          OCCL_DISABLE_SHM=0, which must still select shared memory
+#   tier 5  mpirun -np 2          unusable rendezvous path, which must fail initialization
+#   tier 6  mpirun -np 2          OCCL_DISABLE_SHM=1, same-host edges forced onto TCP
+#   tier 7  mpirun -np 4          OCCL_DISABLE_SHM=1, all four channels over TCP
+#   tier 8  mpirun -np 2          OCCL_DISABLE_SHM=1, which must not bind a rendezvous path
 #
-# Tier 0 needs neither mpirun nor OMPI_COMM_WORLD_*, and it covers the transport
-# independently of the executor the library was built with.
+# Tiers 2-5 exercise the library's own selection (shared memory for same-host edges),
+# tiers 6-8 override it with TCP. The 2- and 4-rank matrix runs in both modes, because the
+# transport selection must not depend on the executor or on the rank count. Every tier
+# makes the same collective assertions; what differs is which transport the test proves was
+# used.
+#
+# Tiers 4, 5 and 8 pin down the override semantics. Only the exact value "1" disables
+# shared memory (tier 4). A shared-memory failure is never quietly turned into a TCP
+# fallback, and the override is a selection rather than a fallback (tiers 5 and 8, which
+# obstruct the same rendezvous path and demand opposite outcomes).
+#
+# Tier 0 covers the transport itself and tier 1 has no data plane, so neither depends on
+# the mode: tier 0 runs in every mode, tier 1 runs once, in the shm pass. Tier 0 needs
+# neither mpirun nor OMPI_COMM_WORLD_* either.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -23,6 +40,9 @@
 #   --build-dir <dir>  build directory (default: <repo>/build)
 #   --build-type <t>   CMAKE_BUILD_TYPE (coverage defaults to Debug, see below)
 #   --executor <name>  OCCL_EXECUTOR: multi_thread, epoll, polling, or reactor (default multi_thread)
+#   --transport <mode> all (default): tiers 0-8, both transport modes
+#                      shm:           tiers 0-5, the library's own transport selection
+#                      tcp:           tier 0 and tiers 6-8, OCCL_DISABLE_SHM=1
 #   --timeout <secs>   per-tier timeout (default: 120)
 #   --allow-skip       a missing mpirun is a warning, not a failure exit
 #   -h, --help         this text
@@ -44,8 +64,11 @@ do_build=1
 coverage=0
 allow_skip=0
 executor="multi_thread"
+transport="all"
 
-usage() { sed -n '3,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+# The header is the usage text: print its comment lines, stopping at the first command.
+# Deriving it beats a line range, which goes stale every time the header grows.
+usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -61,6 +84,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --executor)
             executor="$2"
+            shift
+            ;;
+        --transport)
+            transport="$2"
             shift
             ;;
         --timeout)
@@ -80,6 +107,21 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+case "$transport" in
+    all | shm | tcp) ;;
+    *)
+        echo "unknown transport: $transport (expected all, shm, or tcp)" >&2
+        usage >&2
+        exit 64
+        ;;
+esac
+
+# A narrowed mode is a deliberate choice, but the script's whole point is that a pass
+# means the full matrix ran, so say out loud when it did not.
+if [[ $transport != "all" ]]; then
+    echo "note: --transport $transport runs a subset of the tiers; only --transport all covers the full matrix" >&2
+fi
 
 # Absolute, so that --build-dir with a relative path still resolves from here.
 build_dir=$(cd "$repo_root" && mkdir -p "$build_dir" && cd "$build_dir" && pwd)
@@ -123,15 +165,81 @@ run_tier() {
 }
 
 # mpirun needs one slot per rank; below that it refuses to start rather than
-# reporting an error we can read.
+# reporting an error we can read. The matrix tops out at kMaxRanks, so the flag is decided
+# once rather than per tier.
+kMaxRanks=4
+mpi_extra=()
+if [[ "$n_cpu" -lt "$kMaxRanks" ]]; then
+    mpi_extra+=(--oversubscribe)
+fi
+mpi_extra_label=""
+if [[ ${#mpi_extra[@]} -gt 0 ]]; then
+    mpi_extra_label=" (${mpi_extra[*]})"
+fi
+
+have_mpirun=0
+if command -v mpirun > /dev/null 2>&1; then
+    have_mpirun=1
+fi
+
+# Usage: run_mpi_tier <label> <np> [NAME=value | -u NAME ...]
+# Trailing arguments go to env(1), so a tier can export the transport override or clear it.
 run_mpi_tier() {
-    local np="$1"
-    local -a extra=()
-    if [[ "$n_cpu" -lt "$np" ]]; then
-        extra+=(--oversubscribe)
+    local label="$1"
+    local np="$2"
+    shift 2
+    local -a launcher=(mpirun "${mpi_extra[@]}" -np "$np")
+    if [[ $# -gt 0 ]]; then
+        launcher=(env "$@" "${launcher[@]}")
     fi
-    run_tier "tier $np: mpirun -np $np${extra:+ (${extra[*]})}" \
-        mpirun "${extra[@]}" -np "$np" "$test_bin"
+    run_tier "$label, mpirun -np $np$mpi_extra_label" "${launcher[@]}" "$test_bin"
+}
+
+# A directory at a rendezvous path fails the unlink and the bind both (a regular file would
+# just be unlinked first), which turns "did anything bind this path?" into an observable
+# outcome. The same obstruction is used with both expectations: with shared memory enabled
+# a bind failure must fail initialization instead of quietly falling back to TCP, and with
+# OCCL_DISABLE_SHM=1 nothing ever binds the path, so the run must be unaffected.
+#
+# Usage: run_blocked_rendezvous_tier <label> <fail|ok> [NAME=value | -u NAME ...]
+# Trailing arguments go to env(1).
+run_blocked_rendezvous_tier() {
+    local label="$1"
+    local expect="$2"
+    shift 2
+    local log="$build_dir/blocked-rendezvous-$expect.log"
+    local -a paths=("/tmp/originccl-$OCCL_MASTER_PORT-0.sock" "/tmp/originccl-$OCCL_MASTER_PORT-1.sock")
+    rm -rf "${paths[@]}"
+    mkdir -p "${paths[@]}"
+
+    local rc=0
+    echo
+    echo "--- $label"
+    timeout "$timeout_s" env "$@" mpirun "${mpi_extra[@]}" -np 2 "$test_bin" > "$log" 2>&1 || rc=$?
+    rm -rf "${paths[@]}"
+
+    if [[ "$expect" == ok ]]; then
+        if [[ $rc -eq 0 ]]; then
+            echo ">>> PASS: $label (exit 0 with the rendezvous path unusable)"
+            rm -f "$log"
+            return 0
+        fi
+    elif [[ $rc -ne 0 && $rc -ne 124 ]] \
+        && grep -q 'Failed to create the shared-memory rendezvous listener' "$log" \
+        && ! grep -q 'Communicator init successfully' "$log"; then
+        # Two-sided on purpose. A zero exit means the endpoint quietly went to TCP, and
+        # "Communicator init successfully" means initialization passed and a later
+        # assertion rejected the transport - a different bug that must not read as a
+        # clean initialization failure.
+        echo ">>> PASS: $label (init failed instead of falling back to TCP)"
+        rm -f "$log"
+        return 0
+    fi
+
+    echo ">>> FAIL: $label (exit $rc, full output: $log)" >&2
+    tail -n 20 "$log" >&2
+    failed=1
+    return 1
 }
 
 if [[ $do_build -eq 1 ]]; then
@@ -170,18 +278,39 @@ fi
 # before anything that depends on mpirun being present.
 run_tier "tier 0: shared-memory transport (forked pair)" "$shm_test_bin" || true
 
-# Tier 1 must not inherit OMPI_COMM_WORLD_*: the harness prefers those over argv, so
-# running this script inside an mpirun job would silently turn tier 1 into ws=N.
-run_tier "tier 1: single rank (no data plane)" \
-    env -u OMPI_COMM_WORLD_RANK -u OMPI_COMM_WORLD_SIZE "$test_bin" 0 1 || true
+# Tiers 1-5 all run with shared memory enabled. The test asserts that a single-host run
+# used shared memory for every edge unless OCCL_DISABLE_SHM was exactly "1", so clearing the
+# variable (tiers 2-3) and setting it to "0" (tier 4) must both keep shared memory.
+if [[ $transport != "tcp" ]]; then
+    # Tier 1 must not inherit OMPI_COMM_WORLD_*: the harness prefers those over argv, so
+    # running this script inside an mpirun job would silently turn tier 1 into ws=N.
+    run_tier "tier 1: single rank (no data plane)" \
+        env -u OMPI_COMM_WORLD_RANK -u OMPI_COMM_WORLD_SIZE "$test_bin" 0 1 || true
 
-if command -v mpirun > /dev/null 2>&1; then
-    run_mpi_tier 2 || true
-    run_mpi_tier 4 || true
-else
-    echo
-    echo ">>> SKIP: mpirun not found, tiers 2 and 3 were NOT run" >&2
-    skipped=1
+    if [[ $have_mpirun -eq 1 ]]; then
+        run_mpi_tier "tier 2: shared memory (default selection)" 2 -u OCCL_DISABLE_SHM || true
+        run_mpi_tier "tier 3: shared memory (default selection)" 4 -u OCCL_DISABLE_SHM || true
+        run_mpi_tier "tier 4: shared memory (OCCL_DISABLE_SHM=0)" 2 OCCL_DISABLE_SHM=0 || true
+        run_blocked_rendezvous_tier "tier 5: blocked rendezvous path must fail init" fail \
+            -u OCCL_DISABLE_SHM || true
+    else
+        echo
+        echo ">>> SKIP: mpirun not found, tiers 2-5 were NOT run" >&2
+        skipped=1
+    fi
+fi
+
+if [[ $transport != "shm" ]]; then
+    if [[ $have_mpirun -eq 1 ]]; then
+        run_mpi_tier "tier 6: TCP (OCCL_DISABLE_SHM=1)" 2 OCCL_DISABLE_SHM=1 || true
+        run_mpi_tier "tier 7: TCP (OCCL_DISABLE_SHM=1)" 4 OCCL_DISABLE_SHM=1 || true
+        run_blocked_rendezvous_tier "tier 8: TCP override must not bind the rendezvous path" ok \
+            OCCL_DISABLE_SHM=1 || true
+    else
+        echo
+        echo ">>> SKIP: mpirun not found, tiers 6-8 were NOT run" >&2
+        skipped=1
+    fi
 fi
 
 report_coverage() {
