@@ -165,7 +165,8 @@ cmake -S . -B build-reactor -DOCCL_EXECUTOR=reactor
 ```
 
 Artifacts: `build/liboriginccl.so`, `build/tests/test_allreduce`,
-`build/tests/test_local_info`.
+`build/tests/test_local_info`, `build/tests/test_transport_shm` (`scripts/run_tests.sh`
+runs it as tier 0; it needs no launcher and no ranks).
 
 **Tier 2 — Markdown-only changes** need no build.
 

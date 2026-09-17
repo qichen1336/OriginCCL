@@ -3,9 +3,13 @@
 # Verification matrix for OriginCCL. Runs every tier AGENTS.md documents, because
 # they are different code paths and not just "more of the same":
 #
-#   tier 1  <test> 0 1     single rank, takes the no-data-plane path (no sockets)
-#   tier 2  mpirun -np 2   the ring degenerates, prev == next
-#   tier 3  mpirun -np 4   all four channels, lazy worker expansion
+#   tier 0  test_transport_shm    shared-memory transport, forked endpoint pair, no ranks
+#   tier 1  <test> 0 1            single rank, takes the no-data-plane path (no sockets)
+#   tier 2  mpirun -np 2          the ring degenerates, prev == next
+#   tier 3  mpirun -np 4          all four channels, lazy worker expansion
+#
+# Tier 0 needs neither mpirun nor OMPI_COMM_WORLD_*, and it covers the transport
+# independently of the executor the library was built with.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -80,6 +84,7 @@ done
 # Absolute, so that --build-dir with a relative path still resolves from here.
 build_dir=$(cd "$repo_root" && mkdir -p "$build_dir" && cd "$build_dir" && pwd)
 test_bin="$build_dir/tests/test_allreduce"
+shm_test_bin="$build_dir/tests/test_transport_shm"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
 
@@ -160,6 +165,10 @@ fi
 if [[ $coverage -eq 1 ]]; then
     find "$build_dir" -name '*.gcda' -delete
 fi
+
+# Tier 0 is single-process and rank-free: the forked pair needs no launcher, so run it
+# before anything that depends on mpirun being present.
+run_tier "tier 0: shared-memory transport (forked pair)" "$shm_test_bin" || true
 
 # Tier 1 must not inherit OMPI_COMM_WORLD_*: the harness prefers those over argv, so
 # running this script inside an mpirun job would silently turn tier 1 into ws=N.

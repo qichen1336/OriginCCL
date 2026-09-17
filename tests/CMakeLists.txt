@@ -20,6 +20,20 @@ target_include_directories(test_local_info
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# The shared-memory transport is exercised by a forked process pair, so it needs no
+# mpirun and no communicator. It covers rendezvous, descriptor transfer, the control
+# handshake, blocking and non-blocking transfer, wrap/backpressure, direction rejection
+# and endpoint teardown.
+add_executable(test_transport_shm test_transport_shm.cpp)
+target_link_libraries(test_transport_shm
+    originccl
+    fmt::fmt
+)
+target_include_directories(test_transport_shm
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 # Rank/world_size come from Open MPI (OMPI_COMM_WORLD_RANK / OMPI_COMM_WORLD_SIZE).
 #   mpirun -np 2 ./test_allreduce
 # Or pass them manually:
