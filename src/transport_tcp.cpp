@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -13,6 +14,22 @@ TransportTCP::TransportTCP() {}
 
 TransportTCP::~TransportTCP() {
     Close();
+}
+
+// Only the wait mask follows the direction: a socket is writable when its send side can
+// advance and readable when its receive side can. Send/Recv stay usable either way.
+uint32_t TransportTCP::GetPollEvents() const {
+    if (sockfd < 0) {
+        return EPOLLIN;
+    }
+    switch (direction_) {
+    case TransportDirection::Send:
+        return EPOLLOUT;
+    case TransportDirection::Receive:
+        return EPOLLIN;
+    default:
+        return EPOLLIN | EPOLLOUT;
+    }
 }
 
 bool TransportTCP::Listen(uint16_t port) {

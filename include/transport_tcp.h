@@ -22,8 +22,9 @@ public:
     bool TrySend(const void* data, size_t size, size_t* progress, bool* done) override;
     bool TryRecv(void* data, size_t size, size_t* progress, bool* done) override;
     int GetFd() const override {
-        return sockfd;
+        return sockfd >= 0 ? sockfd : listen_fd;
     }
+    uint32_t GetPollEvents() const override;
 
     void Close() override;
     bool IsConnected() const override {

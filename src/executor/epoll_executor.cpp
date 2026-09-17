@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include "executor/epoll_executor.h"
+#include "executor/transport_wait.h"
 #include "logger.h"
 
 EpollExecutor::~EpollExecutor() {
@@ -28,48 +29,32 @@ bool EpollExecutor::EnsureEpoll() {
     return true;
 }
 
-// Register a task's fds in epoll. Both read and write are always watched; the fired event
-// is forwarded to AllreduceStep. The slot index travels in data.u32 so an event maps
-// straight back to its task without any lookup structure.
+// Register the readiness a task's transports ask to be waited on. The tag carries the slot
+// and the wait index within it, so an event maps back to its task and logical operation.
 bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    TransportWait waits[kTransportWaitMax];
+    size_t count = BuildTransportWaits(task, waits);
+    const uint32_t tag_base = static_cast<uint32_t>(slot) * static_cast<uint32_t>(kTransportWaitMax);
 
-    if (read_fd >= 0) {
+    for (size_t i = 0; i < count; ++i) {
         struct epoll_event ev;
-        ev.events = EPOLLIN;
-        if (write_fd == read_fd) {
-            ev.events |= EPOLLOUT;
-        }
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, read_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD read fd {} failed: {}", read_fd, strerror(errno));
-            return false;
-        }
-    }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, write_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD write fd {} failed: {}", write_fd, strerror(errno));
+        ev.events = waits[i].events;
+        ev.data.u32 = tag_base + static_cast<uint32_t>(i);
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, waits[i].fd, &ev) < 0) {
+            LOG_ERROR("epoll_ctl ADD fd {} failed: {}", waits[i].fd, strerror(errno));
             return false;
         }
     }
     return true;
 }
 
-// Remove a task's fds from epoll. fds belong to channel transports reused across plans,
-// so a finished task must be deregistered before the next plan re-adds them, otherwise
-// EPOLL_CTL_ADD fails with EEXIST.
+// Remove a task's registrations. Transports are reused across plans, so a finished task
+// must be deregistered or the next plan's EPOLL_CTL_ADD fails with EEXIST.
 void EpollExecutor::UnregisterTask(const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-    if (read_fd >= 0) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, read_fd, nullptr);
-    }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, write_fd, nullptr);
+    TransportWait waits[kTransportWaitMax];
+    size_t count = BuildTransportWaits(task, waits);
+    for (size_t i = 0; i < count; ++i) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, waits[i].fd, nullptr);
     }
 }
 
@@ -128,7 +113,7 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         }
     }
 
-    std::vector<struct epoll_event> events(plan.channels.size() * 2);
+    std::vector<struct epoll_event> events(plan.channels.size() * kTransportWaitMax);
     while (active > 0) {
         int ready = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
         if (ready < 0) {
@@ -141,22 +126,31 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         }
 
         for (int e = 0; e < ready; ++e) {
-            size_t slot = events[e].data.u32;
+            uint32_t tag = events[e].data.u32;
+            size_t slot = tag / kTransportWaitMax;
             PlanTask* task = current[slot];
             if (!task) {
                 continue;
             }
+
+            // The registration, not the event bits, says which operation to advance:
+            // a shared descriptor carries both directions and must feed both.
+            TransportWait waits[kTransportWaitMax];
+            size_t count = BuildTransportWaits(*task, waits);
+            size_t side = tag % kTransportWaitMax;
+            if (side >= count || (events[e].events & waits[side].events) == 0) {
+                continue;
+            }
+
             Topology* topo = task->topology.get();
-            // Feed every readiness bit that fired (a single event can carry both EPOLLIN
-            // and EPOLLOUT). Send and recv proceed concurrently within a step. A false
-            // return is the failure channel, so abandon the plan there and then instead of
-            // spinning on a task that can never reach a done state.
-            if ((events[e].events & EPOLLOUT) != 0 && !topo->AllreduceStep(*task, CollEvent::Writable)) {
+            // A false return is the failure channel, so abandon the plan there and then
+            // instead of spinning on a task that can never reach a done state.
+            if (waits[side].writable && !topo->AllreduceStep(*task, CollEvent::Writable)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);
                 abort_plan();
                 return false;
             }
-            if ((events[e].events & EPOLLIN) != 0 && !topo->AllreduceStep(*task, CollEvent::Readable)) {
+            if (waits[side].readable && !topo->AllreduceStep(*task, CollEvent::Readable)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);
                 abort_plan();
                 return false;

@@ -1,16 +1,21 @@
 #include <errno.h>
 #include <string.h>
+#include <algorithm>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 #include <vector>
 #include "executor/reactor_executor.h"
+#include "executor/transport_wait.h"
 #include "topology.h"
 #include "logger.h"
 
 namespace {
 // Channel slots are small indices, so a saturated tag can never collide with one.
 constexpr uint32_t kNotifyTag = 0xFFFFFFFFu;
+// Logical steps a job must run, accumulated from the registrations that fired.
+constexpr uint32_t kStepWritable = 1u;
+constexpr uint32_t kStepReadable = 2u;
 } // namespace
 
 ReactorExecutor::ReactorExecutor(size_t worker_count)
@@ -103,48 +108,32 @@ void ReactorExecutor::EnsureWorkers() {
     }
 }
 
-// Register a task's fds in epoll. Both read and write are always watched; the fired event
-// is forwarded to the worker running the step. The slot index travels in data.u32 so an
-// event maps straight back to its channel without any lookup structure.
+// Register the readiness a task's transports ask to be waited on. The tag carries the slot
+// and the wait index within it, so an event maps back to its channel.
 bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    TransportWait waits[kTransportWaitMax];
+    size_t count = BuildTransportWaits(task, waits);
+    const uint32_t tag_base = static_cast<uint32_t>(slot) * static_cast<uint32_t>(kTransportWaitMax);
 
-    if (read_fd >= 0) {
+    for (size_t i = 0; i < count; ++i) {
         struct epoll_event ev;
-        ev.events = EPOLLIN;
-        if (write_fd == read_fd) {
-            ev.events |= EPOLLOUT;
-        }
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, read_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD read fd {} failed: {}", read_fd, strerror(errno));
-            return false;
-        }
-    }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        struct epoll_event ev;
-        ev.events = EPOLLOUT;
-        ev.data.u32 = static_cast<uint32_t>(slot);
-        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, write_fd, &ev) < 0) {
-            LOG_ERROR("epoll_ctl ADD write fd {} failed: {}", write_fd, strerror(errno));
+        ev.events = waits[i].events;
+        ev.data.u32 = tag_base + static_cast<uint32_t>(i);
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, waits[i].fd, &ev) < 0) {
+            LOG_ERROR("epoll_ctl ADD fd {} failed: {}", waits[i].fd, strerror(errno));
             return false;
         }
     }
     return true;
 }
 
-// Remove a task's fds from epoll. Channel transports are reused across plans, so a
-// finished or in-flight task must be deregistered before the fds are registered again,
-// otherwise EPOLL_CTL_ADD fails with EEXIST.
+// Remove a task's registrations. Transports are reused across plans, so a finished or
+// in-flight task must be deregistered or the next EPOLL_CTL_ADD fails with EEXIST.
 void ReactorExecutor::UnregisterTask(const PlanTask& task) {
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
-    if (read_fd >= 0) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, read_fd, nullptr);
-    }
-    if (write_fd >= 0 && write_fd != read_fd) {
-        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, write_fd, nullptr);
+    TransportWait waits[kTransportWaitMax];
+    size_t count = BuildTransportWaits(task, waits);
+    for (size_t i = 0; i < count; ++i) {
+        epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, waits[i].fd, nullptr);
     }
 }
 
@@ -200,13 +189,13 @@ void ReactorExecutor::WorkerLoop() {
                 LOG_ERROR("Reactor worker failed to init task on channel {}", item.slot);
             }
         } else {
-            // Feed every readiness bit carried by this job. A single step's send and
+            // Feed every logical step carried by this job. A single step's send and
             // recv transfers must both advance: 2-rank rings degenerate to
             // prev == next, so starving the matching recv deadlocks.
-            if ((item.events & EPOLLOUT) != 0) {
+            if ((item.steps & kStepWritable) != 0) {
                 ok = topo->AllreduceStep(*item.task, CollEvent::Writable);
             }
-            if (ok && (item.events & EPOLLIN) != 0) {
+            if (ok && (item.steps & kStepReadable) != 0) {
                 ok = topo->AllreduceStep(*item.task, CollEvent::Readable);
             }
             if (!ok) {
@@ -278,7 +267,9 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
         }
     }
 
-    std::vector<struct epoll_event> events(channel_count * 2 + 1);
+    std::vector<struct epoll_event> events(channel_count * kTransportWaitMax + 1);
+    // Reused across wakeups: the readiness accumulated for this batch, in logical steps.
+    std::vector<uint32_t> ready_steps(channel_count, 0);
     while (active > 0 || in_flight > 0) {
         int ready = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
         if (ready < 0) {
@@ -291,10 +282,10 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             return false;
         }
 
-        // Merge readiness per slot first: the read and write fds of one channel are
-        // separate epoll entries that carry the same slot tag, and a single step must
-        // feed every bit that fired.
-        std::vector<uint32_t> ready_mask(channel_count, 0);
+        // Merge readiness per slot first: the send and receive registrations of one channel
+        // are separate epoll entries carrying the same slot tag, and a single step must feed
+        // every logical operation that fired.
+        std::fill(ready_steps.begin(), ready_steps.end(), 0);
         bool notify = false;
         for (int e = 0; e < ready; ++e) {
             uint32_t tag = events[e].data.u32;
@@ -302,22 +293,35 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
                 notify = true;
                 continue;
             }
-            if (tag >= channel_count) {
+            size_t slot = tag / kTransportWaitMax;
+            if (slot >= channel_count || current[slot] == nullptr) {
                 continue;
             }
-            ready_mask[tag] |= events[e].events;
+
+            TransportWait waits[kTransportWaitMax];
+            size_t count = BuildTransportWaits(*current[slot], waits);
+            size_t side = tag % kTransportWaitMax;
+            if (side >= count || (events[e].events & waits[side].events) == 0) {
+                continue;
+            }
+            if (waits[side].writable) {
+                ready_steps[slot] |= kStepWritable;
+            }
+            if (waits[side].readable) {
+                ready_steps[slot] |= kStepReadable;
+            }
         }
 
         // Hand every ready channel to the pool. The fds leave epoll for the duration of
         // the step, so level-triggered epoll cannot keep reporting a writable socket
         // while a worker is already advancing that task.
         for (size_t slot = 0; slot < channel_count; ++slot) {
-            if (ready_mask[slot] == 0 || current[slot] == nullptr) {
+            if (ready_steps[slot] == 0 || current[slot] == nullptr) {
                 continue;
             }
             UnregisterTask(*current[slot]);
             ++in_flight;
-            PostWork(WorkItem{slot, current[slot], false, ready_mask[slot]});
+            PostWork(WorkItem{slot, current[slot], false, ready_steps[slot]});
         }
 
         if (!notify) {

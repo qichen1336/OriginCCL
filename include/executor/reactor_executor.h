@@ -47,7 +47,9 @@ private:
         size_t slot = 0;
         PlanTask* task = nullptr;
         bool init = false;
-        uint32_t events = 0;
+        // Logical step bits (kStepWritable / kStepReadable), not raw epoll bits: only the
+        // registration that fired knows which operation its readiness advances.
+        uint32_t steps = 0;
     };
 
     struct Completion {

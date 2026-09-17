@@ -1,5 +1,6 @@
 #include <poll.h>
 #include "executor/multi_thread_executor.h"
+#include "executor/transport_wait.h"
 #include "topology.h"
 #include "logger.h"
 
@@ -57,23 +58,18 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return false;
     }
 
-    // Poll both the read and the write fd of this channel and feed each readiness event to
-    // AllreduceStep. Watching both means a blocked send never starves the matching recv,
-    // so no helper send thread is needed even when prev == next (2-rank degenerate).
-    int read_fd = task.recv_transport ? task.recv_transport->GetFd() : -1;
-    int write_fd = task.send_transport ? task.send_transport->GetFd() : -1;
+    // Wait on the readiness each transport provides: readiness on the send transport
+    // advances the send, readiness on the receive transport the recv. Waiting on both keeps
+    // a blocked send from starving the matching recv even when prev == next (2-rank
+    // degenerate). Poll and epoll share bit values on Linux, so the mask is used as-is.
+    TransportWait waits[kTransportWaitMax];
+    size_t wait_count = BuildTransportWaits(task, waits);
     while (!topo->AllreduceDone(task)) {
-        struct pollfd fds[2];
+        struct pollfd fds[kTransportWaitMax];
         nfds_t nfds = 0;
-        if (read_fd >= 0) {
-            fds[nfds].fd = read_fd;
-            fds[nfds].events = POLLIN;
-            fds[nfds].revents = 0;
-            ++nfds;
-        }
-        if (write_fd >= 0 && write_fd != read_fd) {
-            fds[nfds].fd = write_fd;
-            fds[nfds].events = POLLOUT;
+        for (size_t i = 0; i < wait_count; ++i) {
+            fds[nfds].fd = waits[i].fd;
+            fds[nfds].events = static_cast<short>(waits[i].events);
             fds[nfds].revents = 0;
             ++nfds;
         }
@@ -95,15 +91,17 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
             return false;
         }
 
-        // Feed every readiness event that fired. Within one step the send and the recv
-        // transfer proceed concurrently, so driving only one of them starves the other and
-        // deadlocks the 2-rank degenerate ring (prev == next).
+        // Feed every registration that fired; a registration on a shared descriptor carries
+        // both directions. Driving only one starves the other and deadlocks the 2-rank ring.
         for (nfds_t i = 0; i < nfds; ++i) {
-            if ((fds[i].revents & POLLOUT) != 0 && !topo->AllreduceStep(task, CollEvent::Writable)) {
+            if ((fds[i].revents & static_cast<short>(waits[i].events)) == 0) {
+                continue;
+            }
+            if (waits[i].writable && !topo->AllreduceStep(task, CollEvent::Writable)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }
-            if ((fds[i].revents & POLLIN) != 0 && !topo->AllreduceStep(task, CollEvent::Readable)) {
+            if (waits[i].readable && !topo->AllreduceStep(task, CollEvent::Readable)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 return false;
             }

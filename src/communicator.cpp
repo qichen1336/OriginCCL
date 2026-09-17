@@ -282,6 +282,9 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
             error_occurred = true;
             return false;
         }
+        // A channel edge is one directed connection, so the transport knows which operation
+        // its readiness gates. TCP keeps working in both directions regardless.
+        transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
         connector->transport = transport;
     }
 
@@ -315,6 +318,7 @@ bool Communicator::AcceptPassiveEdges(const std::shared_ptr<Transport>& listen_t
                       handshake.rank, handshake.channel_id, local_is_send);
             return false;
         }
+        transport->SetDirection(local_is_send ? TransportDirection::Send : TransportDirection::Receive);
         connector->transport = transport;
     }
 
