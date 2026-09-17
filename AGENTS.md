@@ -33,6 +33,30 @@ These boundaries are **not enforced by the compiler**. Everything ships as one s
 library, and nothing mechanically stops a lower layer from reaching upward. The
 separation holds only if you keep it.
 
+## Known Conventions
+
+Facts about how this codebase is *actually* used, established by the code rather than by
+the type signatures. They are load-bearing: **rely on them instead of writing defensive
+branches for states the code cannot produce.** Read enough surrounding code to learn
+them before adding logic, and whenever you find a convention that is not written down
+yet, record it here or in the relevant `docs/layers/` doc in the same change.
+
+- **Channel transports are simplex in practice, despite the bidirectional interface.**
+  Each `Connector` on a channel owns a transport dedicated to one direction —
+  `channel.send[p]` only ever sends, `channel.recv[p]` only ever receives. A channel
+  edge therefore only needs readiness for one direction; the two are never multiplexed
+  onto one object.
+- **A channel edge's send and recv transports never share an fd.** `InitChannels` creates
+  a separate transport object (and therefore a separate descriptor) per directed edge, so
+  `send[p]` and `recv[p]` are always distinct. This holds even at 2 ranks, where the ring
+  degenerates to `prev == next`: those are still two independent edges with two transports.
+- **Direction is metadata for TCP, but a hard constraint for shared memory.**
+  `TransportTCP` works in both directions regardless of `GetDirection()`; `TransportShm`
+  rejects reverse calls. Bootstrap drives its control traffic over a single bidirectional
+  object, which is why TCP cannot reject the reverse direction.
+- **The planner enables one channel per 64 KiB**, so small messages only ever exercise a
+  single channel.
+
 ## Project Layout
 
 Key directories. Per-file responsibilities live in each layer doc's "file map"
@@ -99,6 +123,12 @@ Cross-layer rules:
 - **Confirm before adding a class, especially a base class.** New classes — and above all
   new abstract base classes — add architecture surface and coupling. Never introduce one
   without explicit approval first. Prefer free functions or extending an existing type.
+- **No unnecessary entities — every name must earn its place.** Every function, variable,
+  struct, and class you add must be semantically clear and genuinely necessary. If a
+  proposed entity can be removed without losing clarity or capability, it should not
+  exist: do not add wrappers, parameters, or placeholders "just in case". This is the
+  working rule behind "prefer the simplest design"; "when in doubt, leave it out" applies
+  to every new name, not only to classes.
 - **Prefer the simplest design and implementation.** Make the smallest change that solves
   the problem. Do not do large-scale rewrites, speculative abstractions, or drive-by
   refactors unless explicitly asked. Write the direct, readable version: straight-line
@@ -112,6 +142,14 @@ Cross-layer rules:
   speculative validation, or recovery paths for failures that can't happen in normal
   use. Handle the errors that can actually occur, log them, and fail cleanly; don't
   build speculative defenses.
+- **Read the code, then rely on its conventions, not on guesses about all possible
+  states.** This tree carries a body of established conventions — see Known Conventions —
+  and they rule out whole classes of input. Learn them from the surrounding code before
+  writing new logic, and build on them instead of branching for combinations the code
+  cannot produce (e.g. don't multiplex a channel's send and recv endpoint onto one wait
+  when they are separate simplex transports). When you find a convention that is not
+  written down, record it in this file or the relevant `docs/layers/` doc in the same
+  change.
 - **Do not add comment blocks — good code is self-documenting.** Let names carry the
   intent; `src/` and `include/` lean toward no comments at all. One short line is fine
   for a non-obvious *why* — a past deadlock, a kernel or system-call quirk, a

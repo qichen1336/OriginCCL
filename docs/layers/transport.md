@@ -32,7 +32,7 @@
 - 非阻塞语义是硬约束：`TrySend`/`TryRecv` 绝不阻塞。
 - 方向只是元数据，不是操作许可：TCP 在任何方向下都能收发（bootstrap 在同一个双向对象上收发控制消息）。方向只决定 `GetPollEvents()`（`Send`→`EPOLLOUT`，`Receive`→`EPOLLIN`，`Bidirectional`→两者）；只有按方向拒绝反向操作的实现（如共享内存端点）才把方向当约束。
 - 就绪位的含义由 transport 决定，不由 operation 决定：socket 是「可写=发送可推进、可读=接收可推进」，而共享内存发送端等的是**可读**的 eventfd。所以 executor 一律用 `GetPollEvents()` 拿掩码，并用「就绪来自 send 还是 recv transport」决定推进哪个逻辑操作，不得自行把位解释成方向。
-- `GetFd()` 返回的 fd 生命周期由 transport 管理；同一个 transport 在两个方向上可以给出同一个 fd，executor 必须按 fd 合并注册。
+- `GetFd()` 返回的 fd 生命周期由 transport 管理；executor 只注册/注销。channel 边的 send/recv 是各自独立的 transport 对象，fd 必然不同（见 `AGENTS.md` 的 Known Conventions），executor 可以按「一个 transport 一个等待」处理，无需合并同一 fd 的多路注册。
 
 ### 设计区间
 
