@@ -27,8 +27,8 @@ find_package(fmt REQUIRED)
 
 set(ORIGIN_CCL_SOURCES
     src/utils.cpp
-    src/transport_tcp.cpp
-    src/transport_shm.cpp
+    src/transport/transport_tcp.cpp
+    src/transport/transport_shm.cpp
     src/topology_ring.cpp
     src/bootstrap.cpp
     src/planner.cpp

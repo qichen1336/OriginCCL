@@ -23,8 +23,10 @@ OriginCCL 是一个受 NCCL 启发的 C++ 集合通信（collective communicatio
 ```
 include/                   公开头（平铺）
 include/executor/          executor 头（限定路径引用：#include "executor/executor.h"）
+include/transport/         transport 头（限定路径引用：#include "transport/transport.h"）
 src/                       实现（平铺）
 src/executor/              四种 executor 实现
+src/transport/             TCP 与共享内存传输实现
 tests/                     三个测试二进制
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
 scripts/                   run_tests.sh / run_all_executors.sh
@@ -32,7 +34,7 @@ scripts/                   run_tests.sh / run_all_executors.sh
 
 | 层 | 头文件 | 职责 | 铁律 |
 | --- | --- | --- | --- |
-| **transport** | `transport.h` / `transport_tcp.h` / `transport_shm.h` | 字节搬运 + 就绪可等待性（readiness） | 见下方“transport 就绪契约”；TCP 与 SHM 同构（listener + connection 双形态） |
+| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` | 字节搬运 + 就绪可等待性（readiness） | 见下方“transport 就绪契约”；TCP 与 SHM 同构（listener + connection 双形态） |
 | **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 只做事件处理，非阻塞，见下方契约 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | 编译期选定；是 task 游标的**唯一推进者** |

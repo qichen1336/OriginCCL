@@ -2,7 +2,7 @@
 
 执行策略层。**只决定如何等待 socket 就绪**，算法推进交给 `Topology::AllreduceStep`。改动 executor 前阅读本文件。
 
-其他层仍是 `include/`、`src/` 平铺，只有 executor 单独成目录。头文件从 include 根限定引用，
+executor 与 transport 单独成目录，其余层仍是 `include/`、`src/` 平铺。头文件从 include 根限定引用，
 形如 `#include "executor/executor.h"`、`#include "executor/epoll_executor.h"`。
 
 ## 核心职责边界

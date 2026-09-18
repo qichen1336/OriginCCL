@@ -7,7 +7,7 @@
 #include "bootstrap.h"
 #include "utils.h"
 #include "logger.h"
-#include "transport_tcp.h"
+#include "transport/transport_tcp.h"
 
 bool Bootstrap::Run(const CommConfig& config, uint16_t data_port, int bootstrap_listen_fd,
                     std::vector<NodeInfo>& all_nodes) {

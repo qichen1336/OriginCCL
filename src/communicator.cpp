@@ -13,8 +13,8 @@
 #include "logger.h"
 #include "utils.h"
 #include "bootstrap.h"
-#include "transport_tcp.h"
-#include "transport_shm.h"
+#include "transport/transport_tcp.h"
+#include "transport/transport_shm.h"
 #include "topology_ring.h"
 
 #if defined(OCCL_EXECUTOR_EPOLL)

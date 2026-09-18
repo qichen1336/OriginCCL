@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include "transport_shm.h"
+#include "transport/transport_shm.h"
 #include "logger.h"
 
 namespace {
