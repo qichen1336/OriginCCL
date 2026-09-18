@@ -10,9 +10,7 @@
 #include "logger.h"
 
 namespace {
-// Channel slots are small indices, so a saturated tag can never collide with one.
 constexpr uint32_t kNotifyTag = 0xFFFFFFFFu;
-// Logical steps a job must run, accumulated from the registrations that fired.
 constexpr uint32_t kStepWritable = 1u;
 constexpr uint32_t kStepReadable = 2u;
 } // namespace
@@ -36,9 +34,6 @@ void ReactorExecutor::Shutdown() {
     }
 }
 
-// Stop and join every worker, then drop anything still queued. Run() calls this on a
-// fatal wait failure so that no worker can still hold a PlanTask pointer once Run
-// returns; Shutdown() relies on it too, before the channel transports go away.
 void ReactorExecutor::StopWorkers() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -72,8 +67,6 @@ bool ReactorExecutor::EnsureEpoll() {
         return false;
     }
 
-    // The completion eventfd shares the epoll instance with the transport fds, so one
-    // epoll_wait covers both readiness and worker results.
     notify_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (notify_fd_ < 0) {
         LOG_ERROR("Failed to create reactor eventfd: {}", strerror(errno));
@@ -107,9 +100,6 @@ void ReactorExecutor::EnsureWorkers() {
     }
 }
 
-// Register the readiness a task's transports ask to be waited on. Each task registers up to
-// two distinct descriptors: recv at side 0, send at side 1. The tag carries slot and side,
-// so an event maps back to its channel and operation.
 bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
     const uint32_t tag_base = static_cast<uint32_t>(slot) * 2u;
     if (task.recv_transport) {
@@ -141,8 +131,6 @@ bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
     return true;
 }
 
-// Remove a task's registrations. Transports are reused across plans, so a finished or
-// in-flight task must be deregistered or the next EPOLL_CTL_ADD fails with EEXIST.
 void ReactorExecutor::UnregisterTask(const PlanTask& task) {
     if (task.recv_transport) {
         int fd = task.recv_transport->GetFd();
@@ -166,8 +154,6 @@ void ReactorExecutor::PostWork(const WorkItem& item) {
     work_ready_.notify_one();
 }
 
-// The completion must reach the queue before the eventfd is written: the reactor drains
-// the eventfd first, so a wakeup without a visible completion would be lost.
 void ReactorExecutor::PostCompletion(const Completion& completion) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -210,9 +196,6 @@ void ReactorExecutor::WorkerLoop() {
                 LOG_ERROR("Reactor worker failed to init task on channel {}", item.slot);
             }
         } else {
-            // Feed every logical step carried by this job. A single step's send and
-            // recv transfers must both advance: 2-rank rings degenerate to
-            // prev == next, so starving the matching recv deadlocks.
             if ((item.steps & kStepWritable) != 0) {
                 ok = topo->AllreduceStep(*item.task, CollEvent::Writable);
             }
@@ -245,9 +228,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
     }
     EnsureWorkers();
 
-    // One outstanding task per channel keeps the loop free of cross-channel head-of-line
-    // blocking. The reactor thread owns these cursors and is the only writer; a worker
-    // sees a task only through the WorkItem it was handed.
     const size_t channel_count = plan.channels.size();
     std::vector<PlanTask*> current(channel_count, nullptr);
     std::vector<size_t> task_index(channel_count, 0);
@@ -263,8 +243,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
         StopWorkers();
     };
 
-    // Queue a channel's front task. AllreduceInit runs on a worker like any other step,
-    // so the reactor thread never calls into a topology itself.
     auto start_next = [&](size_t slot) -> bool {
         while (task_index[slot] < plan.channels[slot].tasks.size()) {
             PlanTask& task = const_cast<PlanTask&>(plan.channels[slot].tasks[task_index[slot]]);
@@ -289,7 +267,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
     }
 
     std::vector<struct epoll_event> events(channel_count * 2 + 1);
-    // Reused across wakeups: the readiness accumulated for this batch, in logical steps.
     std::vector<uint32_t> ready_steps(channel_count, 0);
     while (active > 0 || in_flight > 0) {
         int ready = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), -1);
@@ -298,14 +275,10 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
                 continue;
             }
             LOG_ERROR("Reactor epoll_wait failed: {}", strerror(errno));
-            // There is no safe way to keep waiting; tear the plan down before returning.
             abort_plan();
             return false;
         }
 
-        // Merge readiness per slot first: the send and receive registrations of one channel
-        // are separate epoll entries carrying the same slot tag, and a single step must feed
-        // every logical operation that fired.
         std::fill(ready_steps.begin(), ready_steps.end(), 0);
         bool notify = false;
         for (int e = 0; e < ready; ++e) {
@@ -319,11 +292,9 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
                 continue;
             }
 
-            // Side 0 is the recv registration, side 1 the send one; each advances exactly
-            // one logical step.
             size_t side = tag % 2u;
-            Transport* transport = (side == 0) ? current[slot]->recv_transport.get()
-                                               : current[slot]->send_transport.get();
+            Transport* transport =
+                (side == 0) ? current[slot]->recv_transport.get() : current[slot]->send_transport.get();
             if (!transport || (events[e].events & transport->GetPollEvents()) == 0) {
                 continue;
             }
@@ -334,9 +305,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             }
         }
 
-        // Hand every ready channel to the pool. The fds leave epoll for the duration of
-        // the step, so level-triggered epoll cannot keep reporting a writable socket
-        // while a worker is already advancing that task.
         for (size_t slot = 0; slot < channel_count; ++slot) {
             if (ready_steps[slot] == 0 || current[slot] == nullptr) {
                 continue;
@@ -363,11 +331,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             --in_flight;
 
             size_t slot = completion.slot;
-            // A step job belongs to a channel already counted in `active`. An init job
-            // only joins that count once it turns out to need the network, which is what
-            // keeps a single-rank plan (every task completes immediately) out of an
-            // empty epoll_wait. Every path that retires the channel's current task has to
-            // return the count, or a lone channel keeps the loop alive forever.
             const bool counted = !completion.init;
 
             if (completion.state == JobState::Failed) {
@@ -376,9 +339,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
             }
 
             if (completion.state == JobState::Waiting) {
-                // current[slot] stays set on failure: RegisterTask may have added the recv
-                // fd before the send fd failed, so abort_plan must still see the task to
-                // deregister that half-registered pair.
                 if (!RegisterTask(slot, *current[slot])) {
                     abort_plan();
                     return false;
@@ -389,7 +349,6 @@ bool ReactorExecutor::Run(const CollPlan& plan) {
                 continue;
             }
 
-            // JobState::Done: settle this task and queue the channel's next one.
             if (counted) {
                 --active;
             }

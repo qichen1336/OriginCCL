@@ -28,9 +28,6 @@ bool EpollExecutor::EnsureEpoll() {
     return true;
 }
 
-// Register the readiness a task's transports ask to be waited on. Each task registers up to
-// two distinct descriptors: recv at side 0, send at side 1. The tag carries slot and side,
-// so an event maps back to its channel and operation.
 bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
     const uint32_t tag_base = static_cast<uint32_t>(slot) * 2u;
     if (task.recv_transport) {
@@ -62,8 +59,6 @@ bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
     return true;
 }
 
-// Remove a task's registrations. Transports are reused across plans, so a finished task
-// must be deregistered or the next plan's EPOLL_CTL_ADD fails with EEXIST.
 void EpollExecutor::UnregisterTask(const PlanTask& task) {
     if (task.recv_transport) {
         int fd = task.recv_transport->GetFd();
@@ -87,16 +82,10 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         return false;
     }
 
-    // One outstanding task per channel keeps the single-threaded loop free of
-    // cross-channel head-of-line blocking. current[i] is the task we are waiting on. The
-    // executor owns each channel's cursor, so it steps tasks through a mutable reference.
     std::vector<PlanTask*> current(plan.channels.size(), nullptr);
     std::vector<size_t> task_index(plan.channels.size(), 0);
     size_t active = 0;
 
-    // A failure abandons the whole plan. Every fd still registered must leave epoll
-    // first: they belong to channel transports reused across plans, so a leftover
-    // registration makes the next plan's EPOLL_CTL_ADD fail with EEXIST.
     auto abort_plan = [&]() {
         for (PlanTask* task : current) {
             if (task) {
@@ -105,9 +94,6 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         }
     };
 
-    // Start a channel's front task and, while tasks complete immediately (the no-data-
-    // plane single-rank path), keep advancing. Only a task that genuinely waits on the
-    // network is left registered in epoll and counted in `active`.
     auto start = [&](size_t slot) -> bool {
         while (task_index[slot] < plan.channels[slot].tasks.size()) {
             PlanTask& task = const_cast<PlanTask&>(plan.channels[slot].tasks[task_index[slot]]);
@@ -154,18 +140,13 @@ bool EpollExecutor::Run(const CollPlan& plan) {
                 continue;
             }
 
-            // Side 0 is the recv registration, side 1 the send one; each advances exactly
-            // one operation, so the event's tag alone says what to feed.
             size_t side = tag % 2u;
-            Transport* transport = (side == 0) ? task->recv_transport.get()
-                                               : task->send_transport.get();
+            Transport* transport = (side == 0) ? task->recv_transport.get() : task->send_transport.get();
             if (!transport || (events[e].events & transport->GetPollEvents()) == 0) {
                 continue;
             }
 
             Topology* topo = task->topology.get();
-            // A false return is the failure channel, so abandon the plan there and then
-            // instead of spinning on a task that can never reach a done state.
             CollEvent op = (side == 0) ? CollEvent::Readable : CollEvent::Writable;
             if (!topo->AllreduceStep(*task, op)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);

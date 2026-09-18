@@ -6,9 +6,6 @@
 #include "executor/executor.h"
 #include "topology.h"
 
-// Single-threaded event-driven executor. One thread registers every channel's current
-// task fds into a single epoll instance and advances whichever becomes ready. No worker
-// threads are spawned; the calling thread drives the whole plan to completion.
 class EpollExecutor : public Executor {
 public:
     EpollExecutor() = default;

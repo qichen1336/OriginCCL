@@ -4,8 +4,7 @@
 #include "logger.h"
 #include "communicator.h"
 
-// On a single host (the only setup this tier can exercise) every rank must map to the
-// same machine, so the local view degenerates to the global one.
+// This tier runs on one host, so the local view degenerates to the global one.
 bool TestLocalInfo(const Communicator& comm) {
     int rank = comm.GetRank();
     int world_size = comm.GetWorldSize();

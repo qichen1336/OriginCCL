@@ -57,11 +57,6 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return false;
     }
 
-    // Wait on the readiness each transport provides: readiness on the receive transport
-    // advances the recv, readiness on the send transport the send. The two transports are
-    // always distinct descriptors (each channel edge is its own directed connection), so
-    // each registration advances exactly one operation. Poll and epoll share bit values on
-    // Linux, so the mask is used as-is.
     while (!topo->AllreduceDone(task)) {
         struct pollfd fds[2];
         CollEvent ops[2];
@@ -103,7 +98,6 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
             return false;
         }
 
-        // Feed every registration that fired; each advances exactly one operation.
         for (nfds_t i = 0; i < nfds; ++i) {
             if ((fds[i].revents & fds[i].events) == 0) {
                 continue;
@@ -135,7 +129,6 @@ void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch
         if (channel_id < plan->channels.size()) {
             const ChannelPlan& channel = plan->channels[channel_id];
             for (const PlanTask& task : channel.tasks) {
-                // This worker exclusively owns its channel's task cursor for the batch.
                 if (!ExecuteTask(channel.channel_id, const_cast<PlanTask&>(task))) {
                     success = false;
                     break;

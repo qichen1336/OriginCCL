@@ -27,10 +27,6 @@ enum class CollFunc {
     AllReduce
 };
 
-// Bootstrap rendezvous handle. Rank 0 fills in the address it listens on and hands the id
-// to every other rank, so no rank but the root needs to know (or choose) the master
-// address. Trivially copyable and self-contained, so a launcher can move it as raw bytes
-// (MPI_Bcast with MPI_BYTE).
 struct UniqueId {
     char ip_addr[64] = {};
     uint16_t port = 0;
@@ -64,24 +60,13 @@ struct CollTask {
     ReduceOp op = ReduceOp::SUM;
 };
 
-// Readiness event delivered to the topology. The executor watches both the read and the
-// write fd of a task and reports which one fired, so the topology advances exactly the
-// matching transfer instead of probing both.
 enum class CollEvent {
     Readable,
     Writable
 };
 
-// Minimal pure-data cursor for one collective. The planner value-initializes it; the
-// topology advances it in AllreduceStep(). Only the irreducible per-step state is kept:
-// a step's send and recv transfers proceed concurrently (2-rank rings degenerate to
-// prev == next, so serializing them deadlocks), hence each has its own byte progress and
-// done flag. Everything else (chunk layout, pointers, byte counts) is recomputed from
-// phase/step/rank on demand. No callbacks, so the plan stays free of std::function.
-// Failure is not part of the cursor: AllreduceInit/AllreduceStep return false and the
-// executor abandons the collective, so a cursor only ever holds a progressing operation.
 struct CollOpState {
-    int phase = 0; // 0 = unstarted, 1 = reduce-scatter, 2 = all-gather, 3 = done
+    int phase = 0;
     int step = 0;
     size_t send_progress = 0;
     size_t recv_progress = 0;
@@ -95,8 +80,6 @@ struct PlanTask {
     const void* send_buf = nullptr;
     void* recv_buf = nullptr;
     size_t elem_count = 0;
-    // Elements per ring chunk for this slice: ceil(elem_count / world_size). The planner
-    // computes it once; the ring topology only reads it.
     size_t chunk_size = 0;
     DataType dtype = DataType::FLOAT32;
     ReduceOp reduce_op = ReduceOp::SUM;
@@ -105,7 +88,6 @@ struct PlanTask {
     std::shared_ptr<Topology> topology;
     std::shared_ptr<Transport> send_transport;
     std::shared_ptr<Transport> recv_transport;
-    // Algorithm cursor advanced in place by the executor that owns this channel.
     CollOpState state;
 };
 

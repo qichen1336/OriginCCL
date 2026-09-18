@@ -14,15 +14,13 @@
 
 namespace {
 constexpr uint32_t kShmResourceMagic = 0x53484d31; // "SHM1"
-constexpr size_t kShmResourceFdCount = 3;          // ring, data-ready, space-ready
+constexpr size_t kShmResourceFdCount = 3;
 constexpr int kShmRendezvousBacklog = 128;
 
 std::string ErrnoText() {
     return strerror(errno);
 }
 
-// The rendezvous message is one fixed-size write, so a SOCK_SEQPACKET transfer either
-// arrives whole or is rejected as a protocol error.
 struct RendezvousAddress {
     sockaddr_un addr{};
     socklen_t length = 0;
@@ -69,7 +67,6 @@ bool TransportShm::ListenPath(const std::string& rendezvous_path) {
     if (!address.Set(rendezvous_path)) {
         return false;
     }
-    // A previous run may have died without unlinking its socket; the path is ours to take.
     unlink(rendezvous_path.c_str());
 
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -174,8 +171,6 @@ bool TransportShm::CreateRing() {
     if (!MapRing(resources.ring)) {
         return false;
     }
-    // The space-ready count starts at one so an event-driven producer can begin without
-    // polling the ring; the new ring is empty, so data-ready starts at zero.
     resources.data_ready = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     resources.space_ready = eventfd(1, EFD_NONBLOCK | EFD_CLOEXEC);
     if (resources.data_ready < 0 || resources.space_ready < 0) {
@@ -194,9 +189,6 @@ bool TransportShm::MapRing(int fd) {
         return false;
     }
     map = static_cast<char*>(addr);
-    // The mapping is raw storage otherwise: start the cursors' lifetime before touching
-    // them. Both endpoints do this while the ring is still empty, so neither resets state
-    // the other published.
     new (map) ShmRingCursors{};
     return true;
 }
@@ -361,9 +353,6 @@ bool TransportShm::TrySend(const void* data, size_t size, size_t* progress, bool
         if (chunk > 0) {
             continue;
         }
-        // The ring is the only source of truth: drop notifications that did not come with
-        // space, then look again, so a stale count neither spins the caller nor hides the
-        // space this call just gave up on.
         Drain(resources.space_ready);
         if (SpaceAvailable() == 0) {
             break;

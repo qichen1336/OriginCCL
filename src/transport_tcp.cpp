@@ -16,8 +16,6 @@ TransportTCP::~TransportTCP() {
     Close();
 }
 
-// Only the wait mask follows the direction: a socket is writable when its send side can
-// advance and readable when its receive side can. Send/Recv stay usable either way.
 uint32_t TransportTCP::GetPollEvents() const {
     if (sockfd < 0) {
         return EPOLLIN;

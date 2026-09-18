@@ -18,8 +18,6 @@ bool Bootstrap::Run(const CommConfig& config, uint16_t data_port, int bootstrap_
     }
 }
 
-// The listener is bound by the communicator (GetUniqueId) and stays open until Finalize, so
-// the port the other ranks were handed cannot be taken before the first accept.
 bool Bootstrap::RunMaster(const CommConfig& config, uint16_t data_port, int listen_fd,
                           std::vector<NodeInfo>& all_nodes) {
     LOG_INFO("Bootstrap - Master: Running as master with world size {}", config.world_size);

@@ -19,14 +19,6 @@ public:
 
     virtual void FillChannels(std::vector<Channel>& channels) const = 0;
 
-    // The topology owns the collective algorithm and treats the task's CollOpState as
-    // its cursor; the executor owns how to wait for socket readiness. The executor
-    // registers the task's send/recv fds (both read and write) and calls AllreduceStep()
-    // with the event that fired. It never blocks and advances only the matching transfer.
-    //
-    // Init and Step report failure through their return value — that is the only error
-    // channel, and the executor must abandon the collective as soon as it sees false.
-    // Done therefore means "completed successfully"; a failed task never becomes done.
     virtual bool AllreduceInit(PlanTask& task) const noexcept = 0;
     virtual bool AllreduceStep(PlanTask& task, CollEvent event) const noexcept = 0;
     virtual bool AllreduceDone(const PlanTask& task) const = 0;

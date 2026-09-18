@@ -10,19 +10,6 @@
 #include "types.h"
 #include "executor/executor.h"
 
-// Reactor executor: the calling thread only waits for readiness in epoll, and a pool of
-// worker threads runs every topology call. The reactor thread owns fd registration, the
-// per-channel task cursor and the decision to start the next task; a worker only runs
-// AllreduceInit/AllreduceStep on the one task it was handed. A PlanTask cursor therefore
-// never has two writers, because a channel's fds are removed from epoll while its step is
-// in flight.
-//
-// Thread hand-off:
-//   reactor -> worker  a mutex-protected FIFO queue plus a condition variable; an idle
-//                      worker pops the next job, so no channel is bound to a worker.
-//   worker  -> reactor a mutex-protected completion queue plus an eventfd write. The
-//                      eventfd is registered in the same epoll instance, so the reactor
-//                      needs a single wait to observe both socket readiness and results.
 class ReactorExecutor : public Executor {
 public:
     static constexpr size_t kDefaultWorkers = 4;
@@ -47,8 +34,6 @@ private:
         size_t slot = 0;
         PlanTask* task = nullptr;
         bool init = false;
-        // Logical step bits (kStepWritable / kStepReadable), not raw epoll bits: only the
-        // registration that fired knows which operation its readiness advances.
         uint32_t steps = 0;
     };
 

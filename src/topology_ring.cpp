@@ -7,7 +7,6 @@
 #include "logger.h"
 
 namespace {
-// CollOpState.phase values.
 constexpr int kPhaseUnstarted = 0;
 constexpr int kPhaseReduceScatter = 1;
 constexpr int kPhaseAllGather = 2;
@@ -18,8 +17,6 @@ size_t ChunkElemCount(size_t count, size_t chunk_size, int chunk_index) {
     return start >= count ? 0 : std::min(chunk_size, count - start);
 }
 
-// Recompute the current step's chunk indices from the cursor. Everything about a step's
-// layout is derivable from phase/step/rank, so the cursor does not store it.
 int SendChunk(const PlanTask& task) {
     const CollOpState& s = task.state;
     if (s.phase == kPhaseReduceScatter) {
@@ -44,8 +41,6 @@ size_t RecvBytes(const PlanTask& task) {
     return ChunkElemCount(task.elem_count, task.chunk_size, RecvChunk(task)) * Utils::GetDataTypeSize(task.dtype);
 }
 
-// ReduceScatter receives into the scratch buffer (folded in on completion); AllGather
-// receives straight into the destination chunk.
 char* RecvPtr(const PlanTask& task) {
     const CollOpState& s = task.state;
     if (s.phase == kPhaseReduceScatter) {
@@ -60,7 +55,6 @@ const char* SendPtr(const PlanTask& task) {
            static_cast<size_t>(SendChunk(task)) * task.chunk_size * Utils::GetDataTypeSize(task.dtype);
 }
 
-// Reset the per-step transfer progress in the cursor for the step just entered.
 void BeginStep(PlanTask& task) {
     CollOpState& s = task.state;
     s.send_progress = 0;
@@ -69,8 +63,6 @@ void BeginStep(PlanTask& task) {
     s.recv_done = (RecvBytes(task) == 0);
 }
 
-// A step is complete when both its transfers finish; fold the scratch buffer into the
-// reduced chunk (ReduceScatter only), then advance the phase machine.
 void CompleteStep(PlanTask& task) {
     CollOpState& s = task.state;
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
@@ -171,9 +163,6 @@ bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const noexcept
         return true;
     }
 
-    // Advance only the transfer whose readiness fired. A send-fd writable event drives the
-    // send; a recv-fd readable event drives the recv. Both run concurrently within a step.
-    // A false return is the failure channel; the executor abandons the collective on it.
     if (event == CollEvent::Writable && !s.send_done) {
         if (!task.send_transport->TrySend(SendPtr(task), SendBytes(task), &s.send_progress, &s.send_done)) {
             LOG_ERROR("Ring AllReduce send failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);

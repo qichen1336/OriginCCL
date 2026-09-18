@@ -24,8 +24,6 @@ bool PollingExecutor::Run(const CollPlan& plan) {
         return true;
     }
 
-    // One outstanding task per channel; never wait on any fd, just keep stepping. The
-    // executor owns each channel's cursor, so it steps tasks through a mutable reference.
     std::vector<PlanTask*> current(plan.channels.size(), nullptr);
     std::vector<size_t> task_index(plan.channels.size(), 0);
     size_t active = 0;
@@ -52,9 +50,6 @@ bool PollingExecutor::Run(const CollPlan& plan) {
             size_t before_recv = task->state.recv_progress;
             int before_phase = task->state.phase;
 
-            // No real readiness event exists when polling: drive whichever transfer is
-            // still unfinished (both may advance, send first). A false return is the
-            // failure channel, so abandon the whole plan then and there.
             if (!task->state.send_done && !topo->AllreduceStep(*task, CollEvent::Writable)) {
                 LOG_ERROR("PollingExecutor step failed on channel {}", plan.channels[i].channel_id);
                 return false;

@@ -20,8 +20,7 @@ namespace {
 
 int failures = 0;
 
-// Every step of a scenario is a bounded exchange, so a silent forked endpoint is a
-// failure rather than a deadlock.
+// A silent forked endpoint must fail rather than deadlock.
 constexpr int kAwaitTimeoutMs = 5000;
 
 bool Expect(bool condition, const std::string& what) {
@@ -62,8 +61,7 @@ bool ReadableNow(int fd) {
     return poll(&pfd, 1, 0) > 0;
 }
 
-// One-way byte pipe, used to order the two forked endpoints around operations that would
-// otherwise race. Each side reads one pipe and writes the other.
+// Orders the two forked endpoints around operations that would otherwise race.
 struct Pipe {
     int read_fd = -1;
     int write_fd = -1;
@@ -100,8 +98,7 @@ bool Await(const Pipe& pipe) {
     return rc == 1;
 }
 
-// The payload both endpoints derive independently, so a transfer that corrupts bytes is
-// caught without sharing a buffer.
+// Derived by both endpoints independently, so corruption is caught without sharing a buffer.
 char PayloadByte(size_t index) {
     return static_cast<char>((index * 7 + 13) % 251);
 }
@@ -124,16 +121,14 @@ bool PayloadMatches(const char* buffer, size_t length, size_t offset) {
     return true;
 }
 
-// The communicator's connection handshake, which on shared memory travels over the
-// control socket before the ring carries data.
+// The communicator's connection handshake: on shared memory it travels over the control socket.
 struct ControlHandshake {
     int rank = 0;
     int channel_id = 0;
     int is_send = 0;
 };
 
-// Open descriptor counts around the control handshake: one less afterwards means the
-// transport really did use the control socket and then close it.
+// One less open descriptor after the handshake means the control socket was really closed.
 struct HandshakeFacts {
     int fds_before = 0;
     int fds_after = 0;
@@ -142,9 +137,7 @@ struct HandshakeFacts {
 using ActiveWork = std::function<bool(Transport&, const HandshakeFacts&, Pipe&, Pipe&)>;
 using PassiveWork = std::function<bool(Transport&, const HandshakeFacts&, Pipe&, Pipe&)>;
 
-// Establishes one shared-memory pair: the listener lives in this process, the active
-// endpoint lives in a forked child, and the control handshake is exchanged before either
-// side's work runs.
+// One shared-memory pair: listener here, active endpoint in a forked child, handshake first.
 bool RunPair(const std::string& tag, const ActiveWork& active, const PassiveWork& passive) {
     const std::string path = "/tmp/originccl-shm-test-" + std::to_string(getpid()) + "-" + tag + ".sock";
     Pipe to_child = OpenPipe();
@@ -222,9 +215,7 @@ bool RunPair(const std::string& tag, const ActiveWork& active, const PassiveWork
     return passed;
 }
 
-// Rendezvous and descriptor transfer happen in RunPair; this checks the readiness contract
-// of the established endpoints and drives one blocking transfer whose payload is larger
-// than the ring, so it cannot travel over the control socket.
+// Checks the readiness contract and drives one blocking transfer larger than the ring.
 bool TestBlockingTransfer() {
     const size_t size = 3 * 1024 * 1024;
 
@@ -263,10 +254,7 @@ bool TestBlockingTransfer() {
     return RunPair("blocking", active, passive);
 }
 
-// Drives a payload past the ring capacity through the non-blocking interface only, so
-// partial progress, backpressure, the peek on the cursors and both wrap points are all
-// exercised. The two endpoints alternate explicitly, which makes every step's expected
-// byte count exact instead of timing dependent.
+// Non-blocking only: partial progress, backpressure and both wrap points, step by step.
 bool TestNonBlockingWrapAndBackpressure() {
     constexpr size_t kSlice = 1024 * 1024;
     const size_t size = kShmRingCapacity + 2 * kSlice + kSlice / 2; // 2 MiB + 1 MiB + 1.5 MiB
@@ -339,8 +327,7 @@ bool TestNonBlockingWrapAndBackpressure() {
     return RunPair("non_blocking", active, passive);
 }
 
-// Repeated rounds prove that neither endpoint is left permanently readable by the counts
-// it accumulated earlier, and that a later transfer still wakes the other side.
+// Repeated rounds: no endpoint stays readable from stale counts, and later sends still wake.
 bool TestRepeatedOperations() {
     constexpr int kRounds = 3;
     constexpr size_t kRoundBytes = 64;
@@ -387,8 +374,7 @@ bool TestRepeatedOperations() {
     return RunPair("repeated", active, passive);
 }
 
-// A shared-memory endpoint carries one direction only, so the opposite operation is a
-// reported error rather than a silently unusable transfer. The errors below are expected.
+// The opposite operation is a reported error, not a silently unusable transfer.
 bool TestDirectionRejection() {
     LOG_INFO("Expect direction errors: the next checks call the wrong operation on purpose");
     const ActiveWork active = [](Transport& producer, const HandshakeFacts&, Pipe&, Pipe&) {
@@ -418,8 +404,7 @@ bool TestDirectionRejection() {
     return RunPair("direction", active, passive);
 }
 
-// Closing an established endpoint has to give back everything it owns: the wait
-// descriptor and the mapping.
+// Closing an endpoint gives back its wait descriptor and its ring mapping.
 bool TestResourceRelease() {
     const ActiveWork active = [](Transport&, const HandshakeFacts&, Pipe&, Pipe&) { return true; };
 
@@ -440,8 +425,7 @@ bool TestResourceRelease() {
     return RunPair("release", active, passive);
 }
 
-// Nothing here falls back to TCP: a rendezvous that cannot be reached fails the endpoint,
-// and the listener owns and later removes its socket path. The errors below are expected.
+// Setup failures fail the endpoint, with no fallback to TCP.
 bool TestSetupFailures() {
     LOG_INFO("Expect setup errors: the next checks use a missing path and a port on purpose");
     const std::string prefix = "/tmp/originccl-shm-test-" + std::to_string(getpid());

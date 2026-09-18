@@ -28,8 +28,6 @@
 #endif
 
 namespace {
-// The executor is a compile-time choice: exactly one OCCL_EXECUTOR_* macro is defined by
-// the build, so there is a single concrete type per library build and no runtime branch.
 #if defined(OCCL_EXECUTOR_EPOLL)
 constexpr const char* kExecutorName = "epoll";
 using DefaultExecutor = EpollExecutor;
@@ -44,15 +42,10 @@ constexpr const char* kExecutorName = "multi_thread";
 using DefaultExecutor = MultiThreadExecutor;
 #endif
 
-// Default number of channels when config.n_channels is unset or non-positive.
 constexpr int kDefaultChannelCount = 4;
 
-// Shared-memory rendezvous sockets all live in one directory: the port (now chosen by rank
-// 0) plus the rank is the only key a run needs, and a directory that cannot be created
-// fails every rank the same way, before any listener exists.
 constexpr const char* kRendezvousDir = "/tmp/originccl";
 
-// OCCL_DISABLE_SHM=1 forces TCP; any other value keeps local edges on shared memory.
 bool SharedMemoryEnabled() {
     const char* value = std::getenv("OCCL_DISABLE_SHM");
     return value == nullptr || std::strcmp(value, "1") != 0;
@@ -121,7 +114,6 @@ bool Communicator::Init(const CommConfig& cfg) {
         return true;
     }
 
-    // Bound before bootstrap and kept open, so the announced data-port cannot be taken.
     auto tcp_listener = std::make_shared<TransportTCP>();
     if (!tcp_listener->Listen(0)) {
         LOG_ERROR("Rank {}: Failed to create the data-plane listener", config.rank);
@@ -303,12 +295,10 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
         }
 
         const auto& peer_info = all_nodes[edge.peer];
-        // Host identity is the bootstrap hostname; only a peer that shares it rendezvouses.
         const bool local_edge = use_shm && peer_info.hostname == all_nodes[config.rank].hostname;
         std::shared_ptr<Transport> transport;
         if (local_edge) {
             auto shm_transport = std::make_shared<TransportShm>();
-            // The direction picks the ring half, so it must be set before the rendezvous.
             shm_transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
             if (!shm_transport->Connect(RendezvousPath(config.unique_id.port, edge.peer), 0)) {
                 LOG_ERROR("Rank {}: Failed to connect to rank {} channel {} over shared memory", config.rank, edge.peer,
@@ -336,9 +326,6 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
                 error_occurred = true;
                 return false;
             }
-            // A channel edge is one directed connection, so the transport knows which
-            // operation its readiness gates. TCP keeps working in both directions
-            // regardless, because bootstrap drives its control traffic over one object.
             tcp_transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
             transport = std::move(tcp_transport);
         }
@@ -380,7 +367,6 @@ bool Communicator::AcceptPassiveEdges(const std::vector<std::shared_ptr<Transpor
             return false;
         }
 
-        // Local and remote peers connect concurrently, so one loop serves both listeners.
         int ready = 0;
         do {
             ready = poll(poll_fds.data(), poll_fds.size(), -1);
