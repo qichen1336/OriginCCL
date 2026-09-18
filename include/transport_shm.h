@@ -116,6 +116,5 @@ private:
     int control_fd = -1;
     RingResources resources;
     char* map = nullptr;
-    bool active = false;
     bool connected = false;
 };

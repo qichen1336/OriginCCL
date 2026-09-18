@@ -142,19 +142,10 @@ struct HandshakeFacts {
 using ActiveWork = std::function<bool(Transport&, const HandshakeFacts&, Pipe&, Pipe&)>;
 using PassiveWork = std::function<bool(Transport&, const HandshakeFacts&, Pipe&, Pipe&)>;
 
-// Whether RunPair drives the control handshake before the endpoints' own work. The role
-// scenario needs the window before it, where nothing but the endpoint's role allows a
-// control transfer.
-enum class HandshakeMode {
-    Exchange,
-    Skip
-};
-
 // Establishes one shared-memory pair: the listener lives in this process, the active
 // endpoint lives in a forked child, and the control handshake is exchanged before either
 // side's work runs.
-bool RunPair(const std::string& tag, HandshakeMode handshake_mode, const ActiveWork& active,
-             const PassiveWork& passive) {
+bool RunPair(const std::string& tag, const ActiveWork& active, const PassiveWork& passive) {
     const std::string path = "/tmp/originccl-shm-test-" + std::to_string(getpid()) + "-" + tag + ".sock";
     Pipe to_child = OpenPipe();
     Pipe to_parent = OpenPipe();
@@ -184,7 +175,7 @@ bool RunPair(const std::string& tag, HandshakeMode handshake_mode, const ActiveW
         }
         HandshakeFacts facts;
         facts.fds_before = CountOpenFds();
-        const bool handshook = handshake_mode == HandshakeMode::Skip || producer.Send(&handshake, sizeof(handshake));
+        const bool handshook = producer.Send(&handshake, sizeof(handshake));
         facts.fds_after = CountOpenFds();
         if (!handshook) {
             LOG_ERROR("[{}] child: control handshake failed", tag);
@@ -203,14 +194,12 @@ bool RunPair(const std::string& tag, HandshakeMode handshake_mode, const ActiveW
     HandshakeFacts facts;
     facts.fds_before = CountOpenFds();
     ControlHandshake received;
-    const bool handshook = handshake_mode == HandshakeMode::Skip || consumer->Recv(&received, sizeof(received));
+    const bool handshook = consumer->Recv(&received, sizeof(received));
     facts.fds_after = CountOpenFds();
     bool passed = handshook;
     if (handshook) {
-        if (handshake_mode == HandshakeMode::Exchange) {
-            Expect(received.rank == 1 && received.channel_id == 0 && received.is_send == 1,
-                   "the connection handshake arrives intact");
-        }
+        Expect(received.rank == 1 && received.channel_id == 0 && received.is_send == 1,
+               "the connection handshake arrives intact");
         passed = passive(*consumer, facts, to_child, to_parent);
     } else {
         LOG_ERROR("[{}] control handshake failed on the accepted endpoint", tag);
@@ -271,7 +260,7 @@ bool TestBlockingTransfer() {
         return true;
     };
 
-    return RunPair("blocking", HandshakeMode::Exchange, active, passive);
+    return RunPair("blocking", active, passive);
 }
 
 // Drives a payload past the ring capacity through the non-blocking interface only, so
@@ -347,7 +336,7 @@ bool TestNonBlockingWrapAndBackpressure() {
         return true;
     };
 
-    return RunPair("non_blocking", HandshakeMode::Exchange, active, passive);
+    return RunPair("non_blocking", active, passive);
 }
 
 // Repeated rounds prove that neither endpoint is left permanently readable by the counts
@@ -395,7 +384,7 @@ bool TestRepeatedOperations() {
         return true;
     };
 
-    return RunPair("repeated", HandshakeMode::Exchange, active, passive);
+    return RunPair("repeated", active, passive);
 }
 
 // A shared-memory endpoint carries one direction only, so the opposite operation is a
@@ -426,26 +415,7 @@ bool TestDirectionRejection() {
         return true;
     };
 
-    return RunPair("direction", HandshakeMode::Exchange, active, passive);
-}
-
-// Before the handshake the control socket is still open, and only the endpoint's role
-// allows a control transfer: the active side sent the resources, so it sends the
-// handshake, and the passive side receives it. Nothing here may block either.
-bool TestHandshakeRoles() {
-    const ActiveWork active = [](Transport& producer, const HandshakeFacts&, Pipe&, Pipe&) {
-        std::vector<char> buffer(16, 0);
-        return Expect(!producer.Recv(buffer.data(), buffer.size()),
-                      "the active endpoint cannot receive the handshake it has to send");
-    };
-
-    const PassiveWork passive = [](Transport& consumer, const HandshakeFacts&, Pipe&, Pipe&) {
-        const std::vector<char> buffer(16, 0);
-        return Expect(!consumer.Send(buffer.data(), buffer.size()),
-                      "the passive endpoint cannot send the handshake it has to receive");
-    };
-
-    return RunPair("handshake_roles", HandshakeMode::Skip, active, passive);
+    return RunPair("direction", active, passive);
 }
 
 // Closing an established endpoint has to give back everything it owns: the wait
@@ -467,7 +437,7 @@ bool TestResourceRelease() {
         return true;
     };
 
-    return RunPair("release", HandshakeMode::Exchange, active, passive);
+    return RunPair("release", active, passive);
 }
 
 // Nothing here falls back to TCP: a rendezvous that cannot be reached fails the endpoint,
@@ -509,7 +479,6 @@ int main() {
     passed = TestNonBlockingWrapAndBackpressure() && passed;
     passed = TestRepeatedOperations() && passed;
     passed = TestDirectionRejection() && passed;
-    passed = TestHandshakeRoles() && passed;
     passed = TestResourceRelease() && passed;
     passed = TestSetupFailures() && passed;
 

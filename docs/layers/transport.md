@@ -17,8 +17,7 @@
 - 与 TCP 同构的 listener/connection 双形态：`ListenPath(path)` + `Accept()`（被动端），`Connect(rendezvous_path, port)`（主动端，`port` 忽略）。基类的 `Listen(uint16_t)` / `GetListenPort()` 只用来报告「共享内存绑的是路径不是端口」的误用，永远失败/返回 0。
 - 建立流程：主动端建 2 MiB 数据容量的 memfd 环 + data-ready/space-ready 两个 eventfd，用 `SOCK_SEQPACKET` + `SCM_RIGHTS` 一次性传给对端并带上自己的方向；被动端取补方向。环元数据是 cache line 分隔、单调递增的 `std::atomic<uint64_t>` head/tail（producer 写 head，consumer 写 tail，acquire/release 配对）。
 - 控制 socket 与数据面分开：调用方**第一次**阻塞 `Send`/`Recv`（即 communicator 的连接握手）走 control socket，接收方回 1 字节 ack，双方随即关闭 control socket；之后所有阻塞与非阻塞操作都走环。所以调用点不需要区分传输类型。
-- 方向在此**是**约束（与 TCP 不同）：producer 只 `Send`、consumer 只 `Recv`，反向调用 `LOG_ERROR` + `false`。方向管的是数据面，控制面握手两种方向都要用。
-- 控制面同样按角色设限：主动端（建环并发出 rendezvous 的那一端）只能发出握手、被动端只能接收握手。否则 producer 未握手时的第一个 `Recv` 会把握手字节当成数据，绕过方向约束。
+- 方向在此**是**约束（与 TCP 不同）：producer 只 `Send`、consumer 只 `Recv`，反向调用 `LOG_ERROR` + `false`。方向只约束数据面；control socket 存续期间不发方向校验，由调用方按自己的角色使用。
 - 就绪：`GetFd()` listening 返回 rendezvous fd，建立后返回本端 eventfd（producer 等 space-ready，consumer 等 data-ready）；`GetPollEvents()` 恒为 `EPOLLIN`（eventfd 的可读就是就绪）。space-ready 初值 1，所以事件驱动 producer 首发送不必先轮询；data-ready 初值 0。建立到握手完成之间真正可推进的是 control socket，但该窗口内 executor 不会运行（握手在 channel init 阶段完成），executor 拿到的始终是 eventfd。
 - 阻塞 `Send`/`Recv` 在环上靠 `poll()` 等本端 eventfd 完成；`TrySend`/`TryRecv` 绝不阻塞：推不动时先排空本端 eventfd 再复检环状态，然后才报「无进展」，一次成功调用最多通知对端一次。
 - **Linux 专属**：实现依赖 `memfd_create`、`eventfd`、Unix domain socket（`SOCK_SEQPACKET`）、`SCM_RIGHTS`、`poll`/`epoll`。非 Linux 平台不提供该实现，也不加条件编译下的降级路径。
@@ -54,6 +53,7 @@
 - 改动本层不得破坏非阻塞语义：`TrySend`/`TryRecv` 绝不阻塞。
 - 新增实现必须继承 `Transport` 基类并实现全部接口（含 `GetFd`/`GetPollEvents`）；`GetFd` 返回的 fd 生命周期由 transport 管理，executor 只注册/注销。
 - 勿回退：数据面只走 `TrySend`/`TryRecv`（历史曾有人把数据面改成阻塞 `Send`/`Recv`，导致死锁）。共享内存的阻塞 `Send`/`Recv` 只服务于调用方的首个握手与同类控制用途，executor 与 topology 一律走 `Try*`。
+- 勿回退：control socket 阶段**不加**角色门禁（主动端只能发、被动端只能收）。调用方（communicator）两端角色固定，门禁永不触发，只是多一个死分支。
 - 勿回退：executor 不得硬编码 `EPOLLIN`/`EPOLLOUT`，一律取 `GetPollEvents()`。
 - 共享内存实现不得引入自动回退到 TCP：任何建立/映射/传描述符/握手失败都直接让 communicator 初始化失败（`LOG_ERROR` + `false`）。
 - 环容量固定 2 MiB，不做可配置/动态扩容；一个环只允许单 producer + 单 consumer，不新增双向或多生产者模型。

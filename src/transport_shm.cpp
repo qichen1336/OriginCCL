@@ -157,7 +157,6 @@ bool TransportShm::Connect(const std::string& rendezvous_path, uint16_t port) {
     }
 
     control_fd = fd;
-    active = true;
     connected = true;
     return true;
 }
@@ -290,10 +289,6 @@ bool TransportShm::RecvResources(int fd, RingResources* incoming, TransportDirec
 
 bool TransportShm::Send(const void* data, size_t size) {
     if (control_fd >= 0) {
-        if (!active) {
-            LOG_ERROR("A passive shared-memory endpoint receives the connection handshake, it cannot send it");
-            return false;
-        }
         if (!SendControl(data, size)) {
             return false;
         }
@@ -324,10 +319,6 @@ bool TransportShm::Send(const void* data, size_t size) {
 
 bool TransportShm::Recv(void* data, size_t size) {
     if (control_fd >= 0) {
-        if (active) {
-            LOG_ERROR("An active shared-memory endpoint sends the connection handshake, it cannot receive it");
-            return false;
-        }
         if (!RecvControl(data, size)) {
             return false;
         }
