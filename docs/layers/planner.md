@@ -9,14 +9,14 @@
 - `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、topology 指针、对应 channel 的 send/recv transport。
 - `PlanTask.chunk_size`（每 chunk 元素数 = `ceil(elem_count / world_size)`）由 planner 计算填入，拓扑只读。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
-- `PlanTask.topology` 复用 `comm.GetTopology()`；planner 不新建拓扑。
+- `PlanTask.topology` 复用 `comm.GetTopology()`；planner 不新建拓扑。隐含保证是拓扑在 `Init` 已建好且只此一份，据此不做「拓扑是否为空」的防御检查。
 - 不负责：不展开算法步骤（topology）、不决定等待策略（executor）。
 
 ## 不变式与设计区间
 
 ### 不变式
 
-- **plan 无行为铁律**：plan 不使用 `std::function`、`execute` 回调、`pre_execute` 或 `post_execute`。`CollOpState` 是纯数据游标，不是回调。
+- **plan 无行为铁律**：plan 不使用 `std::function`、`execute` 回调、`pre_execute` 或 `post_execute`。`CollOpState` 是纯数据游标，不是回调。隐含保证是游标只被 executor 推进、拓扑不越权，据此不为 plan 注入任何执行回调。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`；planner 不重复赋值。
 - `PlanTask`、`ChannelPlan`、`CollPlan` 在 `include/types.h`：改字段必须同步 planner 与 executor。
 

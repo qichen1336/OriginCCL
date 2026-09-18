@@ -1,261 +1,76 @@
-# AGENTS.md
+# OriginCCL — Agent 指南（AGENTS.md）
+本文件是 AI 编码代理与贡献者在本仓库工作的权威指引，如果本文件内容与代码现状冲突，内容以**代码现状**为准，并主动提醒是否更新本文件。本文档不允许自行改动，一定要主动提醒经过同意！
 
-Guidance for AI coding agents (and the humans driving them) working on OriginCCL.
+## Project overview
+OriginCCL 是一个受 NCCL 启发的 C++ 集合通信（collective communication）库。
 
-This file is an *orientation map*, not the full rulebook. It holds the cross-layer
-rules, build/test thresholds, style, and commit conventions. Per-layer guidance on how
-to write and modify each layer's code — its responsibilities, invariants, design space,
-and modification rules — lives in `docs/layers/`.
-When this file and a layer doc disagree, **the layer doc wins** — and please fix this file.
+- 语言/标准：C++17
+- 构建：CMake（≥ 3.10），产物为共享库 `originccl`
+- 外部依赖（系统级，需预装）：
+  - **fmt**（≥ 9，已验证 10.2.1），必须提供 CMake package
+  - **Threads**
+  - 多进程测试仅支持 **Open MPI** 的 `mpirun`。
 
-## Overview
-
-OriginCCL is a C++17 collective-communication library. It follows the two-phase design
-used by NCCL: a bootstrap phase that exchanges endpoint information, then a data-plane
-phase that moves buffers. The code is deliberately modular — `Planner`, `CollPlan`,
-`MultiThreadExecutor`, `Topology` — so that algorithms and execution strategies can
-evolve independently.
-
-We want code that is correct and clear, and that still holds up on 1, 2, and 4 ranks
-after moving to another machine. Not code that happens to work in the one configuration
-it was first tried in.
+## Golden rules (the things agents most often get wrong)!!!!
+- **主路径优先于防御性编码。** 先把核心功能跑通 —— 这比守住每个边界情况更重要。事实上，当前代码的逻辑设计已经有了很多“隐含保证”，例如同一个channel的send和recv一定使用不同的fd。你应该妥善利用这些“隐含保证”，不要做不可能发生的错误处理、回退与防御性检查。`docs/`目录下的文件有助于你理解这些“隐含保证”，你在更新docs/`目录下的文件也要注意维护和增删这些隐含保证。
+- 你添加的每个函数、变量、结构体与类都必须**语义清晰且确实必要**。如果某个被提议的实体删掉后既不损失清晰度也不损失能力，那它就不该存在：不要"以防万一"地添加包装、参数或占位。特别是**新增类之前先确认，尤其是基类。** 未经明确批准绝不引入新的抽象基类。优先使用自由函数，或扩展既有类型。
+- **优先采用最简设计与实现。** 做能解决问题的最小改动，不要大规模重写，不要顺手重构，使用 git diff 最小设计。写直接、可读的版本：不要为处理不了的错误加 `try`/`catch`。
+- **不要添加注释块 —— 好代码是自注释的。** 让命名承载意图；`src/` 与 `include/` 倾向于完全无注释。对于不显而易见的 *why*，写一行短注释是可以的。
+- 公开入口返回 `bool`，不跨 API 抛异常。失败时先 `LOG_ERROR`，再 `return false`。
+- 日志一律走 `LOG_DEBUG/INFO/WARN/ERROR` 宏（fmt 风格 `{}` 占位），不用 `printf`/`iostream`。
 
 ## Architecture
-
-Two chains, deliberately independent.
-
-- **Execution:** `CollTask` → `Planner::Plan` → `CollPlan` → `ChannelPlan` → `PlanTask`
-  → `MultiThreadExecutor` → `Topology::AllReduce`
-- **Initialization:** `Communicator::Init` → `TopologyRing` → `Bootstrap` (exchange
-  `NodeInfo`) → `InitChannels` (per-channel send/recv transports)
-
-These boundaries are **not enforced by the compiler**. Everything ships as one shared
-library, and nothing mechanically stops a lower layer from reaching upward. The
-separation holds only if you keep it.
-
-## Known Conventions
-
-Facts about how this codebase is *actually* used, established by the code rather than by
-the type signatures. They are load-bearing: **rely on them instead of writing defensive
-branches for states the code cannot produce.** Read enough surrounding code to learn
-them before adding logic, and whenever you find a convention that is not written down
-yet, record it here or in the relevant `docs/layers/` doc in the same change.
-
-- **Channel transports are simplex in practice, despite the bidirectional interface.**
-  Each `Connector` on a channel owns a transport dedicated to one direction —
-  `channel.send[p]` only ever sends, `channel.recv[p]` only ever receives. A channel
-  edge therefore only needs readiness for one direction; the two are never multiplexed
-  onto one object.
-- **A channel edge's send and recv transports never share an fd.** `InitChannels` creates
-  a separate transport object (and therefore a separate descriptor) per directed edge, so
-  `send[p]` and `recv[p]` are always distinct. This holds even at 2 ranks, where the ring
-  degenerates to `prev == next`: those are still two independent edges with two transports.
-- **Direction is metadata for TCP, but a hard constraint for shared memory.**
-  `TransportTCP` works in both directions regardless of `GetDirection()`; `TransportShm`
-  rejects reverse calls. Bootstrap drives its control traffic over a single bidirectional
-  object, which is why TCP cannot reject the reverse direction.
-- **The planner enables one channel per 64 KiB**, so small messages only ever exercise a
-  single channel.
-
-## Project Layout
-
-Key directories. Per-file responsibilities live in each layer doc's "file map"
-section under `docs/layers/`, not here.
-
-| Path | Purpose |
-|------|---------|
-| `include/` | Public headers, one per layer (`transport.h`, `topology.h`, `planner.h`, `communicator.h`, `bootstrap.h`, `types.h`, `utils.h`, `logger.h`, …) |
-| `src/` | Implementation, one `.cpp` per layer |
-| `include/executor/`, `src/executor/` | The only layer in its own subdirectory; headers are included with a qualified path, e.g. `#include "executor/executor.h"` |
-| `tests/` | Test harness (`test_allreduce`, `test_local_info`) |
-| `scripts/` | `run_all_executors.sh`, `run_tests.sh` |
-| `docs/layers/` | Per-layer docs: responsibilities, invariants, design space, file map, modification rules |
-| `build*/` | Generated build directories (see Do NOT touch) |
-
-## Code Conventions
-
-`.clang-format` is the single source of truth for formatting — read it rather than
-relying on a summary here.
-
-- Naming: classes and methods `PascalCase`; data members and locals `snake_case`;
-  private members take a trailing `_`; constants are `k` plus `PascalCase`
-  (`kMinBytesPerChannel`).
-- `SortIncludes` is off and include blocks are preserved. Do not reorder existing
-  `#include` groups.
-- Logging goes through the `LOG_DEBUG` / `LOG_INFO` / `LOG_WARN` / `LOG_ERROR` macros
-  with fmt `{}` placeholders.
-- Public entry points return `bool` and do not throw across the API. On failure, log
-  with `LOG_ERROR` first, then `return false`.
-- Prefer modern C++17 idioms where they make intent clearer: `std::optional` for
-  values that may be absent, `std::variant` for type-safe alternatives, smart pointers
-  for ownership, and `std::promise` / `std::future` / `std::async` for async results.
-  The project is C++17, so avoid C++20-only features (`std::span`, `std::jthread`,
-  concepts, ranges). The rule above still holds: public entry points return `bool`, so
-  use `std::optional` and friends in internals.
-- Match the style of the file you are editing. The tree is not perfectly uniform — for
-  example, `Communicator`'s private members carry no trailing `_` while
-  `MultiThreadExecutor`'s do. Don't use that as an excuse for a drive-by refactor.
-
-### Naming
-
-| Name | Meaning |
-|------|---------|
-| `OriginCCL` | the project |
-| `OCCL_` | environment-variable prefix (`OCCL_MASTER_ADDR`, `OCCL_MASTER_PORT`) |
-| `originccl` | CMake target and shared library name |
-| `ORIGIN_CCL_SOURCES` | source list variable in `CMakeLists.txt` |
-
-`n_channels` defaults to 4 when unset or non-positive.
-
-## Golden Rules (Do and Don't)
-
-Layer-specific rules live in the per-layer docs, not here. Before touching a layer's
-code, read its doc under `docs/layers/` (`transport.md`, `topology.md`, `executor.md`,
-`planner.md`, `communicator.md`). Each file has four sections: core responsibility
-boundary, invariants & design space, file map, and modification rules.
-
-Cross-layer rules:
-
-- **Shut down before closing sockets.** `Communicator::Finalize` must call
-  `executor.Shutdown()` and join the workers *before* closing channel transports.
-  A worker must never touch a socket that is already gone. (Details in `executor.md`
-  and `communicator.md`.)
-- **Confirm before adding a class, especially a base class.** New classes — and above all
-  new abstract base classes — add architecture surface and coupling. Never introduce one
-  without explicit approval first. Prefer free functions or extending an existing type.
-- **No unnecessary entities — every name must earn its place.** Every function, variable,
-  struct, and class you add must be semantically clear and genuinely necessary. If a
-  proposed entity can be removed without losing clarity or capability, it should not
-  exist: do not add wrappers, parameters, or placeholders "just in case". This is the
-  working rule behind "prefer the simplest design"; "when in doubt, leave it out" applies
-  to every new name, not only to classes.
-- **Prefer the simplest design and implementation.** Make the smallest change that solves
-  the problem. Do not do large-scale rewrites, speculative abstractions, or drive-by
-  refactors unless explicitly asked. Write the direct, readable version: straight-line
-  logic beats an extra layer of functions. A helper called once, with no meaning of its
-  own, is indirection, not abstraction. Do not add `try`/`catch` for errors you cannot
-  handle, and do not use exceptions as control flow. Public entry points log with
-  `LOG_ERROR` and `return false`; internals return `bool` or `std::optional`.
-- **Prioritize the main path over defensive coding.** Get the core functionality
-  working first — that matters more than guarding every edge case. Avoid
-  over-engineering error handling, fallbacks, and defensive checks: don't add retries,
-  speculative validation, or recovery paths for failures that can't happen in normal
-  use. Handle the errors that can actually occur, log them, and fail cleanly; don't
-  build speculative defenses.
-- **Read the code, then rely on its conventions, not on guesses about all possible
-  states.** This tree carries a body of established conventions — see Known Conventions —
-  and they rule out whole classes of input. Learn them from the surrounding code before
-  writing new logic, and build on them instead of branching for combinations the code
-  cannot produce (e.g. don't multiplex a channel's send and recv endpoint onto one wait
-  when they are separate simplex transports). When you find a convention that is not
-  written down, record it in this file or the relevant `docs/layers/` doc in the same
-  change.
-- **Do not add comment blocks — good code is self-documenting.** Let names carry the
-  intent; `src/` and `include/` lean toward no comments at all. One short line is fine
-  for a non-obvious *why* — a past deadlock, a kernel or system-call quirk, a
-  load-bearing ordering constraint. Not fine: restating what the code plainly does, or
-  narrating the change you just made. If a block feels necessary, the fix is usually a
-  better name or a smaller function.
-- **When adding code, reconsider what it can replace.** Before adding a feature, check
-  whether existing code can be removed or simplified. Constrain the project's
-  complexity: avoid over-engineering and over-encapsulation when there is no need.
-- Read the relevant `docs/layers/` file before inventing a new pattern.
-
-### Performance (data path)
-
-- Pay attention to execution performance. Trading a bounded amount of memory for speed
-  is acceptable where it is measured to help.
-- Don't add allocations, locks, or branches to the critical send/recv path without a
-  clear, measured justification.
-- `Topology` is shared: every channel worker calls `AllReduce` on the same instance
-  concurrently. Keep it free of mutable member state — no cached scratch buffers, no
-  member counters. Scratch space belongs in locals.
-
-### Do NOT touch
-
-- **`build/`** is generated. Note that `build/third_party/fmt/` is a stale leftover from
-  an earlier layout; there is no `third_party/` in the source tree. Do not treat it as a
-  source of truth, and do not edit anything under it.
-- **Do not re-vendor fmt.** fmt and the MPI runtime are system dependencies, resolved via
-  `find_package(fmt REQUIRED)` (fmt ≥ 9 required — `logger.h` uses `fmt::format_string`
-  compile-time checks). They are not part of this tree.
-- **Do not weaken a test to make it pass.** When a test fails, the default assumption is
-  that the code is wrong. Fix the code, or report the bug.
-
-## Build and Verification
-
-**Tier 1 — build.** The build enables `-Wall -Wextra` but *not* `-Werror`, so warnings
-will not stop you. Read them, and do not add new ones.
-
-```sh
-cmake -S . -B build
-cmake --build build -j"$(nproc)"
+```
+include/                   公开头（平铺）
+include/executor/          executor 头（限定路径引用：#include "executor/executor.h"）
+src/                       实现（平铺）
+src/executor/              四种 executor 实现
+tests/                     三个测试二进制
+docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
+scripts/                   run_tests.sh / run_all_executors.sh
 ```
 
-The executor is chosen at compile time via `OCCL_EXECUTOR`
-(`multi_thread` / `epoll` / `polling` / `reactor`; default `multi_thread`). An invalid
-value is a cmake `FATAL_ERROR`. Build the other variants in separate build dirs:
+| 层 | 头文件 | 职责 | 铁律 |
+| --- | --- | --- | --- |
+| **transport** | `transport.h` / `transport_tcp.h` / `transport_shm.h` | 字节搬运 + 就绪可等待性（readiness） | 见下方“transport 就绪契约”；TCP 与 SHM 同构（listener + connection 双形态） |
+| **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 只做事件处理，非阻塞，见下方契约 |
+| **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
+| **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | 编译期选定；是 task 游标的**唯一推进者** |
+| **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露 `AllReduce` |
+| **bootstrap** | `bootstrap.h` | master/worker 交换 `NodeInfo`（含 `data_port`/`hostname`） | 用于本地分组与建连 |
+| **utils / logger / types** | `utils.h` / `logger.h` / `types.h` | 编解码、socket 辅助、reduce 运算、日志宏、公共数据结构 | 日志统一走 `LOG_*` 宏 |
 
-```sh
-cmake -S . -B build-epoll -DOCCL_EXECUTOR=epoll
-cmake -S . -B build-polling -DOCCL_EXECUTOR=polling
-cmake -S . -B build-reactor -DOCCL_EXECUTOR=reactor
-```
+## Coding discipline
+- 格式化由 `.clang-format` 统一（LLVM 基底：4 空格缩进、120 列、`Attach` 大括号、`PointerAlignment: Left`、`SortIncludes: Never`）。Stop 阶段的 format hook 会对改动的 `.cpp/.h` 跑 `clang-format -i`。
+- 命名：类/类型 PascalCase，成员 `snake_case_`（尾部下划线），自由函数 `PascalCase` 或 `namespace Utils` 内小写开头。与你正在编辑的文件的风格保持一致。不要以此作为顺手重构（drive-by refactor）的借口。
+- 优先使用智能指针管理所有权，使用 decltype 进行类型推导，在类型明显或冗长时使用 auto，使用 using 代替 typedef，编码风格贴近 C++17 而非C语言。
+- 缩进：4个空格，不使用制表符；大括号：K&R 风格（不另起一行）；最大行长度：200 字符；逗号后加空格；
 
-Artifacts: `build/liboriginccl.so`, `build/tests/test_allreduce`,
-`build/tests/test_local_info`, `build/tests/test_transport_shm` (`scripts/run_tests.sh`
-runs it as tier 0; it needs no launcher and no ranks).
+## Build and test
+测试进程的 rank / world size 来自 `OMPI_COMM_WORLD_RANK` / `OMPI_COMM_WORLD_SIZE`：
 
-**Tier 2 — Markdown-only changes** need no build.
-
-**Tier 3 — single-process smoke test**, which takes the no-data-plane path:
-
-```sh
-build/tests/test_allreduce 0 1
-```
-
-**Tier 4 — multi-rank.** These are *different code paths*, not just more of the same:
-at 2 ranks the ring degenerates (`prev == next`), which exercises the split between
-`Channel::send` and `Channel::recv`. Same-host channel edges use shared memory by
-default and cross-host ones use TCP, so the override run is what proves those same edges
-also carry the collectives over TCP:
-
-```sh
+```bash
 mpirun -np 2 build/tests/test_allreduce
 mpirun -np 4 build/tests/test_allreduce
-OCCL_DISABLE_SHM=1 mpirun -np 2 build/tests/test_allreduce
-OCCL_DISABLE_SHM=1 mpirun -np 4 build/tests/test_allreduce
+# 或手动指定（需自行同时拉起各进程）：
+build/tests/test_allreduce <rank> <world_size>
 ```
 
-For architecture or concurrency changes, run the full executor matrix — both transport
-modes, since `scripts/run_tests.sh --transport` only narrows it:
+- `cmake --build build --target run_test_allreduce` 只跑 **np=2** 一档，不是全矩阵。
+- **完整验证请用脚本**（各 tier 是不同的代码路径，不是“同一条多跑几次”）：
+  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–8 矩阵（含 shm / tcp 两种传输模式）。
+  - `scripts/run_all_executors.sh` —— 对 4 种 executor 各跑一遍完整矩阵，退出码 0 才算全过。
+  - 主要参数：`--coverage` / `--no-build` / `--build-dir` / `--build-type` / `--executor` / `--transport` / `--timeout` / `--allow-skip`。
+- 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 失败 / `2` 有 SKIP / `3` 覆盖率报告无法生成。
+- **mpirun 缺失 → 报 SKIP 而非通过**：在一台只跑了单 rank tier 的机器上“静默变绿”正是该脚本要杜绝的失败模式。
+- 三个测试二进制：
+  - `test_allreduce`：端到端 AllReduce 正确性（各 rank 填 `rank+1`，断言 reduce 结果）。
+  - `test_local_info`：单机 local rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）断言。
+  - `test_transport_shm`：共享内存传输的 fork 端点对，**无需 mpirun**（rendezvous、描述符传递、控制握手、阻塞/非阻塞、回绕/背压、方向拒绝、拆除）。
 
-```sh
-scripts/run_all_executors.sh    # four executors × 2/4 ranks × both transports
-```
 
-Finish with `git diff --check`. After a clean build, `git status` must be clean; an
-untracked build product means a missing `.gitignore` entry, and committing the artifact
-is never the fix.
-
-**Do not report untested code as verified.** State which tiers you actually ran.
-
-## Testing
-
-The test harness reads `OMPI_COMM_WORLD_RANK` and `OMPI_COMM_WORLD_SIZE`; other launchers
-(MPICH, PMI, Slurm) are not supported. Without those variables it falls back to
-`argv[1]` = rank and `argv[2]` = world_size, and then the ranks must be started by hand.
-
-Rank `i` fills its buffer with `i + 1`, so SUM is `ws * (ws + 1) / 2` and AVG is
-`(ws + 1) / 2`. The planner enables one channel per 64 KiB, so small messages only ever
-exercise a single channel.
-
-## Commit Conventions
-
-Short, lower-case, plain English — `add fmt`, `modify channels`, `root ip and port from
-env`. No Conventional Commits prefixes, and no AI-tool attribution. If you fix an
-unrelated bug along the way, land it as its own commit.
-
-If a change alters an architecture boundary, a build command, or the way tests are run,
-update the corresponding layer doc under `docs/layers/` in the same change. Those docs
-are the authority on how to write and modify each layer.
+## commit rules
+- **提交comment**：简短、小写、朴素英文 —— `add fmt`、`modify channels`、`root ip and port from env`。
+不使用 Conventional Commits 前缀，也不加 AI 工具署名。
+- **提交边界**：不要顺路修复不相关的bug或者重构，把它作为独立提交落下来，或者主动询问是否修改。
+- **文档同步**：架构边界、构建命令、或测试运行方式发生变化时，必须在**同一次改动**中更新 `docs/layers/` 对应文档（`executor.md` / `topology.md` / `transport.md` / `planner.md` / `communicator.md`）。Stop 阶段的 docs hook 会在 `src/` 改动 ≥ `OCCL_DOCS_SYNC_MIN_LINES`（默认 500）行且 `docs/` 未动时提醒一次；确认无需更新时说明理由即可。

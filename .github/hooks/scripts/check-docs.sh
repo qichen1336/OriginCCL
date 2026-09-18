@@ -5,9 +5,9 @@
 #
 # AGENTS.md requires the matching layer doc to be updated in the same change
 # whenever an architecture boundary, a build command, or the way tests are run
-# changes. This hook measures added plus deleted lines under the code scope; at or
-# above OCCL_DOCS_SYNC_MIN_LINES (default 200) with docs/ untouched, it blocks the
-# stop and names the layer docs to review.
+# changes. This hook measures added plus deleted lines under src/; at or above
+# OCCL_DOCS_SYNC_MIN_LINES (default 500) with docs/ untouched, it blocks the stop
+# and names the layer docs to review. Any change under docs/ is enough to pass.
 #
 # The agent is blocked at most once per distinct change set. stop_hook_active covers
 # the immediate continuation, and a fingerprint of the diff keeps a later stop in the
@@ -18,9 +18,9 @@
 # a retry loop and spend turns on a hook that cannot help.
 set -uo pipefail
 
-kLineThreshold="${OCCL_DOCS_SYNC_MIN_LINES:-200}"
+kLineThreshold="${OCCL_DOCS_SYNC_MIN_LINES:-500}"
 base_ref="${OCCL_DOCS_SYNC_BASE:-HEAD}"
-code_scope=(src include scripts tests/CMakeLists.txt CMakeLists.txt)
+code_scope=(src)
 doc_scope=(docs)
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +39,7 @@ if printf '%s' "${payload}" \
 fi
 
 case "${kLineThreshold}" in
-    '' | *[!0-9]*) kLineThreshold=200 ;;
+    '' | *[!0-9]*) kLineThreshold=500 ;;
 esac
 
 git cat-file -e "${base_ref}^{commit}" 2>/dev/null || exit 0

@@ -10,8 +10,8 @@
 - `Executor` 基类只有 `Run(const CollPlan&)` 与 `Shutdown()`。
 - 等待 task 各 transport 提供的就绪（`GetFd()` + `GetPollEvents()`），把就绪喂给 `Topology::AllreduceStep`；不展开算法步骤。
 - 就绪到逻辑操作的映射由 transport 在 task 中的位置决定：`send_transport` 的就绪推进可写（send），`recv_transport` 的就绪推进可读（recv）。executor 不认具体 transport 类型，也不把就绪位当成方向（共享内存发送端等的是可读的 eventfd）。
-- 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进（worker/单线程独占自己 channel）。
-- 不提供调用级互斥：同一 `Communicator` 的多个 AllReduce 由调用方保证不并发。
+- 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进。隐含保证是 worker/单线程独占自己 channel，`PlanTask.state` 因此是单写者，executor 不为它加锁。
+- 不提供调用级互斥：隐含保证是同一 `Communicator` 的多个 AllReduce 由调用方保证不并发，executor 据此不加调用级锁。
 - 编译期选定：由 CMake `OCCL_EXECUTOR`（`multi_thread`/`epoll`/`polling`/`reactor`，默认 `multi_thread`）→ 编译宏 → `Communicator` 用 `#ifdef` 构造。一次构建一种，**无运行时切换接口**。
 
 ## 不变式与设计区间
@@ -19,7 +19,7 @@
 ### 不变式（都曾踩过坑，勿回退）
 
 1. **多事件必须全喂**：一次 poll/epoll 等待可能同时返回 recv 和 send 两个就绪，两者都要喂 `AllreduceStep`。只喂一个会饿死对方 → 2 rank（`prev == next`）死锁。
-2. **就绪位不是方向，方向由位置决定**：`send_transport` 的就绪推进 Writable（send）、`recv_transport` 的推进 Readable（recv）。两者一定是不同的描述符（每条 channel edge 是独立有向连接），所以每个注册只推进一个操作；executor 不把就绪位当方向（共享内存发送端等的是可读 eventfd），也不硬编码 `EPOLLIN`/`EPOLLOUT`。
+2. **就绪位不是方向，方向由位置决定**：`send_transport` 的就绪推进 Writable（send）、`recv_transport` 的推进 Readable（recv）。隐含保证是两者一定是不同的描述符（每条 channel edge 是独立有向连接），所以每个注册只推进一个操作，无需为同一 fd 的多路就绪做合并；executor 不把就绪位当方向（共享内存发送端等的是可读 eventfd），也不硬编码 `EPOLLIN`/`EPOLLOUT`。
 3. **epoll fd 跨 plan 复用**：task 完成必须 `EPOLL_CTL_DEL`，否则下个 plan `ADD` 报 EEXIST。
 4. **单 rank（无数据面）task 立即完成**：epoll 不注册 fd；启动时循环结算立即完成的 task，只有真等网络的才计入 active，否则 `epoll_wait(-1)` 永久阻塞。
 5. **生命周期**：`Communicator::Finalize` 先 `executor->Shutdown()`（多线程还需 join worker），再关闭 channel transport。

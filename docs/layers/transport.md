@@ -29,9 +29,9 @@
 - 数据面传输只走 `TrySend`/`TryRecv`（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。
 - bootstrap/握手用 `Utils::SendAll`/`RecvAll`（带长度前缀），不走 Transport 的阻塞 `Send`/`Recv`。
 - 非阻塞语义是硬约束：`TrySend`/`TryRecv` 绝不阻塞。
-- 方向只是元数据，不是操作许可：TCP 在任何方向下都能收发（bootstrap 在同一个双向对象上收发控制消息）。方向只决定 `GetPollEvents()`（`Send`→`EPOLLOUT`，`Receive`→`EPOLLIN`，`Bidirectional`→两者）；只有按方向拒绝反向操作的实现（如共享内存端点）才把方向当约束。
+- 方向只是元数据，不是操作许可：TCP 在任何方向下都能收发。方向只决定 `GetPollEvents()`（`Send`→`EPOLLOUT`，`Receive`→`EPOLLIN`，`Bidirectional`→两者）；只有按方向拒绝反向操作的实现（如共享内存端点）才把方向当约束。**TCP 不能像共享内存那样拒绝反向，这是代码的隐含保证**：bootstrap 把控制流量跑在单个双向对象上（同一个 `Transport` 既发又收），拒绝反向会立刻打断握手；因此「方向是硬约束」只发生在数据面端点（见 [communicator.md](communicator.md) 的 channel 有向边），不要据此给 TCP 加反向拒绝的防御。
 - 就绪位的含义由 transport 决定，不由 operation 决定：socket 是「可写=发送可推进、可读=接收可推进」，而共享内存发送端等的是**可读**的 eventfd。所以 executor 一律用 `GetPollEvents()` 拿掩码，并用「就绪来自 send 还是 recv transport」决定推进哪个逻辑操作，不得自行把位解释成方向。
-- `GetFd()` 返回的 fd 生命周期由 transport 管理；executor 只注册/注销。channel 边的 send/recv 是各自独立的 transport 对象，fd 必然不同（见 `AGENTS.md` 的 Known Conventions），executor 可以按「一个 transport 一个等待」处理，无需合并同一 fd 的多路注册。
+- `GetFd()` 返回的 fd 生命周期由 transport 管理；executor 只注册/注销。**隐含保证：channel 边的 send/recv 是各自独立的 transport 对象，fd 必然不同**（含 2 rank 下 `prev == next` 的退化情形，见 [communicator.md](communicator.md) 的「channel 边是有向的」）；executor 据此按「一个 transport 一个等待」处理，无需（也不该）为同一 fd 的多路注册做合并这类防御。
 
 ### 设计区间
 
@@ -53,8 +53,8 @@
 - 改动本层不得破坏非阻塞语义：`TrySend`/`TryRecv` 绝不阻塞。
 - 新增实现必须继承 `Transport` 基类并实现全部接口（含 `GetFd`/`GetPollEvents`）；`GetFd` 返回的 fd 生命周期由 transport 管理，executor 只注册/注销。
 - 勿回退：数据面只走 `TrySend`/`TryRecv`（历史曾有人把数据面改成阻塞 `Send`/`Recv`，导致死锁）。共享内存的阻塞 `Send`/`Recv` 只服务于调用方的首个握手与同类控制用途，executor 与 topology 一律走 `Try*`。
-- 勿回退：control socket 阶段**不加**角色门禁（主动端只能发、被动端只能收）。调用方（communicator）两端角色固定，门禁永不触发，只是多一个死分支。
+- 勿回退：control socket 阶段**不加**角色门禁（主动端只能发、被动端只能收）。隐含保证是调用方（communicator）两端角色固定，门禁永不触发；加它就是多一个死分支。
 - 勿回退：executor 不得硬编码 `EPOLLIN`/`EPOLLOUT`，一律取 `GetPollEvents()`。
-- 共享内存实现不得引入自动回退到 TCP：任何建立/映射/传描述符/握手失败都直接让 communicator 初始化失败（`LOG_ERROR` + `false`）。
-- 环容量固定 2 MiB，不做可配置/动态扩容；一个环只允许单 producer + 单 consumer，不新增双向或多生产者模型。
+- 共享内存实现不得引入自动回退到 TCP：任何建立/映射/传描述符/握手失败都直接让 communicator 初始化失败（`LOG_ERROR` + `false`）。主路径优先：失败即停，不做降级重试。
+- 环容量固定 2 MiB，不做可配置/动态扩容；**隐含保证是单环单 producer + 单 consumer**，据此不做容量协商、多生产者或双向的防御分支。
 - 改动本层后跑 `scripts/run_tests.sh`：tier 0 只测传输本身（fork 端点对，无需 mpirun）；2/4 rank 的集合通信档位在默认选择与 `OCCL_DISABLE_SHM=1` 两种模式下各跑一遍（1 rank 无数据面，只跑一次）。

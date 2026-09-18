@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 #
-# PostToolUse hook: run clang-format on the file(s) an agent just edited.
+# Stop hook: run clang-format on the C/C++ file(s) an agent changed.
 #
-# The hook payload arrives as JSON on stdin. The exact field name is not part of the
-# documented contract, so several spellings are tried, and anything that does not
-# resolve to an existing C/C++ file is ignored. This script always exits 0: a missing
-# or failing formatter must never block the agent.
+# A Stop payload carries no edited-file list, so the files come from git: the diff
+# against HEAD plus untracked files. clang-format is idempotent, so already-formatted
+# files are rewritten unchanged. This script always exits 0 and never blocks: a
+# missing or failing formatter must never trap the agent.
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
+
+cd "${repo_root}" 2>/dev/null || exit 0
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
 
 # Keep the most recent payload around, so the real stdin schema can be inspected.
 payload="$(cat)"
@@ -20,50 +23,43 @@ escape_json() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
 }
 
-# Collect candidate paths: the likely keys first, then any generic "path"-like value.
-candidates=""
-if command -v jq >/dev/null 2>&1; then
-    candidates="$(printf '%s' "${payload}" | jq -r '
-        .tool_input.file_path, .tool_input.filePath, .tool_input.path,
-        .file_path, .filePath, .path
-        | select(type == "string" and . != "" and . != "null")' 2>/dev/null)"
+# Set when the agent is already running because of a previous stop hook. Never
+# re-enter, or the session can never end.
+if printf '%s' "${payload}" \
+    | grep -qE '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
+    exit 0
 fi
 
-if [ -z "${candidates}" ]; then
-    candidates="$(printf '%s' "${payload}" \
-        | grep -oE '"(file_path|filePath|path)"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        | sed -E 's/^"[^"]+"[[:space:]]*:[[:space:]]*"([^"]+)"$/\1/')"
+files="$( {
+    git diff --name-only HEAD 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null
+} | sort -u | grep -E '\.(cpp|cc|cxx|h|hpp|hh)$' || true )"
+
+[ -n "${files}" ] || exit 0
+
+if ! command -v clang-format >/dev/null 2>&1; then
+    printf '{"systemMessage":"%s"}\n' \
+        "$(escape_json "clang-format is not installed; skipped formatting changed sources.")"
+    exit 0
 fi
 
-[ -n "${candidates}" ] || exit 0
-
+formatted=""
 messages=""
 while IFS= read -r file_path; do
-    [ -n "${file_path}" ] || continue
+    [ -f "${file_path}" ] || continue
 
-    case "${file_path}" in
-        /*) abs="${file_path}" ;;
-        *) abs="${repo_root}/${file_path}" ;;
-    esac
-
-    # Only existing C/C++ sources and headers are formatted.
-    [ -f "${abs}" ] || continue
-    case "${abs}" in
-        *.cpp|*.cc|*.cxx|*.h|*.hpp|*.hh) ;;
-        *) continue ;;
-    esac
-
-    if ! command -v clang-format >/dev/null 2>&1; then
-        messages="${messages}clang-format is not installed; skipped formatting ${file_path}
-"
-        break
-    fi
-
-    if ! error="$(clang-format -i "${abs}" 2>&1)"; then
+    before="$(cksum <"${file_path}" 2>/dev/null)"
+    if ! error="$(clang-format -i "${file_path}" 2>&1)"; then
         messages="${messages}clang-format failed on ${file_path}: ${error}
 "
+        continue
     fi
-done <<<"${candidates}"
+    [ "${before}" = "$(cksum <"${file_path}" 2>/dev/null)" ] || formatted="${formatted}${file_path}
+"
+done <<<"${files}"
+
+[ -n "${formatted}" ] && messages="clang-format rewrote:
+${formatted}${messages}"
 
 if [ -n "${messages}" ]; then
     printf '{"systemMessage": "%s"}\n' "$(escape_json "${messages}")"

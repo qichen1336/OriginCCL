@@ -17,13 +17,13 @@
 ### 不变式
 
 - **一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等对方 recv → **死锁**。所以"一步"不是原子状态：send/recv 各有独立 progress + done 标志。
-- **错误只有一个通道**：`AllreduceInit`/`AllreduceStep` 声明为 `noexcept`，返回 `false` 即失败，拓扑内已 `LOG_ERROR`；executor 见到 false 立即放弃该次集合，而非等一个永不到来的 done。可恢复失败只经 `false` 表达；意外抛出的 C++ 异常（如 `bad_alloc`）是致命错误，不再转换。
+- **错误只有一个通道**：`AllreduceInit`/`AllreduceStep` 声明为 `noexcept`，返回 `false` 即失败，拓扑内已 `LOG_ERROR`；executor 见到 false 立即放弃该次集合，而非等一个永不到来的 done。隐含保证是失败不存进游标、也不会有「半失败的 done」——可恢复失败只经 `false` 表达；意外抛出的 C++ 异常（如 `bad_alloc`）是致命错误，不再转换。据此不做失败回退与重试，`AllreduceDone` 也无需检查失败态。
 - 状态机三件套接口固定（`AllreduceInit`/`AllreduceStep`/`AllreduceDone`），算法推进必须经由它们。
 
 ### 设计区间
 
 - `Topology` 基类允许新算法实现（不止 ring）。
-- chunk 布局/指针/字节数由 `phase/step/rank` **现算**（`SendChunk`/`RecvChunk`/`SendPtr`/`RecvPtr`/`SendBytes`/`RecvBytes` helper 在 `topology_ring.cpp` 匿名命名空间），不必存进 state。
+- chunk 布局/指针/字节数由 `phase/step/rank` **现算**（`SendChunk`/`RecvChunk`/`SendPtr`/`RecvPtr`/`SendBytes`/`RecvBytes` helper 在 `topology_ring.cpp` 匿名命名空间），不必存进 state。隐含保证是 `state` 只存不可现算的最小状态，据此不为这些量设缓存字段。
 - `task.chunk_size`（每 chunk 元素数 = `ceil(elem_count / world_size)`）由 planner 计算填入，拓扑只读。
 
 ## 文件介绍

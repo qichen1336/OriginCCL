@@ -1,6 +1,6 @@
 {
   "hooks": {
-    "PostToolUse": [
+    "Stop": [
       {
         "type": "command",
         "command": "bash .github/hooks/scripts/format-edited.sh",
