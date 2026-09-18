@@ -107,7 +107,7 @@ bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
         uint32_t events = task.recv_transport->GetPollEvents();
         if (fd >= 0 && events != 0) {
             struct epoll_event ev;
-            ev.events = events;
+            ev.events = events | EPOLLET;
             ev.data.u32 = tag_base;
             if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
                 LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));
@@ -120,7 +120,7 @@ bool ReactorExecutor::RegisterTask(size_t slot, const PlanTask& task) {
         uint32_t events = task.send_transport->GetPollEvents();
         if (fd >= 0 && events != 0) {
             struct epoll_event ev;
-            ev.events = events;
+            ev.events = events | EPOLLET;
             ev.data.u32 = tag_base + 1u;
             if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
                 LOG_ERROR("epoll_ctl ADD fd {} failed: {}", fd, strerror(errno));

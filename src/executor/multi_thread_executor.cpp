@@ -1,5 +1,8 @@
-#include <poll.h>
+#include <cerrno>
+#include <unistd.h>
+#include <sys/epoll.h>
 #include "executor/multi_thread_executor.h"
+#include "transport.h"
 #include "topology.h"
 #include "logger.h"
 
@@ -56,59 +59,59 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         LOG_ERROR("MultiThreadExecutor failed to init task on channel {}", channel_id);
         return false;
     }
+    if (topo->AllreduceDone(task)) {
+        return true;
+    }
 
-    while (!topo->AllreduceDone(task)) {
-        struct pollfd fds[2];
-        CollEvent ops[2];
-        nfds_t nfds = 0;
+    const int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        LOG_ERROR("MultiThreadExecutor failed to create epoll on channel {}", channel_id);
+        return false;
+    }
 
-        if (task.recv_transport) {
-            int fd = task.recv_transport->GetFd();
-            uint32_t events = task.recv_transport->GetPollEvents();
-            if (fd >= 0 && events != 0) {
-                fds[nfds] = {fd, static_cast<short>(events), 0};
-                ops[nfds] = CollEvent::Readable;
-                ++nfds;
-            }
+    auto add_fd = [&](Transport* transport, uint32_t tag) -> bool {
+        if (!transport) {
+            return true;
         }
-        if (task.send_transport) {
-            int fd = task.send_transport->GetFd();
-            uint32_t events = task.send_transport->GetPollEvents();
-            if (fd >= 0 && events != 0) {
-                fds[nfds] = {fd, static_cast<short>(events), 0};
-                ops[nfds] = CollEvent::Writable;
-                ++nfds;
-            }
+        int fd = transport->GetFd();
+        uint32_t events = transport->GetPollEvents();
+        if (fd < 0 || events == 0) {
+            return true;
         }
-
-        if (nfds == 0) {
-            if (!topo->AllreduceStep(task, CollEvent::Readable)) {
-                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
-                return false;
-            }
-            continue;
+        struct epoll_event ev;
+        ev.events = events | EPOLLET;
+        ev.data.u32 = tag;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+            LOG_ERROR("MultiThreadExecutor epoll_ctl ADD fd {} failed on channel {}", fd, channel_id);
+            return false;
         }
+        return true;
+    };
 
-        int ready = poll(fds, nfds, -1);
+    bool registered = add_fd(task.recv_transport.get(), 0u) && add_fd(task.send_transport.get(), 1u);
+
+    struct epoll_event events[2];
+    while (registered && !topo->AllreduceDone(task)) {
+        int ready = epoll_wait(epfd, events, 2, -1);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            LOG_ERROR("Executor poll failed on channel {}", channel_id);
-            return false;
+            LOG_ERROR("MultiThreadExecutor epoll_wait failed on channel {}", channel_id);
+            break;
         }
-
-        for (nfds_t i = 0; i < nfds; ++i) {
-            if ((fds[i].revents & fds[i].events) == 0) {
-                continue;
-            }
-            if (!topo->AllreduceStep(task, ops[i])) {
+        for (int i = 0; i < ready; ++i) {
+            CollEvent op = (events[i].data.u32 == 0u) ? CollEvent::Readable : CollEvent::Writable;
+            if (!topo->AllreduceStep(task, op)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
-                return false;
+                registered = false;
+                break;
             }
         }
     }
-    return true;
+
+    close(epfd);
+    return registered && topo->AllreduceDone(task);
 }
 
 void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch_id) {

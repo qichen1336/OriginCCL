@@ -23,7 +23,8 @@
 3. **epoll fd 跨 plan 复用**：task 完成必须 `EPOLL_CTL_DEL`，否则下个 plan `ADD` 报 EEXIST。
 4. **单 rank（无数据面）task 立即完成**：epoll 不注册 fd；启动时循环结算立即完成的 task，只有真等网络的才计入 active，否则 `epoll_wait(-1)` 永久阻塞。
 5. **生命周期**：`Communicator::Finalize` 先 `executor->Shutdown()`（多线程还需 join worker），再关闭 channel transport。
-6. **Reactor 的派发期间必须注销 fd**：fd 交给 worker 前 `EPOLL_CTL_DEL`，completion 返回 Waiting 后再注册。既避免 level-triggered epoll 在 worker 推进同一 task 时反复唤醒 reactor，也保证 `PlanTask.state` 单写者。`Run` 返回前必须 drain 完所有 in-flight job（异常路径用 `StopWorkers()` 兜底），否则 worker 会引用已销毁的局部 `CollPlan`。
+6. **Reactor 的派发期间必须注销 fd**：fd 交给 worker 前 `EPOLL_CTL_DEL`，completion 返回 Waiting 后再注册。既避免 epoll 在 worker 推进同一 task 时反复唤醒 reactor，也保证 `PlanTask.state` 单写者。`Run` 返回前必须 drain 完所有 in-flight job（异常路径用 `StopWorkers()` 兜底），否则 worker 会引用已销毁的局部 `CollPlan`。
+7. **边沿触发（EPOLLET）**：四种 executor 全部以 `EPOLLET` 注册（`multi_thread` 每 task 一个 epoll，`epoll`/`reactor` 共享一个），消除 `send_done && !recv_done`（及对称）窗口内挂起就绪导致的 level 忙等。配套两条：(a) transport 的 `Try*` 必须排空到不能再推进（eventfd 是 drain+复检、socket 是读到 EAGAIN），否则部分排空丢掉下一个边沿 → 死锁；(b) step 完成、`BeginStep` 重置 `send_done`/`recv_done` 后立刻对两侧各喂一次（`BeginStep` 内调 `Advance`）——`send_done`/`recv_done` 单调累积（只增不清），挂起的通知仍在 eventfd 里，这次喂让刚重置的那侧立刻消费一次并顺手 Drain 复位计数，之后的 0→1 边沿才能再触发；已完成那侧由 `Advance` 的 done 守卫变成 no-op。`AllreduceInit` 末尾也走 `BeginStep`，因此首次启动即推进一次，不必先睡眠。**删掉这次补喂会死锁**（已变异验证：np2 SHM 首个 AllReduce 卡死）——SHM 的 `Try*` 是 drain-to-empty，不补喂则该侧计数永不被复位，对端新通知落不上 0→1 边沿，epoll 不再唤醒。`polling` 不监听 fd，与触发模式无关。
 
 ### 设计区间
 
@@ -34,7 +35,7 @@
 
 四种 executor 现状：
 
-- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；新 worker 以当前 batch id 初始化。每 worker `poll()` 自己 channel 各 transport 的就绪（掩码取自 transport，poll 与 epoll 位值一致）。
+- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；新 worker 以当前 batch id 初始化。每 worker 在每个 task 上建一个 `epoll` 实例（`EPOLLET`），注册该 task 各 transport 的就绪（掩码取自 transport），等待就绪后全喂 Step。
 - **EpollExecutor**：单线程把每 channel 队首 task 的各 transport 就绪注册进一个 epoll；channel 内多 task 顺序推进。
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Allreduce*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job（job 带逻辑 step 位，不带原始 epoll 位），worker 用 mutex + completion 队列加 eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
@@ -44,7 +45,7 @@
 | 文件 | 职责 |
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
-| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + `poll()`，就绪事件全喂 Step，批次同步与错误汇总 |
+| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + per-task `epoll`（`EPOLLET`），就绪事件全喂 Step，批次同步与错误汇总 |
 | `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪事件喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
 | `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |

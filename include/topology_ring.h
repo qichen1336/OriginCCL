@@ -17,4 +17,9 @@ public:
 
     int GetPrevRank(int r) const;
     int GetNextRank(int r) const;
+
+private:
+    bool BeginStep(PlanTask& task) const;
+    bool CompleteStep(PlanTask& task) const;
+    bool CompleteSteps(PlanTask& task) const;
 };

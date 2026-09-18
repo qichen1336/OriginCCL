@@ -55,20 +55,44 @@ const char* SendPtr(const PlanTask& task) {
            static_cast<size_t>(SendChunk(task)) * task.chunk_size * Utils::GetDataTypeSize(task.dtype);
 }
 
-void BeginStep(PlanTask& task) {
+bool Advance(PlanTask& task, CollEvent event) {
+    CollOpState& s = task.state;
+    if (event == CollEvent::Writable) {
+        if (s.send_done) {
+            return true;
+        }
+        if (!task.send_transport->TrySend(SendPtr(task), SendBytes(task), &s.send_progress, &s.send_done)) {
+            LOG_ERROR("Ring AllReduce send failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
+            return false;
+        }
+        return true;
+    }
+    if (s.recv_done) {
+        return true;
+    }
+    if (!task.recv_transport->TryRecv(RecvPtr(task), RecvBytes(task), &s.recv_progress, &s.recv_done)) {
+        LOG_ERROR("Ring AllReduce recv failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool TopologyRing::BeginStep(PlanTask& task) const {
     CollOpState& s = task.state;
     s.send_progress = 0;
     s.recv_progress = 0;
     s.send_done = (SendBytes(task) == 0);
     s.recv_done = (RecvBytes(task) == 0);
+    return Advance(task, CollEvent::Writable) && Advance(task, CollEvent::Readable);
 }
 
-void CompleteStep(PlanTask& task) {
+bool TopologyRing::CompleteStep(PlanTask& task) const {
     CollOpState& s = task.state;
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t chunk = task.chunk_size;
     char* data = static_cast<char*>(task.recv_buf);
-
     if (s.phase == kPhaseReduceScatter) {
         size_t recv_count = ChunkElemCount(task.elem_count, chunk, RecvChunk(task));
         Utils::PerformReduce(s.temp_buffer.data(), data + static_cast<size_t>(RecvChunk(task)) * chunk * type_size,
@@ -84,12 +108,21 @@ void CompleteStep(PlanTask& task) {
             Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
         }
         s.phase = kPhaseDone;
-        return;
+        return true;
     }
 
-    BeginStep(task);
+    return BeginStep(task);
 }
-} // namespace
+
+bool TopologyRing::CompleteSteps(PlanTask& task) const {
+    CollOpState& s = task.state;
+    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+        if (!CompleteStep(task)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void TopologyRing::FillChannels(std::vector<Channel>& channels) const {
     for (size_t i = 0; i < channels.size(); ++i) {
@@ -148,8 +181,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
     s.temp_buffer.resize(task.chunk_size * type_size);
     s.phase = kPhaseReduceScatter;
     s.step = 0;
-    BeginStep(task);
-    return true;
+    return BeginStep(task) && CompleteSteps(task);
 }
 
 bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const noexcept {
@@ -163,22 +195,10 @@ bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const noexcept
         return true;
     }
 
-    if (event == CollEvent::Writable && !s.send_done) {
-        if (!task.send_transport->TrySend(SendPtr(task), SendBytes(task), &s.send_progress, &s.send_done)) {
-            LOG_ERROR("Ring AllReduce send failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
-            return false;
-        }
-    } else if (event == CollEvent::Readable && !s.recv_done) {
-        if (!task.recv_transport->TryRecv(RecvPtr(task), RecvBytes(task), &s.recv_progress, &s.recv_done)) {
-            LOG_ERROR("Ring AllReduce recv failed on rank {} (phase {}, step {})", task.rank, s.phase, s.step);
-            return false;
-        }
+    if (!Advance(task, event)) {
+        return false;
     }
-
-    if (s.send_done && s.recv_done) {
-        CompleteStep(task);
-    }
-    return true;
+    return CompleteSteps(task);
 }
 
 bool TopologyRing::AllreduceDone(const PlanTask& task) const {
