@@ -1,41 +1,8 @@
 #include <vector>
-#include <cstdlib>
-#include <cstring>
+#include <mpi.h>
 #include "types.h"
 #include "logger.h"
 #include "communicator.h"
-
-void PrintUsage(const char* prog) {
-    LOG_ERROR("Usage:");
-    LOG_ERROR("  Manual:    {} <rank> <world_size>", prog);
-    LOG_ERROR("  Open MPI:  mpirun -np <N> {}", prog);
-}
-
-// 通过环境变量依次为 config 各字段赋值（不存在该环境变量时保留默认值）。
-// 返回 true 表示检测到 OpenMPI 环境变量（由 mpirun 启动）。
-bool LoadConfigFromEnv(CommConfig& config) {
-    bool found = false;
-
-    const char* ompi_rank = std::getenv("OMPI_COMM_WORLD_RANK");
-    const char* ompi_size = std::getenv("OMPI_COMM_WORLD_SIZE");
-    if (ompi_rank && ompi_size) {
-        config.rank = std::atoi(ompi_rank);
-        config.world_size = std::atoi(ompi_size);
-        found = true;
-    }
-
-    const char* master_addr_env = std::getenv("OCCL_MASTER_ADDR");
-    if (master_addr_env && master_addr_env[0] != '\0') {
-        config.master_addr = master_addr_env;
-    }
-
-    const char* master_port_env = std::getenv("OCCL_MASTER_PORT");
-    if (master_port_env && master_port_env[0] != '\0') {
-        config.master_port = static_cast<uint16_t>(std::atoi(master_port_env));
-    }
-
-    return found;
-}
 
 // On a single host (the only setup this tier can exercise) every rank must map to the
 // same machine, so the local view degenerates to the global one.
@@ -74,22 +41,22 @@ bool TestLocalInfo(const Communicator& comm) {
 }
 
 int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
     CommConfig config;
     config.n_channels = 4;
+    MPI_Comm_rank(MPI_COMM_WORLD, &config.rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &config.world_size);
 
-    if (!LoadConfigFromEnv(config)) {
-        if (argc < 3) {
-            PrintUsage(argv[0]);
-            return 1;
-        }
-        config.rank = std::atoi(argv[1]);
-        config.world_size = std::atoi(argv[2]);
-    }
-
-    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring, master_addr={}, master_port={}",
-             config.rank, config.world_size, config.master_addr, config.master_port);
+    LOG_INFO("Configuration: rank={}, world_size={}, transport=TCP, topology=Ring", config.rank, config.world_size);
 
     Communicator comm;
+    if (config.rank == 0 && !comm.GetUniqueId(config.unique_id)) {
+        LOG_ERROR("Rank 0: Failed to get the unique id");
+        return 1;
+    }
+    MPI_Bcast(&config.unique_id, sizeof(config.unique_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+
     if (!comm.Init(config)) {
         LOG_ERROR("Rank {}: Failed to init", config.rank);
         return 1;
@@ -100,5 +67,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    MPI_Finalize();
     return 0;
 }

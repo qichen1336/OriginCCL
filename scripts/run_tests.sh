@@ -4,11 +4,11 @@
 # they are different code paths and not just "more of the same":
 #
 #   tier 0  test_transport_shm    shared-memory transport, forked endpoint pair, no ranks
-#   tier 1  <test> 0 1            single rank, takes the no-data-plane path (no sockets)
+#   tier 1  <test>                single rank (MPI singleton), takes the no-data-plane path
 #   tier 2  mpirun -np 2          shared memory, the ring degenerates, prev == next
 #   tier 3  mpirun -np 4          shared memory, all four channels
 #   tier 4  mpirun -np 2          OCCL_DISABLE_SHM=0, which must not force TCP
-#   tier 5  mpirun -np 2          unusable rendezvous path, which must fail initialization
+#   tier 5  mpirun -np 2          unusable rendezvous directory, which must fail initialization
 #   tier 6  mpirun -np 2          OCCL_DISABLE_SHM=1, same-host edges forced onto TCP
 #   tier 7  mpirun -np 4          OCCL_DISABLE_SHM=1, all four channels over TCP
 #   tier 8  mpirun -np 2          OCCL_DISABLE_SHM=1, which must not bind a rendezvous path
@@ -21,11 +21,11 @@
 #
 # Tiers 5 and 8 pin down the override semantics: a shared-memory failure is never quietly
 # turned into a TCP fallback, and the override is a selection rather than a fallback. They
-# obstruct the same rendezvous path and demand opposite outcomes.
+# obstruct the same rendezvous directory and demand opposite outcomes.
 #
 # Tier 0 covers the transport itself and tier 1 has no data plane, so neither depends on
 # the mode: tier 0 runs in every mode, tier 1 runs once, in the shm pass. Tier 0 needs
-# neither mpirun nor OMPI_COMM_WORLD_* either.
+# neither mpirun nor MPI at all.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -129,17 +129,6 @@ shm_test_bin="$build_dir/tests/test_transport_shm"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
 
-# The test reads OCCL_MASTER_PORT; pinning it keeps two concurrent runs (or a run
-# racing a stale rank) from fighting over the default 12345 and hanging.
-free_port() {
-    if command -v python3 > /dev/null 2>&1; then
-        python3 -c 'import socket; s = socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
-    else
-        echo $((20000 + RANDOM % 40000))
-    fi
-}
-export OCCL_MASTER_PORT="${OCCL_MASTER_PORT:-$(free_port)}"
-
 failed=0
 skipped=0
 
@@ -194,11 +183,12 @@ run_mpi_tier() {
     run_tier "$label, mpirun -np $np$mpi_extra_label" "${launcher[@]}" "$test_bin"
 }
 
-# A directory at a rendezvous path fails the unlink and the bind both (a regular file would
-# just be unlinked first), which turns "did anything bind this path?" into an observable
-# outcome. The same obstruction is used with both expectations: with shared memory enabled
-# a bind failure must fail initialization instead of quietly falling back to TCP, and with
-# OCCL_DISABLE_SHM=1 nothing ever binds the path, so the run must be unaffected.
+# The rendezvous sockets live in one directory (/tmp/originccl), which makes the failure
+# mode observable without knowing the port rank 0 picked at runtime: a regular file where
+# that directory must be fails the directory creation on every rank. The same obstruction is
+# used with both expectations: with shared memory enabled it must fail initialization instead
+# of quietly falling back to TCP, and with OCCL_DISABLE_SHM=1 it must not affect the run at
+# all, because nothing creates the directory.
 #
 # Usage: run_blocked_rendezvous_tier <label> <fail|ok> [NAME=value | -u NAME ...]
 # Trailing arguments go to env(1).
@@ -207,24 +197,24 @@ run_blocked_rendezvous_tier() {
     local expect="$2"
     shift 2
     local log="$build_dir/blocked-rendezvous-$expect.log"
-    local -a paths=("/tmp/originccl-$OCCL_MASTER_PORT-0.sock" "/tmp/originccl-$OCCL_MASTER_PORT-1.sock")
-    rm -rf "${paths[@]}"
-    mkdir -p "${paths[@]}"
+    local rendezvous_dir="/tmp/originccl"
+    rm -rf "$rendezvous_dir"
+    : > "$rendezvous_dir"
 
     local rc=0
     echo
     echo "--- $label"
     timeout "$timeout_s" env "$@" mpirun "${mpi_extra[@]}" -np 2 "$test_bin" > "$log" 2>&1 || rc=$?
-    rm -rf "${paths[@]}"
+    rm -f "$rendezvous_dir"
 
     if [[ "$expect" == ok ]]; then
         if [[ $rc -eq 0 ]]; then
-            echo ">>> PASS: $label (exit 0 with the rendezvous path unusable)"
+            echo ">>> PASS: $label (exit 0 with the rendezvous directory unusable)"
             rm -f "$log"
             return 0
         fi
     elif [[ $rc -ne 0 && $rc -ne 124 ]] \
-        && grep -q 'Failed to create the shared-memory rendezvous listener' "$log" \
+        && grep -q 'Failed to create the shared-memory rendezvous directory' "$log" \
         && ! grep -q 'Communicator init successfully' "$log"; then
         # Two-sided on purpose. A zero exit means the endpoint quietly went to TCP, and
         # "Communicator init successfully" means initialization passed and a later
@@ -281,16 +271,16 @@ run_tier "tier 0: shared-memory transport (forked pair)" "$shm_test_bin" || true
 # used shared memory for every edge unless OCCL_DISABLE_SHM was exactly "1", so clearing the
 # variable (tiers 2-3) and setting it to "0" (tier 4) must both keep shared memory.
 if [[ $transport != "tcp" ]]; then
-    # Tier 1 must not inherit OMPI_COMM_WORLD_*: the harness prefers those over argv, so
-    # running this script inside an mpirun job would silently turn tier 1 into ws=N.
+    # Tier 1 must not inherit OMPI_COMM_WORLD_*: MPI_Init would otherwise join the enclosing
+    # mpirun world instead of coming up as a singleton, silently turning tier 1 into ws=N.
     run_tier "tier 1: single rank (no data plane)" \
-        env -u OMPI_COMM_WORLD_RANK -u OMPI_COMM_WORLD_SIZE "$test_bin" 0 1 || true
+        env -u OMPI_COMM_WORLD_RANK -u OMPI_COMM_WORLD_SIZE "$test_bin" || true
 
     if [[ $have_mpirun -eq 1 ]]; then
         run_mpi_tier "tier 2: shared memory (default selection)" 2 -u OCCL_DISABLE_SHM || true
         run_mpi_tier "tier 3: shared memory (default selection)" 4 -u OCCL_DISABLE_SHM || true
         run_mpi_tier "tier 4: shared memory (OCCL_DISABLE_SHM=0)" 2 OCCL_DISABLE_SHM=0 || true
-        run_blocked_rendezvous_tier "tier 5: blocked rendezvous path must fail init" fail \
+        run_blocked_rendezvous_tier "tier 5: unusable rendezvous directory must fail init" fail \
             -u OCCL_DISABLE_SHM || true
     else
         echo
@@ -303,7 +293,7 @@ if [[ $transport != "shm" ]]; then
     if [[ $have_mpirun -eq 1 ]]; then
         run_mpi_tier "tier 6: TCP (OCCL_DISABLE_SHM=1)" 2 OCCL_DISABLE_SHM=1 || true
         run_mpi_tier "tier 7: TCP (OCCL_DISABLE_SHM=1)" 4 OCCL_DISABLE_SHM=1 || true
-        run_blocked_rendezvous_tier "tier 8: TCP override must not bind the rendezvous path" ok \
+        run_blocked_rendezvous_tier "tier 8: TCP override must not touch the rendezvous directory" ok \
             OCCL_DISABLE_SHM=1 || true
     else
         echo

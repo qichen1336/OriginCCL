@@ -16,6 +16,10 @@ public:
     Communicator();
     ~Communicator();
 
+    // Binds the bootstrap listener and returns the id that every rank must pass to Init.
+    // Rank 0 calls it, then publishes the returned id (in the tests: MPI_Bcast of its bytes).
+    bool GetUniqueId(UniqueId& unique_id);
+
     bool Init(const CommConfig& cfg);
     void Finalize();
 
@@ -78,6 +82,9 @@ private:
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;
+    // Bootstrap listener bound in GetUniqueId and kept open until Finalize, so the port in
+    // the unique id cannot be taken by someone else before rank 0 accepts on it.
+    int bootstrap_listen_fd = -1;
     int local_rank = 0;
     int local_size = 1;
     std::vector<int> local_ranks;

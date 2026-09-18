@@ -27,11 +27,19 @@ enum class CollFunc {
     AllReduce
 };
 
+// Bootstrap rendezvous handle. Rank 0 fills in the address it listens on and hands the id
+// to every other rank, so no rank but the root needs to know (or choose) the master
+// address. Trivially copyable and self-contained, so a launcher can move it as raw bytes
+// (MPI_Bcast with MPI_BYTE).
+struct UniqueId {
+    char ip_addr[64] = {};
+    uint16_t port = 0;
+};
+
 struct CommConfig {
     int rank = 0;
     int world_size = 1;
-    std::string master_addr = "127.0.0.1";
-    uint16_t master_port = 12345;
+    UniqueId unique_id;
     int n_channels = 0;
 };
 

@@ -3,9 +3,12 @@
 #include <atomic>
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <poll.h>
+#include <unistd.h>
 #include "communicator.h"
 #include "logger.h"
 #include "utils.h"
@@ -44,14 +47,19 @@ using DefaultExecutor = MultiThreadExecutor;
 // Default number of channels when config.n_channels is unset or non-positive.
 constexpr int kDefaultChannelCount = 4;
 
+// Shared-memory rendezvous sockets all live in one directory: the port (now chosen by rank
+// 0) plus the rank is the only key a run needs, and a directory that cannot be created
+// fails every rank the same way, before any listener exists.
+constexpr const char* kRendezvousDir = "/tmp/originccl";
+
 // OCCL_DISABLE_SHM=1 forces TCP; any other value keeps local edges on shared memory.
 bool SharedMemoryEnabled() {
     const char* value = std::getenv("OCCL_DISABLE_SHM");
     return value == nullptr || std::strcmp(value, "1") != 0;
 }
 
-std::string RendezvousPath(uint16_t master_port, int rank) {
-    return "/tmp/originccl-" + std::to_string(master_port) + "-" + std::to_string(rank) + ".sock";
+std::string RendezvousPath(uint16_t port, int rank) {
+    return std::string(kRendezvousDir) + "/" + std::to_string(port) + "-" + std::to_string(rank) + ".sock";
 }
 } // namespace
 
@@ -59,6 +67,26 @@ Communicator::Communicator() {}
 
 Communicator::~Communicator() {
     Finalize();
+}
+
+bool Communicator::GetUniqueId(UniqueId& unique_id) {
+    if (bootstrap_listen_fd >= 0) {
+        LOG_ERROR("Bootstrap listener is already bound");
+        return false;
+    }
+
+    uint16_t port = 0;
+    bootstrap_listen_fd = Utils::CreateListenSocket(0, &port);
+    if (bootstrap_listen_fd < 0) {
+        LOG_ERROR("Failed to bind the bootstrap listener");
+        return false;
+    }
+
+    const std::string ip_addr = Utils::GetLocalIPAddress();
+    std::snprintf(unique_id.ip_addr, sizeof(unique_id.ip_addr), "%s", ip_addr.c_str());
+    unique_id.port = port;
+    LOG_INFO("Rank 0: Bootstrap listener is on {}:{}", ip_addr, port);
+    return true;
 }
 
 bool Communicator::Init(const CommConfig& cfg) {
@@ -105,7 +133,14 @@ bool Communicator::Init(const CommConfig& cfg) {
     std::vector<std::shared_ptr<Transport>> listeners;
     listeners.push_back(tcp_listener);
     if (use_shm) {
-        const std::string rendezvous = RendezvousPath(config.master_port, config.rank);
+        std::error_code error;
+        std::filesystem::create_directories(kRendezvousDir, error);
+        if (error) {
+            LOG_ERROR("Rank {}: Failed to create the shared-memory rendezvous directory {}: {}", config.rank,
+                      kRendezvousDir, error.message());
+            return false;
+        }
+        const std::string rendezvous = RendezvousPath(config.unique_id.port, config.rank);
         auto shm_listener = std::make_shared<TransportShm>();
         if (!shm_listener->ListenPath(rendezvous)) {
             LOG_ERROR("Rank {}: Failed to create the shared-memory rendezvous listener on {}", config.rank, rendezvous);
@@ -117,7 +152,7 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     Bootstrap bootstrap;
     std::vector<NodeInfo> all_nodes;
-    if (!bootstrap.Run(config, data_port, all_nodes)) {
+    if (!bootstrap.Run(config, data_port, bootstrap_listen_fd, all_nodes)) {
         LOG_ERROR("Rank {}: Failed to run bootstrap", config.rank);
         return false;
     }
@@ -150,6 +185,11 @@ bool Communicator::Init(const CommConfig& cfg) {
 void Communicator::Finalize() {
     if (executor) {
         executor->Shutdown();
+    }
+
+    if (bootstrap_listen_fd >= 0) {
+        close(bootstrap_listen_fd);
+        bootstrap_listen_fd = -1;
     }
 
     for (auto& channel : channels) {
@@ -270,7 +310,7 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
             auto shm_transport = std::make_shared<TransportShm>();
             // The direction picks the ring half, so it must be set before the rendezvous.
             shm_transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
-            if (!shm_transport->Connect(RendezvousPath(config.master_port, edge.peer), 0)) {
+            if (!shm_transport->Connect(RendezvousPath(config.unique_id.port, edge.peer), 0)) {
                 LOG_ERROR("Rank {}: Failed to connect to rank {} channel {} over shared memory", config.rank, edge.peer,
                           edge.channel_id);
                 error_occurred = true;

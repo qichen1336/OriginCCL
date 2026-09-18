@@ -10,10 +10,11 @@ public:
     Bootstrap() = default;
     ~Bootstrap() = default;
 
-    bool Run(const CommConfig& config, uint16_t data_port, std::vector<NodeInfo>& all_nodes);
+    bool Run(const CommConfig& config, uint16_t data_port, int bootstrap_listen_fd, std::vector<NodeInfo>& all_nodes);
 
 private:
-    bool RunMaster(const CommConfig& config, uint16_t data_port, std::vector<NodeInfo>& all_nodes);
+    bool RunMaster(const CommConfig& config, uint16_t data_port, int bootstrap_listen_fd,
+                   std::vector<NodeInfo>& all_nodes);
     bool RunWorker(const CommConfig& config, uint16_t data_port, std::vector<NodeInfo>& all_nodes);
 
     bool AcceptConnections(int listen_fd, int count, std::vector<int>& client_fds);

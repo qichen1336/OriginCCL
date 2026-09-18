@@ -1,7 +1,17 @@
+# Rank, world size and the bootstrap UniqueId all travel over MPI: rank 0 generates the id
+# and every rank receives it with MPI_Bcast, so a rank-based run must be launched by an MPI
+# launcher
+#   mpirun -np 2 ./test_allreduce
+# A process started on its own is an MPI singleton (rank 0, world size 1), which is what the
+# single-rank tier needs. MPI development files are therefore a hard requirement: the
+# launcher is not only used to start the process pair, it also carries the unique id.
+find_package(MPI REQUIRED COMPONENTS CXX)
+
 add_executable(test_allreduce test_allreduce.cpp)
 target_link_libraries(test_allreduce
     originccl
     fmt::fmt
+    MPI::MPI_CXX
 )
 target_include_directories(test_allreduce
     PRIVATE
@@ -14,6 +24,7 @@ add_executable(test_local_info test_local_info.cpp)
 target_link_libraries(test_local_info
     originccl
     fmt::fmt
+    MPI::MPI_CXX
 )
 target_include_directories(test_local_info
     PRIVATE
@@ -34,12 +45,7 @@ target_include_directories(test_transport_shm
         ${CMAKE_SOURCE_DIR}/include
 )
 
-# Rank/world_size come from Open MPI (OMPI_COMM_WORLD_RANK / OMPI_COMM_WORLD_SIZE).
-#   mpirun -np 2 ./test_allreduce
-# Or pass them manually:
-#   ./test_allreduce <rank> <world_size>
-#
-# This target is the 2-rank tier only. The ranks are different code paths, so use
+# The targets below are the 2-rank tier only. The ranks are different code paths, so use
 # scripts/run_tests.sh when you want the full matrix (1, 2 and 4 ranks).
 find_program(MPIRUN_EXECUTABLE NAMES mpirun)
 if(MPIRUN_EXECUTABLE)

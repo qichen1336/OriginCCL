@@ -9,13 +9,13 @@ OriginCCL 是一个受 NCCL 启发的 C++ 集合通信（collective communicatio
 - 外部依赖（系统级，需预装）：
   - **fmt**（≥ 9，已验证 10.2.1），必须提供 CMake package
   - **Threads**
-  - 多进程测试仅支持 **Open MPI** 的 `mpirun`。
+  - **MPI**（Open MPI 4.1.2 已验证）：测试链接 `MPI::MPI_CXX`，rank / world size / `UniqueId` 都走它；多进程测试仅支持 `mpirun` 启动。
 
 ## Golden rules (the things agents most often get wrong)!!!!
 - **主路径优先于防御性编码。** 先把核心功能跑通 —— 这比守住每个边界情况更重要。事实上，当前代码的逻辑设计已经有了很多“隐含保证”，例如同一个channel的send和recv一定使用不同的fd。你应该妥善利用这些“隐含保证”，不要做不可能发生的错误处理、回退与防御性检查。`docs/`目录下的文件有助于你理解这些“隐含保证”，你在更新docs/`目录下的文件也要注意维护和增删这些隐含保证。
 - 你添加的每个函数、变量、结构体与类都必须**语义清晰且确实必要**。如果某个被提议的实体删掉后既不损失清晰度也不损失能力，那它就不该存在：不要"以防万一"地添加包装、参数或占位。特别是**新增类之前先确认，尤其是基类。** 未经明确批准绝不引入新的抽象基类。优先使用自由函数，或扩展既有类型。
 - **优先采用最简设计与实现。** 做能解决问题的最小改动，不要大规模重写，不要顺手重构，使用 git diff 最小设计。写直接、可读的版本：不要为处理不了的错误加 `try`/`catch`。
-- **不要添加注释块 —— 好代码是自注释的。** 让命名承载意图；`src/` 与 `include/` 倾向于完全无注释。对于不显而易见的 *why*，写一行短注释是可以的。
+- **不要添加任何注释。**`src/` 与 `include/` 倾向于完全无注释。对于特别不显而易见的 *why*，写**一行**短注释是可以的。
 - 公开入口返回 `bool`，不跨 API 抛异常。失败时先 `LOG_ERROR`，再 `return false`。
 - 日志一律走 `LOG_DEBUG/INFO/WARN/ERROR` 宏（fmt 风格 `{}` 占位），不用 `printf`/`iostream`。
 
@@ -47,13 +47,13 @@ scripts/                   run_tests.sh / run_all_executors.sh
 - 缩进：4个空格，不使用制表符；大括号：K&R 风格（不另起一行）；最大行长度：200 字符；逗号后加空格；
 
 ## Build and test
-测试进程的 rank / world size 来自 `OMPI_COMM_WORLD_RANK` / `OMPI_COMM_WORLD_SIZE`：
+测试进程的 rank / world size 来自 MPI（`MPI_Comm_rank` / `MPI_Comm_size`）；bootstrap 的 `UniqueId`（rank0 的 IP + 端口）由 rank0 用 `Communicator::GetUniqueId` 生成后经 `MPI_Bcast` 分发给其余 rank，不再有 `OCCL_MASTER_ADDR` / `OCCL_MASTER_PORT`：
 
 ```bash
 mpirun -np 2 build/tests/test_allreduce
 mpirun -np 4 build/tests/test_allreduce
-# 或手动指定（需自行同时拉起各进程）：
-build/tests/test_allreduce <rank> <world_size>
+# 单进程直接跑 = MPI singleton（rank 0、world size 1，走无数据面路径）：
+build/tests/test_allreduce
 ```
 
 - `cmake --build build --target run_test_allreduce` 只跑 **np=2** 一档，不是全矩阵。
