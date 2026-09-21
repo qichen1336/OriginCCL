@@ -32,7 +32,7 @@ flowchart LR
 - **被动端单 `poll()` 循环**：TCP 与 rendezvous 两个 listener 用一个 `poll()` 循环等（掩码取 `Transport::GetPollEvents()`，不是硬编码），谁就绪就 `Accept()`，再走共用握手把 transport 装到对应 connector；不需要独立 accept 线程，也不看 executor 类型。该函数只需要 listener 列表与条数，不需要 `all_nodes`（对端 rank 的数组索引交给 `FindConnector` 自己越界检查）。
 - **listener 生命周期**：channel init 完成后两个 listener 都 `Close()`（rendezvous 路径被 `unlink`），临时 control socket 由 transport 自己在握手后关闭；已建立的 channel transport 活到 `Finalize`。
 - **生命周期顺序（死锁/崩溃防线）**：`Finalize` 必须先 `executor->Shutdown()`（多线程 executor 还需 join worker），**再**关闭 channel transports。`PlanTask` 通过 `shared_ptr<Transport>` 保证 transport 在 plan 执行期间有效。
-- **机器身份 = hostname**（`Utils::GetHostname()` → `gethostname()`），不是 IP：IP 有 `127.0.0.1` 特判且属数据面语义，hostname 与网络无关、单机多进程天然一致——这是隐含保证，据此不做「同 IP」这类需要特判的防御。`NodeInfo` 携带 `hostname`（`EncodeNodeInfo`/`DecodeNodeInfo` 同步编解码），master 与 worker 各自在 bootstrap 时填入 `Utils::GetHostname()`。
+- **机器身份 = hostname**（`Utils::GetHostname()` → `gethostname()`），不是 IP：IP 有 `127.0.0.1` 特判且属数据面语义，hostname 与网络无关、单机多进程天然一致——这是隐含保证，据此不做「同 IP」这类需要特判的防御。`NodeInfo` 携带 `hostname`（`EncodeNodeInfo`/`DecodeNodeInfo` 同步编解码），master 与 worker 各自在 bootstrap 时填入 `CommConfig::get_hostname()`（默认指向 `Utils::GetHostname`，测试可注入按 rank 推导的假值以在单机模拟多机；正常路径仍是真实 hostname）。
 
 ### 设计区间
 
@@ -59,3 +59,4 @@ flowchart LR
 - 机器身份用 hostname，不要改回 IP。
 - 改动传输选择后跑 `scripts/run_tests.sh --transport all`（或 `run_all_executors.sh`）：两档把 rendezvous 目录 `/tmp/originccl` 用普通文件占住（端口由 rank0 运行时挑，脚本猜不到具体路径，只能占目录），分别要求「共享内存开启时初始化失败（不回退）」与「`OCCL_DISABLE_SHM=1` 时照常成功（override 真的没建 listener）」——这是当前唯一能证明选择生效的断言。
 - Bootstrap（`src/bootstrap.cpp`）：rank0 为 master 在借来的 bootstrap listener（`config.unique_id.port`）上收齐各 rank 的 `NodeInfo`(rank/ip/hostname/data_port) 后广播给所有人；worker 连 `config.unique_id.ip_addr:port`，各 rank 自己的 IP 一律 `Utils::GetLocalIPAddress()`（不再有 `master_addr` 特判）。
+- 多机行为单机验证：`tests/test_multi_machine.cpp` 经 `CommConfig::get_hostname` 注入假 hostname，`scripts/run_tests.sh` 的 tier 9（np=2 全不同机，纯 TCP）与 tier 10（np=4 每机 2 rank，混合 SHM+TCP）跑它，断言 local 视图与端到端 AllReduce。

@@ -9,6 +9,10 @@
 class Transport;
 class Topology;
 
+namespace Utils {
+std::string GetHostname();
+}
+
 enum class DataType {
     FLOAT32,
     FLOAT64,
@@ -37,6 +41,7 @@ struct CommConfig {
     int world_size = 1;
     UniqueId unique_id;
     int n_channels = 0;
+    std::string (*get_hostname)() = Utils::GetHostname;
 };
 
 struct NodeInfo {

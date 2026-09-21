@@ -12,6 +12,8 @@
 #   tier 6  mpirun -np 2          OCCL_DISABLE_SHM=1, same-host edges forced onto TCP
 #   tier 7  mpirun -np 4          OCCL_DISABLE_SHM=1, all four channels over TCP
 #   tier 8  mpirun -np 2          OCCL_DISABLE_SHM=1, which must not bind a rendezvous path
+#   tier 9  test_multi_machine    mpirun -np 2, all-distinct fake hostnames, TCP edges
+#   tier 10 test_multi_machine    mpirun -np 4, two ranks per machine, mixed SHM + TCP
 #
 # Tiers 2-5 exercise the library's own selection (shared memory for same-host edges),
 # tiers 6-8 override it with TCP. The 2- and 4-rank matrix runs in both modes, because the
@@ -26,6 +28,12 @@
 # Tier 0 covers the transport itself and tier 1 has no data plane, so neither depends on
 # the mode: tier 0 runs in every mode, tier 1 runs once, in the shm pass. Tier 0 needs
 # neither mpirun nor MPI at all.
+#
+# Tiers 9-10 fake a multi-host topology on one node by injecting a per-rank hostname through
+# CommConfig::get_hostname, so cross-machine edges are exercised without leaving the host:
+# tier 9 gives every rank its own machine (all edges TCP), tier 10 puts two ranks per
+# machine (same-machine edges stay SHM, cross-machine edges go TCP). They assert both the
+# local rank view and end-to-end AllReduce over that transport selection.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -126,6 +134,7 @@ fi
 build_dir=$(cd "$repo_root" && mkdir -p "$build_dir" && cd "$build_dir" && pwd)
 test_bin="$build_dir/tests/test_allreduce"
 shm_test_bin="$build_dir/tests/test_transport_shm"
+multi_machine_test_bin="$build_dir/tests/test_multi_machine"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
 
@@ -181,6 +190,16 @@ run_mpi_tier() {
         launcher=(env "$@" "${launcher[@]}")
     fi
     run_tier "$label, mpirun -np $np$mpi_extra_label" "${launcher[@]}" "$test_bin"
+}
+
+# Usage: run_multi_machine_tier <label> <np>
+# Runs the multi-machine simulation test. The layout (how many ranks share a machine) is
+# hardcoded inside the test by world size, so the launcher only picks the rank count.
+run_multi_machine_tier() {
+    local label="$1"
+    local np="$2"
+    run_tier "$label, mpirun -np $np$mpi_extra_label" mpirun "${mpi_extra[@]}" -np "$np" \
+        "$multi_machine_test_bin"
 }
 
 # The rendezvous sockets live in one directory (/tmp/originccl), which makes the failure
@@ -282,9 +301,11 @@ if [[ $transport != "tcp" ]]; then
         run_mpi_tier "tier 4: shared memory (OCCL_DISABLE_SHM=0)" 2 OCCL_DISABLE_SHM=0 || true
         run_blocked_rendezvous_tier "tier 5: unusable rendezvous directory must fail init" fail \
             -u OCCL_DISABLE_SHM || true
+        run_multi_machine_tier "tier 9: all-distinct hostnames (TCP edges)" 2 || true
+        run_multi_machine_tier "tier 10: two ranks per machine (mixed SHM + TCP)" 4 || true
     else
         echo
-        echo ">>> SKIP: mpirun not found, tiers 2-5 were NOT run" >&2
+        echo ">>> SKIP: mpirun not found, tiers 2-5 and 9-10 were NOT run" >&2
         skipped=1
     fi
 fi

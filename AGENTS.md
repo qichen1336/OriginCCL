@@ -60,14 +60,15 @@ build/tests/test_allreduce
 
 - `cmake --build build --target run_test_allreduce` 只跑 **np=2** 一档，不是全矩阵。
 - **完整验证请用脚本**（各 tier 是不同的代码路径，不是“同一条多跑几次”）：
-  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–8 矩阵（含 shm / tcp 两种传输模式）。
+  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–10 矩阵（含 shm / tcp 两种传输模式与单机多机模拟）。
   - `scripts/run_all_executors.sh` —— 对 4 种 executor 各跑一遍完整矩阵，退出码 0 才算全过。
   - 主要参数：`--coverage` / `--no-build` / `--build-dir` / `--build-type` / `--executor` / `--transport` / `--timeout` / `--allow-skip`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 失败 / `2` 有 SKIP / `3` 覆盖率报告无法生成。
 - **mpirun 缺失 → 报 SKIP 而非通过**：在一台只跑了单 rank tier 的机器上“静默变绿”正是该脚本要杜绝的失败模式。
-- 三个测试二进制：
+- 四个测试二进制：
   - `test_allreduce`：端到端 AllReduce 正确性（各 rank 填 `rank+1`，断言 reduce 结果）。
   - `test_local_info`：单机 local rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）断言。
+  - `test_multi_machine`：单机模拟多机（`CommConfig::get_hostname` 注入按 rank 推导的假 hostname，每机 rank 数按 world size 在测试内写死），断言 local 视角与跨机（TCP）/混合（SHM+TCP）路径的 AllReduce。
   - `test_transport_shm`：共享内存传输的 fork 端点对，**无需 mpirun**（rendezvous、描述符传递、控制握手、阻塞/非阻塞、回绕/背压、方向拒绝、拆除）。
 
 

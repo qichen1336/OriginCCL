@@ -45,6 +45,21 @@ target_include_directories(test_transport_shm
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# A single host is made to look like several machines by injecting a fake hostname through
+# CommConfig::get_hostname, so cross-machine edges (TCP) and the local rank view can be
+# asserted without leaving one node. The layout (how many ranks share a machine) is
+# hardcoded inside the test by world size.
+add_executable(test_multi_machine test_multi_machine.cpp)
+target_link_libraries(test_multi_machine
+    originccl
+    fmt::fmt
+    MPI::MPI_CXX
+)
+target_include_directories(test_multi_machine
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 # The targets below are the 2-rank tier only. The ranks are different code paths, so use
 # scripts/run_tests.sh when you want the full matrix (1, 2 and 4 ranks).
 find_program(MPIRUN_EXECUTABLE NAMES mpirun)
@@ -60,5 +75,11 @@ if(MPIRUN_EXECUTABLE)
         DEPENDS test_local_info originccl
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         COMMENT "Run local-rank info test with Open MPI (single-host assertions)"
+    )
+    add_custom_target(run_test_multi_machine
+        COMMAND ${MPIRUN_EXECUTABLE} -np 2 $<TARGET_FILE:test_multi_machine>
+        DEPENDS test_multi_machine originccl
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Run multi-machine simulation test with Open MPI (all-distinct hostnames)"
     )
 endif()

@@ -25,7 +25,7 @@ bool Bootstrap::RunMaster(const CommConfig& config, uint16_t data_port, int list
     all_nodes.resize(config.world_size);
 
     std::string local_ip(config.unique_id.ip_addr);
-    std::string hostname = Utils::GetHostname();
+    std::string hostname = config.get_hostname();
     all_nodes[0] = NodeInfo(0, local_ip, data_port, hostname);
     LOG_INFO("Bootstrap - Master: Node Info - rank = 0, IP = {}, port = {}, hostname = {}", local_ip, data_port,
              hostname);
@@ -78,7 +78,7 @@ bool Bootstrap::RunWorker(const CommConfig& config, uint16_t data_port, std::vec
     LOG_INFO("Bootstrap - Worker: Connect to master {}:{}", master_addr, config.unique_id.port);
 
     std::string local_ip = Utils::GetLocalIPAddress();
-    std::string hostname = Utils::GetHostname();
+    std::string hostname = config.get_hostname();
     NodeInfo node_info(config.rank, local_ip, data_port, hostname);
     if (!SendNodeInfo(sockfd, node_info)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to send Node Info to master", config.rank);
