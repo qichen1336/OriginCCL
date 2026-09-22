@@ -12,14 +12,25 @@
 #   tier 6  mpirun -np 2          OCCL_DISABLE_SHM=1, same-host edges forced onto TCP
 #   tier 7  mpirun -np 4          OCCL_DISABLE_SHM=1, all four channels over TCP
 #   tier 8  mpirun -np 2          OCCL_DISABLE_SHM=1, which must not bind a rendezvous path
-#   tier 9  test_multi_machine    mpirun -np 2, all-distinct fake hostnames, TCP edges
-#   tier 10 test_multi_machine    mpirun -np 4, two ranks per machine, mixed SHM + TCP
+#   tier 9  test_multi_machine    mpirun -np 2, all-distinct fake hostnames, RDMA edges
+#   tier 10 test_multi_machine    mpirun -np 4, two ranks per machine, mixed SHM + RDMA
+#   tier 11 test_transport_rdma   mpirun -np 2, RDMA CM + RC + writer, no communicator
+#   tier 12 mpirun -np 2          OCCL_DISABLE_RDMA=1, network edges must fall back to TCP
 #
 # Tiers 2-5 exercise the library's own selection (shared memory for same-host edges),
 # tiers 6-8 override it with TCP. The 2- and 4-rank matrix runs in both modes, because the
 # transport selection must not depend on the executor or on the rank count. Every tier
 # makes the same collective assertions, so a tier proves its code path ran end to end, not
 # which transport was picked.
+#
+# The RDMA tiers run the transport directly (tier 11) and through the communicator (tiers 9,
+# 10). Tier 11 drives the CM handshake, the RC queue pair and the write path without a
+# communicator, so an RDMA failure is localised there instead of surfacing as a collective
+# mismatch. Tiers 9 and 10 also assert the concrete transport type on every edge, which is
+# what distinguishes "RDMA was selected" from "RDMA was available but TCP was used".
+# Tiers 6-8 disable RDMA as well as shared memory: OCCL_DISABLE_SHM alone only removes the
+# same-host transport, so without OCCL_DISABLE_RDMA the cross-host edges would still leave
+# the TCP path untested.
 #
 # Tiers 5 and 8 pin down the override semantics: a shared-memory failure is never quietly
 # turned into a TCP fallback, and the override is a selection rather than a fallback. They
@@ -31,9 +42,15 @@
 #
 # Tiers 9-10 fake a multi-host topology on one node by injecting a per-rank hostname through
 # CommConfig::get_hostname, so cross-machine edges are exercised without leaving the host:
-# tier 9 gives every rank its own machine (all edges TCP), tier 10 puts two ranks per
-# machine (same-machine edges stay SHM, cross-machine edges go TCP). They assert both the
-# local rank view and end-to-end AllReduce over that transport selection.
+# tier 9 gives every rank its own machine (all edges over RDMA), tier 10 puts two ranks per
+# machine (same-machine edges stay SHM, cross-machine edges go RDMA). They assert both the
+# local rank view, the concrete transport per edge, and end-to-end AllReduce over that
+# transport selection.
+#
+# Tier 11 needs an RDMA device; when none is usable the tier reports SKIP, because a
+# machine without RDMA genuinely cannot exercise the path. Tier 12 pins the override
+# semantics: with OCCL_DISABLE_RDMA every network edge must be TCP even though a device is
+# present, which is the fallback the task requires.
 #
 # A missing mpirun is reported as SKIP and never as a pass: silently going green on
 # a machine that only ran tier 1 is the failure mode this script exists to prevent.
@@ -47,9 +64,10 @@
 #   --build-dir <dir>  build directory (default: <repo>/build)
 #   --build-type <t>   CMAKE_BUILD_TYPE (coverage defaults to Debug, see below)
 #   --executor <name>  OCCL_EXECUTOR: multi_thread, epoll, polling, or reactor (default multi_thread)
-#   --transport <mode> all (default): tiers 0-8, both transport modes
+#   --transport <mode> all (default): tiers 0-12, both transport modes
 #                      shm:           tiers 0-5, the library's own transport selection
 #                      tcp:           tier 0 and tiers 6-8, OCCL_DISABLE_SHM=1
+#                      rdma:          tiers 0, 9-12, RDMA and its TCP fallback
 #   --timeout <secs>   per-tier timeout (default: 120)
 #   --allow-skip       a missing mpirun is a warning, not a failure exit
 #   -h, --help         this text
@@ -116,9 +134,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$transport" in
-    all | shm | tcp) ;;
+    all | shm | tcp | rdma) ;;
     *)
-        echo "unknown transport: $transport (expected all, shm, or tcp)" >&2
+        echo "unknown transport: $transport (expected all, shm, tcp, or rdma)" >&2
         usage >&2
         exit 64
         ;;
@@ -134,6 +152,7 @@ fi
 build_dir=$(cd "$repo_root" && mkdir -p "$build_dir" && cd "$build_dir" && pwd)
 test_bin="$build_dir/tests/test_allreduce"
 shm_test_bin="$build_dir/tests/test_transport_shm"
+rdma_test_bin="$build_dir/tests/test_transport_rdma"
 multi_machine_test_bin="$build_dir/tests/test_multi_machine"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
@@ -192,14 +211,21 @@ run_mpi_tier() {
     run_tier "$label, mpirun -np $np$mpi_extra_label" "${launcher[@]}" "$test_bin"
 }
 
-# Usage: run_multi_machine_tier <label> <np>
-# Runs the multi-machine simulation test. The layout (how many ranks share a machine) is
-# hardcoded inside the test by world size, so the launcher only picks the rank count.
+# Usage: run_multi_machine_tier <label> <np> <expected> [NAME=value | -u NAME ...]
+# Runs the multi-machine simulation test, which asserts both the local rank view and the
+# concrete transport type stored on every edge. The layout (how many ranks share a machine)
+# is hardcoded inside the test by world size, so the launcher only picks the rank count.
+# Trailing arguments go to env(1).
 run_multi_machine_tier() {
     local label="$1"
     local np="$2"
-    run_tier "$label, mpirun -np $np$mpi_extra_label" mpirun "${mpi_extra[@]}" -np "$np" \
-        "$multi_machine_test_bin"
+    local expected="$3"
+    shift 3
+    local -a launcher=(mpirun "${mpi_extra[@]}" -np "$np" "$multi_machine_test_bin" "$expected")
+    if [[ $# -gt 0 ]]; then
+        launcher=(env "$@" "${launcher[@]}")
+    fi
+    run_tier "$label, mpirun -np $np$mpi_extra_label" "${launcher[@]}"
 }
 
 # The rendezvous sockets live in one directory (/tmp/originccl), which makes the failure
@@ -249,6 +275,17 @@ run_blocked_rendezvous_tier() {
     failed=1
     return 1
 }
+
+# RDMA availability decides whether the RDMA tiers can run at all. A host with no active
+# InfiniBand/RoCE port cannot exercise the path, so those tiers are reported as SKIP rather
+# than failing: pretending a machine without RDMA validated it is the failure mode to avoid.
+have_rdma=0
+for state in /sys/class/infiniband/*/ports/*/state; do
+    if [[ -r "$state" ]] && grep -q ': ACTIVE' "$state" 2> /dev/null; then
+        have_rdma=1
+        break
+    fi
+done
 
 if [[ $do_build -eq 1 ]]; then
     if [[ $coverage -eq 1 ]]; then
@@ -301,26 +338,70 @@ if [[ $transport != "tcp" ]]; then
         run_mpi_tier "tier 4: shared memory (OCCL_DISABLE_SHM=0)" 2 OCCL_DISABLE_SHM=0 || true
         run_blocked_rendezvous_tier "tier 5: unusable rendezvous directory must fail init" fail \
             -u OCCL_DISABLE_SHM || true
-        run_multi_machine_tier "tier 9: all-distinct hostnames (TCP edges)" 2 || true
-        run_multi_machine_tier "tier 10: two ranks per machine (mixed SHM + TCP)" 4 || true
     else
         echo
-        echo ">>> SKIP: mpirun not found, tiers 2-5 and 9-10 were NOT run" >&2
+        echo ">>> SKIP: mpirun not found, tiers 2-5 were NOT run" >&2
         skipped=1
     fi
 fi
 
 if [[ $transport != "shm" ]]; then
     if [[ $have_mpirun -eq 1 ]]; then
-        run_mpi_tier "tier 6: TCP (OCCL_DISABLE_SHM=1)" 2 OCCL_DISABLE_SHM=1 || true
-        run_mpi_tier "tier 7: TCP (OCCL_DISABLE_SHM=1)" 4 OCCL_DISABLE_SHM=1 || true
+        run_mpi_tier "tier 6: TCP (OCCL_DISABLE_SHM=1, OCCL_DISABLE_RDMA=1)" 2 OCCL_DISABLE_SHM=1 \
+            OCCL_DISABLE_RDMA=1 || true
+        run_mpi_tier "tier 7: TCP (OCCL_DISABLE_SHM=1, OCCL_DISABLE_RDMA=1)" 4 OCCL_DISABLE_SHM=1 \
+            OCCL_DISABLE_RDMA=1 || true
         run_blocked_rendezvous_tier "tier 8: TCP override must not touch the rendezvous directory" ok \
-            OCCL_DISABLE_SHM=1 || true
+            OCCL_DISABLE_SHM=1 OCCL_DISABLE_RDMA=1 || true
     else
         echo
         echo ">>> SKIP: mpirun not found, tiers 6-8 were NOT run" >&2
         skipped=1
     fi
+fi
+
+# Tiers 9-10 exercise the network transport selection under a faked multi-host topology and
+# assert the concrete transport per edge, so they need a usable RDMA device. Tier 12 pins the
+# opposite behaviour and therefore runs even without one.
+if [[ $transport != "tcp" ]]; then
+    if [[ $have_mpirun -ne 1 ]]; then
+        echo
+        echo ">>> SKIP: mpirun not found, tiers 9-12 were NOT run" >&2
+        skipped=1
+    elif [[ $have_rdma -eq 1 ]]; then
+        run_multi_machine_tier "tier 9: all-distinct hostnames (RDMA edges)" 2 rdma || true
+        run_multi_machine_tier "tier 10: two ranks per machine (mixed SHM + RDMA)" 4 shm+rdma || true
+    else
+        echo
+        echo ">>> SKIP: no RDMA device with an active port, tiers 9-11 were NOT run" >&2
+        skipped=1
+    fi
+fi
+
+# Tier 11 drives the RDMA transport itself. A verbs context that is forked without exec makes
+# every ibv_post_send fail, so the two endpoints are started by mpirun rather than forked.
+if [[ $transport != "tcp" && $have_mpirun -eq 1 && $have_rdma -eq 1 ]]; then
+    echo
+    echo "--- tier 11: RDMA transport (CM + RC + write), mpirun -np 2$mpi_extra_label"
+    rc=0
+    timeout "$timeout_s" mpirun "${mpi_extra[@]}" -np 2 "$rdma_test_bin" \
+        > "$build_dir/rdma-transport.log" 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        echo ">>> PASS: tier 11"
+    elif [[ $rc -eq 2 ]]; then
+        echo ">>> SKIP: tier 11 needs an RDMA device with an active port" >&2
+        skipped=1
+    else
+        echo ">>> FAIL: tier 11 exited with $rc (log: $build_dir/rdma-transport.log)" >&2
+        tail -n 20 "$build_dir/rdma-transport.log" >&2
+        failed=1
+    fi
+fi
+
+# Tier 12 must hold without a device: OCCL_DISABLE_RDMA is a selection, not a fallback, so
+# every network edge has to be TCP even on a host that does have RDMA.
+if [[ $transport != "tcp" && $have_mpirun -eq 1 ]]; then
+    run_multi_machine_tier "tier 12: OCCL_DISABLE_RDMA=1 must use TCP" 2 tcp OCCL_DISABLE_RDMA=1 || true
 fi
 
 report_coverage() {

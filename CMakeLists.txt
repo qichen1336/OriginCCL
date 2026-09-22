@@ -25,10 +25,24 @@ find_package(Threads REQUIRED)
 # pre-installed and provide its CMake package (fmt >= 9 required, 10.2.1 verified).
 find_package(fmt REQUIRED)
 
+# RDMA is a hard dependency: libibverbs and librdmacm must be pre-installed with their
+# development headers. The RDMA transport is always compiled in; whether it is used at
+# runtime is decided by device probing, not by the build.
+find_path(OCCL_RDMA_INCLUDE_DIR rdma/rdma_cma.h)
+find_library(OCCL_IBVERBS_LIBRARY NAMES ibverbs)
+find_library(OCCL_RDMACM_LIBRARY NAMES rdmacm)
+if(NOT OCCL_RDMA_INCLUDE_DIR OR NOT OCCL_IBVERBS_LIBRARY OR NOT OCCL_RDMACM_LIBRARY)
+    message(FATAL_ERROR
+        "OriginCCL requires the RDMA development files (rdma/rdma_cma.h, libibverbs, librdmacm). "
+        "Install librdmacm-dev and libibverbs-dev, or a provider package that ships them.")
+endif()
+message(STATUS "OriginCCL RDMA: ${OCCL_IBVERBS_LIBRARY} ${OCCL_RDMACM_LIBRARY}")
+
 set(ORIGIN_CCL_SOURCES
     src/utils.cpp
     src/transport/transport_tcp.cpp
     src/transport/transport_shm.cpp
+    src/transport/transport_rdma.cpp
     src/topology_ring.cpp
     src/bootstrap.cpp
     src/planner.cpp
@@ -70,6 +84,10 @@ target_link_libraries(originccl
     PRIVATE
         Threads::Threads
         fmt::fmt
+        ${OCCL_IBVERBS_LIBRARY}
+        ${OCCL_RDMACM_LIBRARY}
 )
+
+target_include_directories(originccl PRIVATE ${OCCL_RDMA_INCLUDE_DIR})
 
 add_subdirectory(tests)

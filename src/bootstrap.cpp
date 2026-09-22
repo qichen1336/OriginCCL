@@ -9,26 +9,24 @@
 #include "logger.h"
 #include "transport/transport_tcp.h"
 
-bool Bootstrap::Run(const CommConfig& config, uint16_t data_port, int bootstrap_listen_fd,
+bool Bootstrap::Run(const CommConfig& config, const NodeInfo& local_node, int bootstrap_listen_fd,
                     std::vector<NodeInfo>& all_nodes) {
     if (config.rank == 0) {
-        return RunMaster(config, data_port, bootstrap_listen_fd, all_nodes);
+        return RunMaster(config, local_node, bootstrap_listen_fd, all_nodes);
     } else {
-        return RunWorker(config, data_port, all_nodes);
+        return RunWorker(config, local_node, all_nodes);
     }
 }
 
-bool Bootstrap::RunMaster(const CommConfig& config, uint16_t data_port, int listen_fd,
+bool Bootstrap::RunMaster(const CommConfig& config, const NodeInfo& local_node, int listen_fd,
                           std::vector<NodeInfo>& all_nodes) {
     LOG_INFO("Bootstrap - Master: Running as master with world size {}", config.world_size);
 
     all_nodes.resize(config.world_size);
 
-    std::string local_ip(config.unique_id.ip_addr);
-    std::string hostname = config.get_hostname();
-    all_nodes[0] = NodeInfo(0, local_ip, data_port, hostname);
-    LOG_INFO("Bootstrap - Master: Node Info - rank = 0, IP = {}, port = {}, hostname = {}", local_ip, data_port,
-             hostname);
+    all_nodes[0] = local_node;
+    LOG_INFO("Bootstrap - Master: Node Info - rank = 0, IP = {}, port = {}, hostname = {}", local_node.ip_addr,
+             local_node.data_port, local_node.hostname);
 
     if (listen_fd < 0) {
         LOG_ERROR("Bootstrap - Master: No bootstrap listener, rank 0 must pass a unique id to Init");
@@ -66,7 +64,7 @@ bool Bootstrap::RunMaster(const CommConfig& config, uint16_t data_port, int list
     return true;
 }
 
-bool Bootstrap::RunWorker(const CommConfig& config, uint16_t data_port, std::vector<NodeInfo>& all_nodes) {
+bool Bootstrap::RunWorker(const CommConfig& config, const NodeInfo& local_node, std::vector<NodeInfo>& all_nodes) {
     LOG_INFO("Bootstrap - Worker: Running as worker {}", config.rank);
 
     const std::string master_addr = config.unique_id.ip_addr;
@@ -77,16 +75,14 @@ bool Bootstrap::RunWorker(const CommConfig& config, uint16_t data_port, std::vec
     }
     LOG_INFO("Bootstrap - Worker: Connect to master {}:{}", master_addr, config.unique_id.port);
 
-    std::string local_ip = Utils::GetLocalIPAddress();
-    std::string hostname = config.get_hostname();
-    NodeInfo node_info(config.rank, local_ip, data_port, hostname);
+    const NodeInfo& node_info = local_node;
     if (!SendNodeInfo(sockfd, node_info)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to send Node Info to master", config.rank);
         close(sockfd);
         return false;
     }
     LOG_INFO("Bootstrap - Worker: Send Node Info to master - rank = {}, IP = {}, port = {}, hostname = {}", config.rank,
-             local_ip, data_port, hostname);
+             node_info.ip_addr, node_info.data_port, node_info.hostname);
 
     if (!RecvAllNodes(sockfd, all_nodes)) {
         LOG_ERROR("Bootstrap - Worker: rank {} failed to recv all Node Info from master", config.rank);

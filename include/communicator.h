@@ -67,9 +67,9 @@ private:
     };
 
     bool InitChannels(const std::vector<NodeInfo>& all_nodes, const std::vector<std::shared_ptr<Transport>>& listeners,
-                      bool use_shm);
+                      bool use_shm, bool rdma_ready);
     bool ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges, bool use_shm,
-                            std::atomic<bool>& error_occurred);
+                            bool rdma_ready, std::atomic<bool>& error_occurred);
     bool AcceptPassiveEdges(const std::vector<std::shared_ptr<Transport>>& listeners, size_t accept_count,
                             std::atomic<bool>& error_occurred);
     Connector* FindConnector(int channel_id, int peer, bool is_send);
