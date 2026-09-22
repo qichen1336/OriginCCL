@@ -45,6 +45,21 @@ target_include_directories(test_transport_shm
         ${CMAKE_SOURCE_DIR}/include
 )
 
+# The RDMA transport needs two independent processes: a verbs context initialized and then
+# forked without exec makes every ibv_post_send fail with EPERM, so the endpoints must be
+# launched by mpirun rather than fork. It covers the CM handshake, the RC queue pair, the
+# RDMA write path, ring slot recycling through credits, and multi-megabyte transfers.
+add_executable(test_transport_rdma test_transport_rdma.cpp)
+target_link_libraries(test_transport_rdma
+    originccl
+    fmt::fmt
+    MPI::MPI_CXX
+)
+target_include_directories(test_transport_rdma
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+)
+
 # A single host is made to look like several machines by injecting a fake hostname through
 # CommConfig::get_hostname, so cross-machine edges (TCP) and the local rank view can be
 # asserted without leaving one node. The layout (how many ranks share a machine) is

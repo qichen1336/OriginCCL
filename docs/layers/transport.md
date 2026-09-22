@@ -1,6 +1,6 @@
 # Transport 层（`include/transport/*.h`、`src/transport/*.cpp`）
 
-两种传输实现：TCP socket 与同机共享内存。改动本层前阅读本文件。
+三种传输实现：TCP socket、同机共享内存与 RDMA（CM 建链 + RC + write）。改动本层前阅读本文件。
 
 transport 与 executor 一样单独成目录；头文件从 include 根限定引用，形如 `#include
 "transport/transport.h"`、`#include "transport/transport_shm.h"`。其余层仍是
@@ -26,6 +26,20 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - 阻塞 `Send`/`Recv` 在环上靠 `poll()` 等本端 eventfd 完成；`TrySend`/`TryRecv` 绝不阻塞：推不动时先排空本端 eventfd 再复检环状态，然后才报「无进展」，一次成功调用最多通知对端一次。`Try*` 必须排空到不能再推进（drain+复检），这是 `EPOLLET` 下不漏边沿的契约；TCP 侧对应「读到 EAGAIN 才停」（`include/transport/transport.h` 有同一条注释）。
 - **Linux 专属**：实现依赖 `memfd_create`、`eventfd`、Unix domain socket（`SOCK_SEQPACKET`）、`SCM_RIGHTS`、`poll`/`epoll`。非 Linux 平台不提供该实现，也不加条件编译下的降级路径。
 
+### RDMA 传输（`TransportRDMA`）
+
+- **建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`**：`ListenAddr(addr, port)` 在 RDMA 设备地址上 `rdma_listen`（`port=0` 时由内核选端口，用 `rdma_get_local_addr` 读回真实端口，因为 `rdma_get_src_port` 在部分 librdmacm 版本上返回错误值）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端在 `CONNECT_REQUEST` 上 `rdma_accept`，两端 QP 都是 `IBV_QPT_RC`。
+- **对端内存信息走 CM private data，不是额外一轮阻塞握手**：`private_data` 携带 `{base_addr, rkey, magic}`，两端在事件里直接得到，避免与调用方握手时序耦合。**被动端的对端信息在 `CONNECT_REQUEST` 事件里，主动端在 `ESTABLISHED` 事件里**——这是本实现的隐含保证，据此不同一套「先 RECV 再 ACCEPT」的同步。
+- **握手与控制流与数据方向解耦**：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关（主动连接方可能是数据消费者）。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`，**完成即返回，不会顺便把同一 buffer 当成数据流的第一段**；之后非生产者方向的阻塞 `Send`/`Recv` 是 no-op 且成功。bootstrap 的控制流量因此可以跑在单向连接上。
+- **数据面是 2 MiB 预注册环形缓冲，`64 KiB × 32` 槽位**：producer 把调用方数据 `memcpy` 进当前槽（staging）后再 post write，consumer 从槽里读。**这解释了 `TrySend` 的语义**：`*progress` 表示已被读入 transport 自有槽并成功提交的字节；`*done` 置位后调用方缓冲区即可立即复用（transport 不再读用户缓冲）。
+- **槽位复用有两个独立门控，缺一不可**：本地槽必须等对应 send CQE（`local_completed`）才能重写，远端槽必须等 consumer 归还 credit（`credits_received`）才能重写，发送窗口取两者较小值。只用其中之一会破坏数据。
+- **credit 反向归还**：consumer 在把整个槽交给调用方后，用一次 `WRITE_WITH_IMM` 写对端控制区，immediate 高位标记「这是 credit」、低位是归还槽数；producer 用这一路回收远端槽。credit 用 write 而不是 SEND，是为了不受方向限制。
+- **`WRITE_WITH_IMM` 会消耗接收方 RQ 里的 WQE，payload 却落在 WR 指定的 `remote_addr`**（不占接收 buffer）：因此接收队列是纯 credit 池（`kRdmaRecvPool` 个空 WQE，绑定 scratch 区），每收到一个 write-imm 就立刻补投一个。没投就发会得到 RNR，环形缓冲无法启动。
+- **就绪与 EPOLLET**：`GetFd()` 连接后返回内部聚合 epoll fd（同时监听 comp channel 与 CM channel，所以断链也能唤醒），监听态返回 CM channel fd；`GetPollEvents()` 恒为 `EPOLLIN`。`TrySend`/`TryRecv` 非阻塞地 drain 完成后，**必须** `ibv_get_cq_event` → `ibv_ack_cq_events` → `ibv_req_notify_cq` 重新 arm 再 poll CQ，只 poll CQ 而不排空 completion channel 会漏掉下一次边沿。
+- **设备探测**：`TransportRDMA::Probe(addr)` 遍历非 loopback 的 IPv4 地址，用 `rdma_bind_addr` + `ibv_query_port` 找出「绑定成功且端口 `ACTIVE`」的那个地址。本机 `GetLocalIPAddress()` 返回的 `enp0s3` 不是 RDMA 网卡，所以**不能把通用 IP 探测结果当 RDMA 地址用**；找不到这样的地址就表示本机不做 RDMA。
+- **限制**：Linux + `libibverbs`/`librdmacm` 是硬依赖（CMake 缺库直接失败）。首版接受一次用户缓冲 ↔ 注册缓冲的拷贝，不做端到端零拷贝、不做 RDMA Read、不做多 rail 或动态缓冲扩缩。
+- **测试用 `mpirun` 而不是 fork**：verbs/CM 初始化后若只 `fork` 不 `exec`，子进程的 `ibv_post_send` 会以 `EPERM` 失败（本机 rxe 实测），所以 `tests/test_transport_rdma.cpp` 用两个独立进程。
+
 ## 不变式与设计区间
 
 ### 不变式
@@ -50,7 +64,9 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 | `include/transport/transport.h` | `Transport` 抽象基类 + `TransportDirection` |
 | `include/transport/transport_tcp.h` / `src/transport/transport_tcp.cpp` | TCP 实现（含非阻塞、`GetFd`、`GetPollEvents`） |
 | `include/transport/transport_shm.h` / `src/transport/transport_shm.cpp` | 共享内存实现：memfd 环 + 两个 eventfd、rendezvous 控制 socket、方向约束 |
+| `include/transport/transport_rdma.h` / `src/transport/transport_rdma.cpp` | RDMA 实现：CM 建链、RC QP、`WRITE_WITH_IMM` 环形缓冲、credit 回收、聚合就绪 fd、设备探测 |
 | `tests/test_transport_shm.cpp` | fork 端点对的传输测试（rendezvous/描述符传递/握手/阻塞与非阻塞/回绕/反压/方向拒绝/释放） |
+| `tests/test_transport_rdma.cpp` | mpirun 端点对的 RDMA 测试（CM 握手、RC、write、槽位回收、1B 到 5MiB 传输） |
 
 ## 修改原则
 
@@ -60,5 +76,9 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - 勿回退：control socket 阶段**不加**角色门禁（主动端只能发、被动端只能收）。隐含保证是调用方（communicator）两端角色固定，门禁永不触发；加它就是多一个死分支。
 - 勿回退：executor 不得硬编码 `EPOLLIN`/`EPOLLOUT`，一律取 `GetPollEvents()`。
 - 共享内存实现不得引入自动回退到 TCP：任何建立/映射/传描述符/握手失败都直接让 communicator 初始化失败（`LOG_ERROR` + `false`）。主路径优先：失败即停，不做降级重试。
+- RDMA 同理不得自动回退：设备可用且全局协商成立后，CM/QP/MR/写路径的任何错误都必须让初始化失败，不静默换成 TCP（`OCCL_DISABLE_RDMA=1` 是显式选择，不是回退）。
+- 勿回退：RDMA 的接收队列必须预先投递。`WRITE_WITH_IMM` 消耗 RQ WQE，少投一个就会 RNR，环形缓冲无法建立。
+- 勿回退：`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ。直接 poll CQ 不重新 arm 会在 EPOLLET 下漏掉边沿。
+- 勿回退：RDMA 地址必须由 `Probe` 通过 `rdma_bind_addr` + `ibv_query_port` 验证，不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
 - 环容量固定 2 MiB，不做可配置/动态扩容；**隐含保证是单环单 producer + 单 consumer**，据此不做容量协商、多生产者或双向的防御分支。
-- 改动本层后跑 `scripts/run_tests.sh`：tier 0 只测传输本身（fork 端点对，无需 mpirun）；2/4 rank 的集合通信档位在默认选择与 `OCCL_DISABLE_SHM=1` 两种模式下各跑一遍（1 rank 无数据面，只跑一次）。
+- 改动本层后跑 `scripts/run_tests.sh`：tier 0 只测传输本身（fork 端点对，无需 mpirun），tier 11 测 RDMA 传输本身（mpirun 端点对，无设备时 SKIP）；2/4 rank 的集合通信档位在默认选择与 `OCCL_DISABLE_SHM=1`/`OCCL_DISABLE_RDMA=1` 覆盖下各跑一遍（1 rank 无数据面，只跑一次）。

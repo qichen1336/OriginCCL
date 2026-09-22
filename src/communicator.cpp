@@ -1,5 +1,4 @@
 #include <thread>
-#include <chrono>
 #include <atomic>
 #include <algorithm>
 #include <cerrno>
@@ -15,6 +14,7 @@
 #include "bootstrap.h"
 #include "transport/transport_tcp.h"
 #include "transport/transport_shm.h"
+#include "transport/transport_rdma.h"
 #include "topology_ring.h"
 
 #if defined(OCCL_EXECUTOR_EPOLL)
@@ -48,6 +48,11 @@ constexpr const char* kRendezvousDir = "/tmp/originccl";
 
 bool SharedMemoryEnabled() {
     const char* value = std::getenv("OCCL_DISABLE_SHM");
+    return value == nullptr || std::strcmp(value, "1") != 0;
+}
+
+bool RdmaEnabled() {
+    const char* value = std::getenv("OCCL_DISABLE_RDMA");
     return value == nullptr || std::strcmp(value, "1") != 0;
 }
 
@@ -100,10 +105,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     }
 
     const bool use_shm = SharedMemoryEnabled();
-    LOG_INFO(
-        "Rank {}: Init Communicator world_size = {}, n_channels = {}, transport = {}, topology = {}, executor = {}",
-        config.rank, config.world_size, n_channels, use_shm ? "shared-memory + TCP" : "TCP", topology->GetName(),
-        kExecutorName);
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {}, executor = {}", config.rank,
+             config.world_size, n_channels, topology->GetName(), kExecutorName);
 
     if (config.world_size <= 1) {
         local_rank = 0;
@@ -123,8 +126,28 @@ bool Communicator::Init(const CommConfig& cfg) {
     const uint16_t data_port = tcp_listener->GetListenPort();
     LOG_INFO("Rank {}: Will use port {} for data plane", config.rank, data_port);
 
-    std::vector<std::shared_ptr<Transport>> listeners;
-    listeners.push_back(tcp_listener);
+    NodeInfo local_node(config.rank, Utils::GetLocalIPAddress(), data_port, config.get_hostname());
+
+    // The RDMA endpoint is announced through the bootstrap NodeInfo so every rank can decide
+    // the network transport with the same cluster-wide view: all ranks must be able to do
+    // RDMA, otherwise the whole network data plane stays on TCP.
+    std::shared_ptr<TransportRDMA> rdma_listener;
+    if (RdmaEnabled()) {
+        std::string rdma_addr;
+        auto candidate = std::make_shared<TransportRDMA>();
+        if (TransportRDMA::Probe(rdma_addr) && candidate->ListenAddr(rdma_addr, 0)) {
+            local_node.rdma_addr = rdma_addr;
+            local_node.rdma_port = candidate->GetListenPort();
+            rdma_listener = std::move(candidate);
+            LOG_INFO("Rank {}: RDMA listener on {}:{}", config.rank, rdma_addr, local_node.rdma_port);
+        } else {
+            LOG_INFO("Rank {}: No usable RDMA device, the network data plane will use TCP", config.rank);
+        }
+    } else {
+        LOG_INFO("Rank {}: RDMA is disabled by OCCL_DISABLE_RDMA", config.rank);
+    }
+
+    std::shared_ptr<TransportShm> shm_listener;
     if (use_shm) {
         std::error_code error;
         std::filesystem::create_directories(kRendezvousDir, error);
@@ -134,22 +157,40 @@ bool Communicator::Init(const CommConfig& cfg) {
             return false;
         }
         const std::string rendezvous = RendezvousPath(config.unique_id.port, config.rank);
-        auto shm_listener = std::make_shared<TransportShm>();
+        shm_listener = std::make_shared<TransportShm>();
         if (!shm_listener->ListenPath(rendezvous)) {
             LOG_ERROR("Rank {}: Failed to create the shared-memory rendezvous listener on {}", config.rank, rendezvous);
             return false;
         }
         LOG_INFO("Rank {}: Shared-memory rendezvous listener on {}", config.rank, rendezvous);
-        listeners.push_back(shm_listener);
     }
 
     Bootstrap bootstrap;
     std::vector<NodeInfo> all_nodes;
-    if (!bootstrap.Run(config, data_port, bootstrap_listen_fd, all_nodes)) {
+    if (!bootstrap.Run(config, local_node, bootstrap_listen_fd, all_nodes)) {
         LOG_ERROR("Rank {}: Failed to run bootstrap", config.rank);
         return false;
     }
     LOG_INFO("Rank {}: Bootstrap is ready, get {} nodes info", config.rank, all_nodes.size());
+
+    const bool rdma_ready =
+        rdma_listener != nullptr &&
+        std::all_of(all_nodes.begin(), all_nodes.end(), [](const NodeInfo& node) { return node.rdma_port != 0; });
+    std::vector<std::shared_ptr<Transport>> listeners;
+    if (use_shm) {
+        listeners.push_back(shm_listener);
+    }
+    if (rdma_ready) {
+        listeners.push_back(rdma_listener);
+        tcp_listener->Close();
+    } else {
+        listeners.push_back(tcp_listener);
+        if (rdma_listener) {
+            rdma_listener->Close();
+            rdma_listener.reset();
+        }
+    }
+    LOG_INFO("Rank {}: Network data plane uses {}", config.rank, rdma_ready ? "RDMA" : "TCP");
 
     const std::string& my_hostname = all_nodes[config.rank].hostname;
     local_ranks.clear();
@@ -168,7 +209,7 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     Utils::PinProcessToCpu(local_rank);
 
-    if (!InitChannels(all_nodes, listeners, use_shm)) {
+    if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);
         return false;
     }
@@ -240,7 +281,8 @@ Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {
 }
 
 bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
-                                const std::vector<std::shared_ptr<Transport>>& listeners, bool use_shm) {
+                                const std::vector<std::shared_ptr<Transport>>& listeners, bool use_shm,
+                                bool rdma_ready) {
     std::vector<ChannelEdge> connect_edges;
     std::vector<ChannelEdge> accept_edges;
 
@@ -265,7 +307,7 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
     std::atomic<bool> error_occurred(false);
     std::thread connect_thread([&]() {
         if (!connect_edges.empty()) {
-            if (!ConnectActiveEdges(all_nodes, connect_edges, use_shm, error_occurred)) {
+            if (!ConnectActiveEdges(all_nodes, connect_edges, use_shm, rdma_ready, error_occurred)) {
                 error_occurred = true;
             }
         }
@@ -291,7 +333,7 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
 }
 
 bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges,
-                                      bool use_shm, std::atomic<bool>& error_occurred) {
+                                      bool use_shm, bool rdma_ready, std::atomic<bool>& error_occurred) {
     for (const ChannelEdge& edge : edges) {
         if (error_occurred) {
             return false;
@@ -299,38 +341,34 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
 
         const auto& peer_info = all_nodes[edge.peer];
         const bool local_edge = use_shm && peer_info.hostname == all_nodes[config.rank].hostname;
+        // Every listener is bound before bootstrap, so one Connect attempt cannot race a peer
+        // that has not started listening yet and no retry loop is needed.
         std::shared_ptr<Transport> transport;
+        std::string addr;
+        uint16_t port = 0;
+        const char* kind = nullptr;
         if (local_edge) {
-            auto shm_transport = std::make_shared<TransportShm>();
-            shm_transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
-            if (!shm_transport->Connect(RendezvousPath(config.unique_id.port, edge.peer), 0)) {
-                LOG_ERROR("Rank {}: Failed to connect to rank {} channel {} over shared memory", config.rank, edge.peer,
-                          edge.channel_id);
-                error_occurred = true;
-                return false;
-            }
-            transport = std::move(shm_transport);
+            transport = std::make_shared<TransportShm>();
+            addr = RendezvousPath(config.unique_id.port, edge.peer);
+            kind = "shared memory";
+        } else if (rdma_ready) {
+            transport = std::make_shared<TransportRDMA>();
+            addr = peer_info.rdma_addr;
+            port = peer_info.rdma_port;
+            kind = "RDMA";
         } else {
-            auto tcp_transport = std::make_shared<TransportTCP>();
-            bool connected = false;
-            for (int retry = 0; retry < 30; ++retry) {
-                if (tcp_transport->Connect(peer_info.ip_addr, peer_info.data_port)) {
-                    connected = true;
-                    break;
-                }
-                LOG_DEBUG("Rank {}: Failed to connect to rank {} channel {} retry {}/30", config.rank, edge.peer,
-                          edge.channel_id, retry);
-                std::this_thread::sleep_for(std::chrono::microseconds(200));
-            }
+            transport = std::make_shared<TransportTCP>();
+            addr = peer_info.ip_addr;
+            port = peer_info.data_port;
+            kind = "TCP";
+        }
 
-            if (!connected) {
-                LOG_ERROR("Rank {}: Failed to connect to rank {}:{} after 30 retries", config.rank, peer_info.ip_addr,
-                          peer_info.data_port);
-                error_occurred = true;
-                return false;
-            }
-            tcp_transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
-            transport = std::move(tcp_transport);
+        transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
+        if (!transport->Connect(addr, port)) {
+            LOG_ERROR("Rank {}: Failed to connect to rank {} channel {} over {} ({}:{})", config.rank, edge.peer,
+                      edge.channel_id, kind, addr, port);
+            error_occurred = true;
+            return false;
         }
 
         ConnHandshake handshake;

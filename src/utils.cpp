@@ -290,6 +290,8 @@ void EncodeNodeInfo(std::vector<char>& buffer, const NodeInfo& node) {
     EncodeString(buffer, node.ip_addr);
     EncodeInt(buffer, node.data_port);
     EncodeString(buffer, node.hostname);
+    EncodeString(buffer, node.rdma_addr);
+    EncodeInt(buffer, node.rdma_port);
 }
 
 NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
@@ -298,6 +300,8 @@ NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
     node.ip_addr = DecodeString(buffer, offset);
     node.data_port = DecodeInt(buffer, offset);
     node.hostname = DecodeString(buffer, offset);
+    node.rdma_addr = DecodeString(buffer, offset);
+    node.rdma_port = static_cast<uint16_t>(DecodeInt(buffer, offset));
     return node;
 }
 

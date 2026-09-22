@@ -49,6 +49,8 @@ struct NodeInfo {
     std::string ip_addr;
     uint16_t data_port = 0;
     std::string hostname;
+    std::string rdma_addr;
+    uint16_t rdma_port = 0;
 
     NodeInfo() = default;
 

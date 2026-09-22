@@ -10,9 +10,10 @@ OriginCCL 是一个受 NCCL 启发的 C++ 集合通信（collective communicatio
   - **fmt**（≥ 9，已验证 10.2.1），必须提供 CMake package
   - **Threads**
   - **MPI**（Open MPI 4.1.2 已验证）：测试链接 `MPI::MPI_CXX`，rank / world size / `UniqueId` 都走它；多进程测试仅支持 `mpirun` 启动。
+  - **librdmacm / libibverbs**（含 `rdma/rdma_cma.h`、`infiniband/verbs.h` 开发头）：RDMA 传输始终编译进来，缺开发库时 CMake 配置直接失败（不是可选依赖，也不做 dlopen）。运行时是否真的用 RDMA 由设备探测决定。
 
 ## Golden rules (the things agents most often get wrong)!!!!
-- **主路径优先于防御性编码。** 先把核心功能跑通 —— 这比守住每个边界情况更重要。事实上，当前代码的逻辑设计已经有了很多“隐含保证”，例如同一个channel的send和recv一定使用不同的fd。你应该妥善利用这些“隐含保证”，不要做不可能发生的错误处理、回退与防御性检查。`docs/`目录下的文件有助于你理解这些“隐含保证”，你在更新docs/`目录下的文件也要注意维护和增删这些隐含保证。
+- **主路径优先于防御性编码。** 先把核心功能跑通不要过度关注边界情况。事实上，当前代码的逻辑设计已经有了很多“隐含保证”，例如同一个channel的send和recv一定使用不同的fd。你应该妥善利用这些“隐含保证”，不要做不可能发生的错误处理、回退与防御性检查，严格控制代码量膨胀和熵增。`docs/`目录下的文件有助于你理解这些“隐含保证”，你在更新docs/`目录下的文件也要注意维护和增删这些隐含保证。
 - 你添加的每个函数、变量、结构体与类都必须**语义清晰且确实必要**。如果某个被提议的实体删掉后既不损失清晰度也不损失能力，那它就不该存在：不要"以防万一"地添加包装、参数或占位。特别是**新增类之前先确认，尤其是基类。** 未经明确批准绝不引入新的抽象基类。优先使用自由函数，或扩展既有类型。
 - **优先采用最简设计与实现。** 做能解决问题的最小改动，不要大规模重写，不要顺手重构，使用 git diff 最小设计。写直接、可读的版本：不要为处理不了的错误加 `try`/`catch`。
 - **不要添加任何注释。**`src/` 与 `include/` 倾向于完全无注释。对于特别不显而易见的 *why*，写**一行**短注释是可以的。
@@ -26,20 +27,20 @@ include/executor/          executor 头（限定路径引用：#include "executo
 include/transport/         transport 头（限定路径引用：#include "transport/transport.h"）
 src/                       实现（平铺）
 src/executor/              四种 executor 实现
-src/transport/             TCP 与共享内存传输实现
-tests/                     三个测试二进制
+src/transport/             TCP、共享内存与 RDMA 传输实现
+tests/                     五个测试二进制
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
 scripts/                   run_tests.sh / run_all_executors.sh
 ```
 
 | 层 | 头文件 | 职责 | 铁律 |
 | --- | --- | --- | --- |
-| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` | 字节搬运 + 就绪可等待性（readiness） | 见下方“transport 就绪契约”；TCP 与 SHM 同构（listener + connection 双形态） |
+| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态） |
 | **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 只做事件处理，非阻塞，见下方契约 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | 编译期选定；是 task 游标的**唯一推进者** |
 | **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露 `AllReduce` |
-| **bootstrap** | `bootstrap.h` | master/worker 交换 `NodeInfo`（含 `data_port`/`hostname`） | 用于本地分组与建连 |
+| **bootstrap** | `bootstrap.h` | master/worker 交换 `NodeInfo`（含 `data_port`/`hostname`/`rdma_addr`/`rdma_port`） | 用于本地分组与建连；本地 `NodeInfo` 由 communicator 构造后传入 |
 | **utils / logger / types** | `utils.h` / `logger.h` / `types.h` | 编解码、socket 辅助、reduce 运算、日志宏、公共数据结构 | 日志统一走 `LOG_*` 宏 |
 
 ## Coding discipline
@@ -60,17 +61,17 @@ build/tests/test_allreduce
 
 - `cmake --build build --target run_test_allreduce` 只跑 **np=2** 一档，不是全矩阵。
 - **完整验证请用脚本**（各 tier 是不同的代码路径，不是“同一条多跑几次”）：
-  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–10 矩阵（含 shm / tcp 两种传输模式与单机多机模拟）。
+  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–12 矩阵（含 shm / tcp / rdma 三种传输模式与单机多机模拟）。
   - `scripts/run_all_executors.sh` —— 对 4 种 executor 各跑一遍完整矩阵，退出码 0 才算全过。
-  - 主要参数：`--coverage` / `--no-build` / `--build-dir` / `--build-type` / `--executor` / `--transport` / `--timeout` / `--allow-skip`。
+  - 主要参数：`--coverage` / `--no-build` / `--build-dir` / `--build-type` / `--executor` / `--transport`（`all` / `shm` / `tcp` / `rdma`）/ `--timeout` / `--allow-skip`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 失败 / `2` 有 SKIP / `3` 覆盖率报告无法生成。
-- **mpirun 缺失 → 报 SKIP 而非通过**：在一台只跑了单 rank tier 的机器上“静默变绿”正是该脚本要杜绝的失败模式。
-- 四个测试二进制：
+- **mpirun 缺失或无可用 RDMA 设备 → 报 SKIP 而非通过**：在一台只跑了单 rank tier、或静默把 RDMA 档位跳过而变绿的机器上，正是该脚本要杜绝的失败模式。
+- 五个测试二进制：
   - `test_allreduce`：端到端 AllReduce 正确性（各 rank 填 `rank+1`，断言 reduce 结果）。
   - `test_local_info`：单机 local rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）断言。
-  - `test_multi_machine`：单机模拟多机（`CommConfig::get_hostname` 注入按 rank 推导的假 hostname，每机 rank 数按 world size 在测试内写死），断言 local 视角与跨机（TCP）/混合（SHM+TCP）路径的 AllReduce。
+  - `test_multi_machine`：单机模拟多机（`CommConfig::get_hostname` 注入按 rank 推导的假 hostname，每机 rank 数按 world size 在测试内写死），断言 local 视角、**每条边的具体传输类型**（参数 `rdma` / `shm+rdma` / `tcp`）与端到端 AllReduce。
   - `test_transport_shm`：共享内存传输的 fork 端点对，**无需 mpirun**（rendezvous、描述符传递、控制握手、阻塞/非阻塞、回绕/背压、方向拒绝、拆除）。
-
+  - `test_transport_rdma`：RDMA 传输的 mpirun 端点对，**需 RDMA 设备**（CM 握手、RC QP、write、槽位回收、1 B 到 5 MiB 传输）；无设备时返回 2，脚本记为 SKIP。
 
 ## commit rules
 - **提交comment**：简短、小写、朴素英文 —— `add fmt`、`modify channels`、`root ip and port from env`。
