@@ -11,7 +11,8 @@ flowchart LR
     A[Communicator::Init] --> B[TopologyRing]
     B --> L[建数据面 TCP listener + 共享内存 rendezvous listener]
     L --> C[Bootstrap 交换 NodeInfo]
-    C --> D[InitChannels]
+    C --> P[local 分组 + 按 local_rank 绑核]
+    P --> D[InitChannels]
     D --> E[每 channel 建立独立 send/recv transport：本机 edge 走共享内存，跨机 edge 走 TCP]
 ```
 
@@ -39,6 +40,7 @@ flowchart LR
 - `n_channels` 默认值可调：`config.n_channels<=0` 时取 `kDefaultChannelCount`（当前 4）；初始化建全部 channel 连接，planner 按消息大小选用本次实际数量。
 - 初始化内部步骤可重构，守住生命周期顺序即可。
 - local 分组可内联实现（现已在 `Init` 内联，不抽纯函数）：取 `all_nodes[config.rank].hostname`，收集 hostname 相同的 rank、升序排序得 `local_ranks`；`local_size = local_ranks.size()`；`local_rank` = 自身 rank 下标；`is_single_machine = (local_size == world_size)`。`world_size<=1` 提前返回（此时**不建任何 listener**，也不装任何 edge）赋 `local_rank=0, local_size=1, local_ranks={0}, is_single_machine=true`（唯一拿不到 `all_nodes` 的分支）。
+- **绑核用 local_rank，不是全局 rank**：`Init` 在两处调 `Utils::PinProcessToCpu(local_rank)`（`world_size<=1` 的提前返回分支与正常 local 分组之后），把进程亲和性设为单核 `local_rank % 在线 CPU 数`。原语只做 `sysconf(_SC_NPROCESSORS_ONLN)` + `sched_setaffinity`（`CPU_SET` 单核），**非致命**：取不到 CPU 数或 `sched_setaffinity` 失败只 `LOG_WARN` 并继续初始化（绑核是性能优化，不是正确性前提，失败不得让 Init 返回 false）。取模而非报错，是为了让一台机器上 local rank 多于 CPU 数的超订场景仍能跑（多个 rank 共享核）。绑核在 bootstrap 之后（此时才知道 `local_rank`），且只执行一次；executor 的 worker 线程继承进程亲和性，不加额外 per-thread 绑定。
 - executor 由编译宏选定（见 [executor.md](executor.md)），`Communicator` 用 `#ifdef` 构造，无运行时注入接口。
 
 ## 文件介绍
@@ -47,7 +49,7 @@ flowchart LR
 |------|------|
 | `include/communicator.h` | `Communicator` 顶层接口（GetUniqueId / Init / AllReduce / Finalize / local 视图） |
 | `include/channel.h` | `Channel` / `Connector` / `Ring` 结构：`send[p]` / `recv[p]` 是两条有向边的两个槽位，`ring` 由 topology 填（`FillChannels`），transport 由 `InitChannels` 装 |
-| `src/communicator.cpp` | `GetUniqueId`（绑 bootstrap listener）+ `Init`（建双 listener → bootstrap → local 分组 → InitChannels）+ `#ifdef` 构造 executor + edge 传输选择（`SharedMemoryEnabled` / `RendezvousPath` 与 `ConnectActiveEdges` 里的 hostname 比较）+ `Finalize` 顺序 |
+| `src/communicator.cpp` | `GetUniqueId`（绑 bootstrap listener）+ `Init`（建双 listener → bootstrap → local 分组 → 绑核 → InitChannels）+ `#ifdef` 构造 executor + edge 传输选择（`SharedMemoryEnabled` / `RendezvousPath` 与 `ConnectActiveEdges` 里的 hostname 比较）+ `Finalize` 顺序 |
 | `src/bootstrap.cpp` | master/节点信息交换（含 hostname 采集） |
 
 ## 修改原则
@@ -57,6 +59,7 @@ flowchart LR
 - 勿回退：`Finalize` 先 `Shutdown()` 再关 transport。
 - 勿新增共享内存 → TCP 的自动回退；失败必须让初始化失败。
 - 机器身份用 hostname，不要改回 IP。
+- 绑核保持非致命且按 `local_rank` 取模：失败只 `LOG_WARN`（不能让 Init 失败），不要改成全局 rank 或硬编码 CPU 数。
 - 改动传输选择后跑 `scripts/run_tests.sh --transport all`（或 `run_all_executors.sh`）：两档把 rendezvous 目录 `/tmp/originccl` 用普通文件占住（端口由 rank0 运行时挑，脚本猜不到具体路径，只能占目录），分别要求「共享内存开启时初始化失败（不回退）」与「`OCCL_DISABLE_SHM=1` 时照常成功（override 真的没建 listener）」——这是当前唯一能证明选择生效的断言。
 - Bootstrap（`src/bootstrap.cpp`）：rank0 为 master 在借来的 bootstrap listener（`config.unique_id.port`）上收齐各 rank 的 `NodeInfo`(rank/ip/hostname/data_port) 后广播给所有人；worker 连 `config.unique_id.ip_addr:port`，各 rank 自己的 IP 一律 `Utils::GetLocalIPAddress()`（不再有 `master_addr` 特判）。
 - 多机行为单机验证：`tests/test_multi_machine.cpp` 经 `CommConfig::get_hostname` 注入假 hostname，`scripts/run_tests.sh` 的 tier 9（np=2 全不同机，纯 TCP）与 tier 10（np=4 每机 2 rank，混合 SHM+TCP）跑它，断言 local 视图与端到端 AllReduce。

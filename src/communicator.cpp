@@ -111,6 +111,7 @@ bool Communicator::Init(const CommConfig& cfg) {
         local_ranks = {0};
         is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
+        Utils::PinProcessToCpu(local_rank);
         return true;
     }
 
@@ -164,6 +165,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     is_single_machine = (local_size == config.world_size);
     LOG_INFO("Rank {}: local_rank = {}, local_size = {}, single_machine = {}, hostname = {}", config.rank, local_rank,
              local_size, is_single_machine, my_hostname);
+
+    Utils::PinProcessToCpu(local_rank);
 
     if (!InitChannels(all_nodes, listeners, use_shm)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);

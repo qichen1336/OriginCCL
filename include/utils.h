@@ -21,6 +21,8 @@ void SetTcpNoDelay(int sockfd);
 
 void SetReuseAddr(int sockfd);
 
+void PinProcessToCpu(int cpu_index);
+
 bool SendAll(int sockfd, const void* data, size_t size);
 bool SendAll(int sockfd, const std::vector<char>& buffer);
 bool SendAll(int sockfd, const std::string& str);

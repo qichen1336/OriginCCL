@@ -1,7 +1,9 @@
 #include <cstring>
+#include <cerrno>
 #include <thread>
 #include <chrono>
 #include <unistd.h>
+#include <sched.h>
 #include <ifaddrs.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -163,6 +165,24 @@ void SetReuseAddr(int sockfd) {
     if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag)) < 0) {
         LOG_WARN("Failed to set socket {} to SO_REUSEADDR", sockfd);
     }
+}
+
+void PinProcessToCpu(int cpu_index) {
+    const long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0) {
+        LOG_WARN("Failed to get the online CPU count, skip CPU pinning");
+        return;
+    }
+
+    const int cpu = cpu_index % static_cast<int>(cpu_count);
+    cpu_set_t cpu_set;
+    CPU_ZERO(&cpu_set);
+    CPU_SET(cpu, &cpu_set);
+    if (sched_setaffinity(0, sizeof(cpu_set), &cpu_set) != 0) {
+        LOG_WARN("Failed to pin to CPU {}: {}", cpu, std::strerror(errno));
+        return;
+    }
+    LOG_INFO("Pinned to CPU {}", cpu);
 }
 
 bool SendAll(int sockfd, const void* data, size_t size) {
