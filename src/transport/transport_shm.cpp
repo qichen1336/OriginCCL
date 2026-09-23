@@ -57,17 +57,13 @@ TransportShm::~TransportShm() {
     Close();
 }
 
-bool TransportShm::Listen(uint16_t port) {
-    LOG_ERROR("Shared-memory transports bind a rendezvous path, not port {}", port);
-    return false;
-}
-
-bool TransportShm::ListenPath(const std::string& rendezvous_path) {
+bool TransportShm::Listen(const std::string& addr, uint16_t port) {
+    (void)port;
     RendezvousAddress address;
-    if (!address.Set(rendezvous_path)) {
+    if (!address.Set(addr)) {
         return false;
     }
-    unlink(rendezvous_path.c_str());
+    unlink(addr.c_str());
 
     const int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) {
@@ -75,18 +71,18 @@ bool TransportShm::ListenPath(const std::string& rendezvous_path) {
         return false;
     }
     if (bind(fd, reinterpret_cast<sockaddr*>(&address.addr), address.length) != 0) {
-        LOG_ERROR("Failed to bind shared-memory rendezvous {}: {}", rendezvous_path, ErrnoText());
+        LOG_ERROR("Failed to bind shared-memory rendezvous {}: {}", addr, ErrnoText());
         close(fd);
         return false;
     }
     if (listen(fd, kShmRendezvousBacklog) != 0) {
-        LOG_ERROR("Failed to listen on shared-memory rendezvous {}: {}", rendezvous_path, ErrnoText());
+        LOG_ERROR("Failed to listen on shared-memory rendezvous {}: {}", addr, ErrnoText());
         close(fd);
-        unlink(rendezvous_path.c_str());
+        unlink(addr.c_str());
         return false;
     }
     listen_fd = fd;
-    listen_path = rendezvous_path;
+    listen_path = addr;
     return true;
 }
 

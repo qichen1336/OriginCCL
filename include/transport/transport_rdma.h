@@ -29,8 +29,7 @@ public:
 
     static bool Probe(std::string& addr);
 
-    bool Listen(uint16_t port) override;
-    bool ListenAddr(const std::string& addr, uint16_t port);
+    bool Listen(const std::string& addr, uint16_t port) override;
     uint16_t GetListenPort() const override {
         return listen_port;
     }

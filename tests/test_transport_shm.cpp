@@ -148,7 +148,7 @@ bool RunPair(const std::string& tag, const ActiveWork& active, const PassiveWork
     handshake.is_send = 1;
 
     auto listener = std::make_shared<TransportShm>();
-    if (!listener->ListenPath(path)) {
+    if (!listener->Listen(path, 0)) {
         LOG_ERROR("[{}] Failed to listen on {}", tag, path);
         return false;
     }
@@ -427,7 +427,7 @@ bool TestResourceRelease() {
 
 // Setup failures fail the endpoint, with no fallback to TCP.
 bool TestSetupFailures() {
-    LOG_INFO("Expect setup errors: the next checks use a missing path and a port on purpose");
+    LOG_INFO("Expect setup errors: the next checks use a missing path and an empty path on purpose");
     const std::string prefix = "/tmp/originccl-shm-test-" + std::to_string(getpid());
 
     const std::string absent = prefix + "-absent.sock";
@@ -436,7 +436,7 @@ bool TestSetupFailures() {
     endpoint.SetDirection(TransportDirection::Send);
     Expect(!endpoint.Connect(absent, 0), "connecting to a missing rendezvous path fails");
     Expect(!endpoint.IsConnected(), "a failed connection leaves the endpoint disconnected");
-    Expect(!endpoint.Listen(0), "shared memory does not bind a port");
+    Expect(!endpoint.Listen("", 0), "shared memory rejects an empty rendezvous path");
 
     const std::string stale = prefix + "-stale.sock";
     FILE* leftover = fopen(stale.c_str(), "w");
@@ -444,7 +444,7 @@ bool TestSetupFailures() {
         fclose(leftover);
     }
     TransportShm listener;
-    Expect(listener.ListenPath(stale), "a stale rendezvous path does not prevent binding");
+    Expect(listener.Listen(stale, 0), "a stale rendezvous path does not prevent binding");
     Expect(access(stale.c_str(), F_OK) == 0, "the rendezvous path exists while the listener is open");
     Expect(listener.GetPollEvents() == EPOLLIN, "a listener waits for readable readiness");
     listener.Close();

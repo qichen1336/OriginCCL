@@ -15,7 +15,7 @@ class Transport {
 public:
     virtual ~Transport() = default;
 
-    virtual bool Listen(uint16_t port) = 0;
+    virtual bool Listen(const std::string& addr, uint16_t port) = 0;
     virtual uint16_t GetListenPort() const = 0;
     virtual std::shared_ptr<Transport> Accept() = 0;
 

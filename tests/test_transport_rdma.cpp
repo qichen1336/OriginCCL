@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
     TransportRDMA listener;
     uint16_t port = 0;
     if (rank == 0) {
-        if (!listener.ListenAddr(addr, 0)) {
+        if (!listener.Listen(addr, 0)) {
             LOG_ERROR("Rank 0: failed to listen over RDMA");
             MPI_Finalize();
             return 1;

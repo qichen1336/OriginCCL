@@ -30,7 +30,8 @@ uint32_t TransportTCP::GetPollEvents() const {
     }
 }
 
-bool TransportTCP::Listen(uint16_t port) {
+bool TransportTCP::Listen(const std::string& addr, uint16_t port) {
+    (void)addr;
     listen_fd = Utils::CreateListenSocket(port, &listen_port);
     if (listen_fd < 0) {
         return false;

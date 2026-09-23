@@ -101,16 +101,7 @@ bool TransportRDMA::Probe(std::string& addr) {
     return found;
 }
 
-bool TransportRDMA::Listen(uint16_t port) {
-    std::string addr;
-    if (!Probe(addr)) {
-        LOG_ERROR("No RDMA device with an active port is available on this host");
-        return false;
-    }
-    return ListenAddr(addr, port);
-}
-
-bool TransportRDMA::ListenAddr(const std::string& addr, uint16_t port) {
+bool TransportRDMA::Listen(const std::string& addr, uint16_t port) {
     if (!OpenChannel()) {
         return false;
     }

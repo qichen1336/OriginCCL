@@ -7,7 +7,7 @@ public:
     TransportTCP();
     ~TransportTCP() override;
 
-    bool Listen(uint16_t port) override;
+    bool Listen(const std::string& addr, uint16_t port) override;
     uint16_t GetListenPort() const override {
         return listen_port;
     }

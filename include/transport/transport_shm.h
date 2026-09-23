@@ -25,8 +25,7 @@ class TransportShm : public Transport {
 public:
     ~TransportShm() override;
 
-    bool ListenPath(const std::string& rendezvous_path);
-    bool Listen(uint16_t port) override;
+    bool Listen(const std::string& addr, uint16_t port) override;
     uint16_t GetListenPort() const override {
         return 0;
     }

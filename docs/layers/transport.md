@@ -10,7 +10,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 - 负责 socket 封装：建连、收发、关闭，并把 fd 暴露给 executor 注册监听。
 - 负责两套接口：
-  - 阻塞接口（控制面）：`Listen` / `Accept` / `Connect` 建连（成功后 socket 置 `O_NONBLOCK`）；`Send` / `Recv`（内部 `SendRaw`/`RecvRaw`，对 EAGAIN 忙等重试），供 bootstrap 握手等偶发控制面使用。
+  - 阻塞接口（控制面）：`Listen(addr, port)` / `Accept` / `Connect` 建连（成功后 socket 置 `O_NONBLOCK`）；`Send` / `Recv`（内部 `SendRaw`/`RecvRaw`，对 EAGAIN 忙等重试），供 bootstrap 握手等偶发控制面使用。三种传输共用同一个 `Listen` 签名，`addr` 语义按传输不同：TCP 忽略它（仍绑 `INADDR_ANY`）、共享内存把它当 rendezvous 路径、RDMA 把它当绑定的设备地址。
   - 非阻塞接口（数据面）：`TrySend(data, size, *progress, *done)` / `TryRecv(...)` 单次推进到 EAGAIN 为止，`*progress` 累计已做字节，`*done` 表示完成；返回 false 表对端关闭或真错误。
   - 就绪契约：`GetFd()` 给出 executor 要等待的描述符（listening 时为 listen fd，连上后为数据面 fd）；`GetPollEvents()` 给出该描述符上要等待的原生就绪掩码（Linux epoll 掩码 `EPOLLIN`/`EPOLLOUT`，与 poll 位值一致）；`SetDirection()` / `GetDirection()` 维护方向元数据（`Bidirectional`（默认）/ `Send` / `Receive`）。
   - `Close()` / `IsConnected()`。
@@ -18,7 +18,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 ### 共享内存传输（`TransportShm`）
 
-- 与 TCP 同构的 listener/connection 双形态：`ListenPath(path)` + `Accept()`（被动端），`Connect(rendezvous_path, port)`（主动端，`port` 忽略）。基类的 `Listen(uint16_t)` / `GetListenPort()` 只用来报告「共享内存绑的是路径不是端口」的误用，永远失败/返回 0。
+- 与 TCP 同构的 listener/connection 双形态：`Listen(path, 0)` + `Accept()`（被动端），`Connect(rendezvous_path, port)`（主动端，`port` 忽略）。`Listen` 的 `port` 参数对共享内存无意义（`(void)port`），`GetListenPort()` 恒返回 0。空路径被 `RendezvousAddress::Set` 拒绝。
 - 建立流程：主动端建 2 MiB 数据容量的 memfd 环 + data-ready/space-ready 两个 eventfd，用 `SOCK_SEQPACKET` + `SCM_RIGHTS` 一次性传给对端并带上自己的方向；被动端取补方向。环元数据是 cache line 分隔、单调递增的 `std::atomic<uint64_t>` head/tail（producer 写 head，consumer 写 tail，acquire/release 配对）。
 - 控制 socket 与数据面分开：调用方**第一次**阻塞 `Send`/`Recv`（即 communicator 的连接握手）走 control socket，接收方回 1 字节 ack，双方随即关闭 control socket；之后所有阻塞与非阻塞操作都走环。所以调用点不需要区分传输类型。
 - 方向在此**是**约束（与 TCP 不同）：producer 只 `Send`、consumer 只 `Recv`，反向调用 `LOG_ERROR` + `false`。方向只约束数据面；control socket 存续期间不发方向校验，由调用方按自己的角色使用。
@@ -28,7 +28,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 ### RDMA 传输（`TransportRDMA`）
 
-- **建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`**：`ListenAddr(addr, port)` 在 RDMA 设备地址上 `rdma_listen`（`port=0` 时由内核选端口，用 `rdma_get_local_addr` 读回真实端口，因为 `rdma_get_src_port` 在部分 librdmacm 版本上返回错误值）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端在 `CONNECT_REQUEST` 上 `rdma_accept`，两端 QP 都是 `IBV_QPT_RC`。
+- **建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`**：`Listen(addr, port)` 在 RDMA 设备地址上 `rdma_listen`（`port=0` 时由内核选端口，用 `rdma_get_local_addr` 读回真实端口，因为 `rdma_get_src_port` 在部分 librdmacm 版本上返回错误值）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端在 `CONNECT_REQUEST` 上 `rdma_accept`，两端 QP 都是 `IBV_QPT_RC`。
 - **对端内存信息走 CM private data，不是额外一轮阻塞握手**：`private_data` 携带 `{base_addr, rkey, magic}`，两端在事件里直接得到，避免与调用方握手时序耦合。**被动端的对端信息在 `CONNECT_REQUEST` 事件里，主动端在 `ESTABLISHED` 事件里**——这是本实现的隐含保证，据此不同一套「先 RECV 再 ACCEPT」的同步。
 - **握手与控制流与数据方向解耦**：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关（主动连接方可能是数据消费者）。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`，**完成即返回，不会顺便把同一 buffer 当成数据流的第一段**；之后非生产者方向的阻塞 `Send`/`Recv` 是 no-op 且成功。bootstrap 的控制流量因此可以跑在单向连接上。
 - **数据面是 2 MiB 预注册环形缓冲，`64 KiB × 32` 槽位**：producer 把调用方数据 `memcpy` 进当前槽（staging）后再 post write，consumer 从槽里读。**这解释了 `TrySend` 的语义**：`*progress` 表示已被读入 transport 自有槽并成功提交的字节；`*done` 置位后调用方缓冲区即可立即复用（transport 不再读用户缓冲）。

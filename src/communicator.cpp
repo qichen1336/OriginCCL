@@ -123,7 +123,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     }
 
     auto tcp_listener = std::make_shared<TransportTCP>();
-    if (!tcp_listener->Listen(0)) {
+    if (!tcp_listener->Listen("", 0)) {
         LOG_ERROR("Rank {}: Failed to create the data-plane listener", config.rank);
         return false;
     }
@@ -139,7 +139,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     if (RdmaEnabled()) {
         std::string rdma_addr;
         auto candidate = std::make_shared<TransportRDMA>();
-        if (TransportRDMA::Probe(rdma_addr) && candidate->ListenAddr(rdma_addr, 0)) {
+        if (TransportRDMA::Probe(rdma_addr) && candidate->Listen(rdma_addr, 0)) {
             local_node.rdma_addr = rdma_addr;
             local_node.rdma_port = candidate->GetListenPort();
             rdma_listener = std::move(candidate);
@@ -162,7 +162,7 @@ bool Communicator::Init(const CommConfig& cfg) {
         }
         const std::string rendezvous = RendezvousPath(config.unique_id.port, config.rank);
         shm_listener = std::make_shared<TransportShm>();
-        if (!shm_listener->ListenPath(rendezvous)) {
+        if (!shm_listener->Listen(rendezvous, 0)) {
             LOG_ERROR("Rank {}: Failed to create the shared-memory rendezvous listener on {}", config.rank, rendezvous);
             return false;
         }
