@@ -2,6 +2,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,9 @@ using DefaultExecutor = MultiThreadExecutor;
 #endif
 
 constexpr int kDefaultChannelCount = 4;
+
+constexpr int kConnectRetryCount = 5;
+constexpr int kConnectRetryIntervalMs = 100;
 
 constexpr const char* kRendezvousDir = "/tmp/originccl";
 
@@ -341,8 +345,6 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
 
         const auto& peer_info = all_nodes[edge.peer];
         const bool local_edge = use_shm && peer_info.hostname == all_nodes[config.rank].hostname;
-        // Every listener is bound before bootstrap, so one Connect attempt cannot race a peer
-        // that has not started listening yet and no retry loop is needed.
         std::shared_ptr<Transport> transport;
         std::string addr;
         uint16_t port = 0;
@@ -364,7 +366,20 @@ bool Communicator::ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, co
         }
 
         transport->SetDirection(edge.is_send ? TransportDirection::Send : TransportDirection::Receive);
-        if (!transport->Connect(addr, port)) {
+        bool connected = false;
+        for (int attempt = 1; attempt <= kConnectRetryCount; ++attempt) {
+            if (transport->Connect(addr, port)) {
+                connected = true;
+                break;
+            }
+            transport->Close();
+            if (attempt < kConnectRetryCount) {
+                LOG_WARN("Rank {}: Failed to connect to rank {} channel {} over {} ({}:{}) on attempt {}/{}, retrying",
+                         config.rank, edge.peer, edge.channel_id, kind, addr, port, attempt, kConnectRetryCount);
+                std::this_thread::sleep_for(std::chrono::milliseconds(kConnectRetryIntervalMs));
+            }
+        }
+        if (!connected) {
             LOG_ERROR("Rank {}: Failed to connect to rank {} channel {} over {} ({}:{})", config.rank, edge.peer,
                       edge.channel_id, kind, addr, port);
             error_occurred = true;
