@@ -273,6 +273,30 @@ bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count,
     return executor->Run(plan);
 }
 
+bool Communicator::Broadcast(void* buffer, size_t count, DataType dtype, int root) {
+    CollTask task{CollFunc::Broadcast, buffer, buffer, count, dtype, ReduceOp::SUM, root};
+    CollPlan plan = planner.Plan(*this, task);
+    return executor->Run(plan);
+}
+
+bool Communicator::AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype) {
+    CollTask task{CollFunc::AllGather, send_buf, recv_buf, count, dtype};
+    CollPlan plan = planner.Plan(*this, task);
+    return executor->Run(plan);
+}
+
+bool Communicator::Reduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int root) {
+    CollTask task{CollFunc::Reduce, send_buf, recv_buf, count, dtype, op, root};
+    CollPlan plan = planner.Plan(*this, task);
+    return executor->Run(plan);
+}
+
+bool Communicator::ReduceScatter(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
+    CollTask task{CollFunc::ReduceScatter, send_buf, recv_buf, count, dtype, op};
+    CollPlan plan = planner.Plan(*this, task);
+    return executor->Run(plan);
+}
+
 Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {
     if (channel_id < 0 || channel_id >= static_cast<int>(channels.size())) {
         return nullptr;

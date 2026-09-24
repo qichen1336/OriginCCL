@@ -2,6 +2,9 @@
 
 C++ 集合通信库。
 
+支持 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter。
+接口参数和缓冲区布局见 [Communicator 层文档](docs/layers/communicator.md)。四种 executor 均通过统一的三阶段接口驱动集合操作。
+
 ## 构建
 
 ```bash
@@ -16,6 +19,8 @@ cmake --build build -j"$(nproc)"
 ```bash
 mpirun -np 2 build/tests/test_allreduce
 mpirun -np 4 build/tests/test_allreduce
+mpirun -np 3 build/tests/test_collectives
+mpirun -np 4 build/tests/test_collectives --large
 ```
 
 也可以通过构建目标一次完成编译与运行：
@@ -29,3 +34,6 @@ cmake --build build --target run_test_allreduce
 ```bash
 build/tests/test_allreduce
 ```
+
+完整验证运行 `scripts/run_all_executors.sh --timeout 120`：包含原有测试、新操作的四数据类型/任意 root/多 channel 布局，以及单 channel 大消息背压。
+新操作同时进入 RDMA、SHM+RDMA 和 TCP 多机模拟测试；设备不可用时报告 SKIP，不算完整通过。

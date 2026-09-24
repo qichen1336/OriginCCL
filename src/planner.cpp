@@ -34,9 +34,11 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
         PlanTask plantask;
         plantask.func = task.func;
         plantask.topology = comm.GetTopology();
-        plantask.send_buf = static_cast<const char*>(task.send_buf) + offset * type_size;
-        plantask.recv_buf = static_cast<char*>(task.recv_buf) + offset * type_size;
+        plantask.send_buf = task.send_buf ? static_cast<const char*>(task.send_buf) + offset * type_size : nullptr;
+        plantask.recv_buf = task.recv_buf ? static_cast<char*>(task.recv_buf) + offset * type_size : nullptr;
         plantask.elem_count = elem_count;
+        plantask.rank_stride = task.count;
+        plantask.root = task.root;
         plantask.dtype = task.dtype;
         plantask.reduce_op = task.op;
         plantask.rank = comm.GetRank();

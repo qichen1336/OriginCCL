@@ -45,21 +45,17 @@ void MultiThreadExecutor::StopWorkers() {
 }
 
 bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
-    if (!task.topology || !task.send_buf || !task.recv_buf || task.world_size <= 0) {
+    if (!task.topology) {
         LOG_ERROR("Executor received invalid task on channel {}", channel_id);
-        return false;
-    }
-    if (task.func != CollFunc::AllReduce) {
-        LOG_ERROR("Executor received unsupported collective on channel {}", channel_id);
         return false;
     }
 
     Topology* topo = task.topology.get();
-    if (!topo->AllreduceInit(task)) {
+    if (!topo->CollectiveInit(task)) {
         LOG_ERROR("MultiThreadExecutor failed to init task on channel {}", channel_id);
         return false;
     }
-    if (topo->AllreduceDone(task)) {
+    if (topo->CollectiveDone(task)) {
         return true;
     }
 
@@ -91,7 +87,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
     bool registered = add_fd(task.recv_transport.get(), 0u) && add_fd(task.send_transport.get(), 1u);
 
     struct epoll_event events[2];
-    while (registered && !topo->AllreduceDone(task)) {
+    while (registered && !topo->CollectiveDone(task)) {
         int ready = epoll_wait(epfd, events, 2, -1);
         if (ready < 0) {
             if (errno == EINTR) {
@@ -102,7 +98,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         }
         for (int i = 0; i < ready; ++i) {
             CollEvent op = (events[i].data.u32 == 0u) ? CollEvent::Readable : CollEvent::Writable;
-            if (!topo->AllreduceStep(task, op)) {
+            if (!topo->CollectiveStep(task, op)) {
                 LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
                 registered = false;
                 break;
@@ -111,7 +107,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
     }
 
     close(epfd);
-    return registered && topo->AllreduceDone(task);
+    return registered && topo->CollectiveDone(task);
 }
 
 void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch_id) {

@@ -191,16 +191,16 @@ void ReactorExecutor::WorkerLoop() {
         if (!ok) {
             LOG_ERROR("Reactor worker received a task without topology on channel {}", item.slot);
         } else if (item.init) {
-            ok = topo->AllreduceInit(*item.task);
+            ok = topo->CollectiveInit(*item.task);
             if (!ok) {
                 LOG_ERROR("Reactor worker failed to init task on channel {}", item.slot);
             }
         } else {
             if ((item.steps & kStepWritable) != 0) {
-                ok = topo->AllreduceStep(*item.task, CollEvent::Writable);
+                ok = topo->CollectiveStep(*item.task, CollEvent::Writable);
             }
             if (ok && (item.steps & kStepReadable) != 0) {
-                ok = topo->AllreduceStep(*item.task, CollEvent::Readable);
+                ok = topo->CollectiveStep(*item.task, CollEvent::Readable);
             }
             if (!ok) {
                 LOG_ERROR("Reactor worker step failed on channel {}", item.slot);
@@ -209,7 +209,7 @@ void ReactorExecutor::WorkerLoop() {
 
         if (!ok) {
             completion.state = JobState::Failed;
-        } else if (topo->AllreduceDone(*item.task)) {
+        } else if (topo->CollectiveDone(*item.task)) {
             completion.state = JobState::Done;
         } else {
             completion.state = JobState::Waiting;

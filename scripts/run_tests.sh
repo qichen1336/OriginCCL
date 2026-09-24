@@ -154,6 +154,7 @@ test_bin="$build_dir/tests/test_allreduce"
 shm_test_bin="$build_dir/tests/test_transport_shm"
 rdma_test_bin="$build_dir/tests/test_transport_rdma"
 multi_machine_test_bin="$build_dir/tests/test_multi_machine"
+collectives_test_bin="$build_dir/tests/test_collectives"
 
 n_cpu=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN 2> /dev/null || echo 1)
 
@@ -402,6 +403,29 @@ fi
 # every network edge has to be TCP even on a host that does have RDMA.
 if [[ $transport != "tcp" && $have_mpirun -eq 1 ]]; then
     run_multi_machine_tier "tier 12: OCCL_DISABLE_RDMA=1 must use TCP" 2 tcp OCCL_DISABLE_RDMA=1 || true
+fi
+
+run_tier "collectives: single rank" "$collectives_test_bin" || true
+if [[ $have_mpirun -eq 1 ]]; then
+    if [[ $transport != "tcp" ]]; then
+        for np in 2 3 4; do
+            run_tier "collectives: SHM np=$np" env -u OCCL_DISABLE_SHM \
+                mpirun "${mpi_extra[@]}" -np "$np" "$collectives_test_bin" || true
+        done
+        run_tier "collectives: SHM single-channel backpressure" env -u OCCL_DISABLE_SHM \
+            mpirun "${mpi_extra[@]}" -np 4 "$collectives_test_bin" --large || true
+    fi
+    if [[ $transport != "shm" ]]; then
+        for np in 2 3 4; do
+            run_tier "collectives: TCP np=$np" env OCCL_DISABLE_SHM=1 OCCL_DISABLE_RDMA=1 \
+                mpirun "${mpi_extra[@]}" -np "$np" "$collectives_test_bin" || true
+        done
+        run_tier "collectives: TCP single-channel backpressure" env OCCL_DISABLE_SHM=1 OCCL_DISABLE_RDMA=1 \
+            mpirun "${mpi_extra[@]}" -np 4 "$collectives_test_bin" --large || true
+    fi
+else
+    echo ">>> SKIP: mpirun not found, multi-rank collective cases were NOT run" >&2
+    skipped=1
 fi
 
 report_coverage() {

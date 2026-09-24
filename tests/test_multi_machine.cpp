@@ -6,6 +6,7 @@
 #include "types.h"
 #include "logger.h"
 #include "communicator.h"
+#include "collective_cases.h"
 #include "channel.h"
 #include "transport/transport_rdma.h"
 #include "transport/transport_shm.h"
@@ -208,6 +209,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    if (!TestCollectives(comm)) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    comm.Finalize();
+    config.n_channels = 1;
+    if (config.rank == 0 && !comm.GetUniqueId(config.unique_id)) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    MPI_Bcast(&config.unique_id, sizeof(config.unique_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+    if (!comm.Init(config) || (!expected.empty() && !TestTransportSelection(comm, expected)) ||
+        !TestCollectives(comm, true)) {
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    comm.Finalize();
     MPI_Finalize();
     return 0;
 }

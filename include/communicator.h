@@ -52,6 +52,10 @@ public:
     const Channel& GetChannel(int channel_id) const;
 
     bool AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op);
+    bool Broadcast(void* buffer, size_t count, DataType dtype, int root);
+    bool AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype);
+    bool Reduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int root);
+    bool ReduceScatter(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op);
 
 private:
     struct ConnHandshake {

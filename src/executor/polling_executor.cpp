@@ -9,7 +9,7 @@ bool PollingExecutor::StartFrontTask(size_t slot, const CollPlan& plan, std::vec
         return true;
     }
     PlanTask& task = const_cast<PlanTask&>(channel.tasks[task_index[slot]]);
-    if (!task.topology || !task.topology->AllreduceInit(task)) {
+    if (!task.topology || !task.topology->CollectiveInit(task)) {
         LOG_ERROR("PollingExecutor failed to init task on channel {}", channel.channel_id);
         return false;
     }
@@ -50,11 +50,11 @@ bool PollingExecutor::Run(const CollPlan& plan) {
             size_t before_recv = task->state.recv_progress;
             int before_phase = task->state.phase;
 
-            if (!task->state.send_done && !topo->AllreduceStep(*task, CollEvent::Writable)) {
+            if (!task->state.send_done && !topo->CollectiveStep(*task, CollEvent::Writable)) {
                 LOG_ERROR("PollingExecutor step failed on channel {}", plan.channels[i].channel_id);
                 return false;
             }
-            if (!task->state.recv_done && !topo->AllreduceStep(*task, CollEvent::Readable)) {
+            if (!task->state.recv_done && !topo->CollectiveStep(*task, CollEvent::Readable)) {
                 LOG_ERROR("PollingExecutor step failed on channel {}", plan.channels[i].channel_id);
                 return false;
             }
@@ -64,7 +64,7 @@ bool PollingExecutor::Run(const CollPlan& plan) {
                 progressed = true;
             }
 
-            if (!topo->AllreduceDone(*task)) {
+            if (!topo->CollectiveDone(*task)) {
                 continue;
             }
 

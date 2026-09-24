@@ -98,12 +98,12 @@ bool EpollExecutor::Run(const CollPlan& plan) {
         while (task_index[slot] < plan.channels[slot].tasks.size()) {
             PlanTask& task = const_cast<PlanTask&>(plan.channels[slot].tasks[task_index[slot]]);
             Topology* topo = task.topology.get();
-            if (!topo || !topo->AllreduceInit(task)) {
+            if (!topo || !topo->CollectiveInit(task)) {
                 LOG_ERROR("EpollExecutor failed to init task on channel {}", slot);
                 return false;
             }
             ++task_index[slot];
-            if (topo->AllreduceDone(task)) {
+            if (topo->CollectiveDone(task)) {
                 continue;
             }
             current[slot] = &task;
@@ -148,12 +148,12 @@ bool EpollExecutor::Run(const CollPlan& plan) {
 
             Topology* topo = task->topology.get();
             CollEvent op = (side == 0) ? CollEvent::Readable : CollEvent::Writable;
-            if (!topo->AllreduceStep(*task, op)) {
+            if (!topo->CollectiveStep(*task, op)) {
                 LOG_ERROR("EpollExecutor step failed on channel {}", slot);
                 abort_plan();
                 return false;
             }
-            if (!topo->AllreduceDone(*task)) {
+            if (!topo->CollectiveDone(*task)) {
                 continue;
             }
 

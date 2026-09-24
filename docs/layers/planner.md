@@ -4,10 +4,11 @@
 
 ## 核心职责边界
 
-- `CollTask` 表达外层 collective API 语义（目前为 AllReduce）：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`。调用方不关心 worker 数、线程池、Ring step 或 channel 调度。
-- `Planner::Plan(Communicator&, const CollTask&)` → `CollPlan`：tensor 按使用中的 channel 数切片。
-- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、topology 指针、对应 channel 的 send/recv transport。
-- `PlanTask.chunk_size`（每 chunk 元素数 = `ceil(elem_count / world_size)`）由 planner 计算填入，拓扑只读。
+- `CollTask` 表达五种 collective 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`。无根操作忽略 root，非归约操作忽略 op。
+- `Planner::Plan(Communicator&, const CollTask&)` → `CollPlan`：按 count 代表的元素区间切片。对于多 rank 块布局，每个 channel 处理每个块的相同子区间，而非切整个 count*world_size 缓冲区。
+- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、rank_stride、topology 指针、对应 channel 的 send/recv transport。
+- `PlanTask.chunk_size`（`ceil(elem_count / world_size)`）由 planner 计算，仅用于 AllReduce 的块划分。
+- `rank_stride` 保存原始 `CollTask.count`（元素数）。非空 send/recv 基址偏移 `offset*type_size`，null 原样保留，不做空指针算术。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
 - `PlanTask.topology` 复用 `comm.GetTopology()`；planner 不新建拓扑。隐含保证是拓扑在 `Init` 已建好且只此一份，据此不做「拓扑是否为空」的防御检查。
 - 不负责：不展开算法步骤（topology）、不决定等待策略（executor）。
@@ -23,6 +24,7 @@
 ### 设计区间
 
 - 启用 channel 的规则可调：当前 `src/planner.cpp` 每 channel 最少 `64 KiB`，使用数 `clamp(total_bytes / 64KiB, 1, comm.GetNChannels())`。小消息只触发单 channel。
+- `total_bytes=count*type_size`，多块操作也按单块大小选通道。测试用 49153/65537 个 32 位元素覆盖三/四通道不均匀切分；count=0 仍生成一个立即完成的任务。
 - `CollTask` 可扩展新 op（不只 AllReduce）。
 - 每个 `ChannelPlan` 的 `PlanTask` 数量可扩展（当前仅一条）。
 

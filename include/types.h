@@ -28,7 +28,11 @@ enum class ReduceOp {
 };
 
 enum class CollFunc {
-    AllReduce
+    AllReduce,
+    Broadcast,
+    Reduce,
+    AllGather,
+    ReduceScatter
 };
 
 struct UniqueId {
@@ -65,6 +69,7 @@ struct CollTask {
     size_t count = 0;
     DataType dtype = DataType::FLOAT32;
     ReduceOp op = ReduceOp::SUM;
+    int root = 0;
 };
 
 enum class CollEvent {
@@ -88,10 +93,12 @@ struct PlanTask {
     void* recv_buf = nullptr;
     size_t elem_count = 0;
     size_t chunk_size = 0;
+    size_t rank_stride = 0;
     DataType dtype = DataType::FLOAT32;
     ReduceOp reduce_op = ReduceOp::SUM;
     int rank = 0;
     int world_size = 1;
+    int root = 0;
     std::shared_ptr<Topology> topology;
     std::shared_ptr<Transport> send_transport;
     std::shared_ptr<Transport> recv_transport;

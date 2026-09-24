@@ -1,6 +1,6 @@
 # Communicator 层（`include/communicator.h`、`src/communicator.cpp`、`src/bootstrap.cpp`）
 
-进程内集合通信的顶层对象：初始化建连 + 发起 AllReduce + 生命周期管理。改动初始化/建连/生命周期前阅读本文件。
+进程内集合通信的顶层对象：初始化建连 + 发起集合操作 + 生命周期管理。改动初始化/建连/生命周期前阅读本文件。
 
 ## 核心职责边界
 
@@ -17,9 +17,24 @@ flowchart LR
     D --> E[每 channel 建立独立 send/recv transport：本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP]
 ```
 
-- 执行链路：`Communicator::AllReduce` 创建 `CollTask` → `planner.Plan` → `executor->Run(plan)`。
+- 执行链路：五个 collective 公开方法创建 `CollTask` → `planner.Plan` → `executor->Run(plan)`，不在入口展开算法。
 - 暴露本机视角：`GetLocalRank()`、`GetLocalSize()`、`GetLocalRanks()`、`IsSingleMachine()`。
 - 不负责：不决定算法（topology）、不决定等待策略（executor）、不切片（planner）、不实现共享内存环（transport）。
+
+## 集合接口语义
+
+| 方法 | count 与缓冲区 |
+|------|---------------|
+| AllReduce(send, recv, count, dtype, op) | 每 rank 输入/输出 count 个元素，允许 send==recv |
+| Broadcast(buffer, count, dtype, root) | 单 buffer；root 提供输入，每 rank 获得 count 个元素 |
+| Reduce(send, recv, count, dtype, op, root) | 每 rank 输入 count，仅 root 输出归约结果；非 root recv 可 null |
+| AllGather(send, recv, count, dtype) | 每 rank 输入 count，输出 N*count，按来源 rank 排列 |
+| ReduceScatter(send, recv, count, dtype, op) | 每 rank 输入 N*count；归约后每 rank 获得其目标块的 count 个元素 |
+
+N 为 world_size；root 支持 `[0,N)` 的任意值。除 AllReduce 与单 buffer Broadcast 外，新操作仅承诺互不重叠的输入输出布局。
+count=0 是成功空操作，允许空缓冲区，但 func/root/world_size 仍须合法；单 rank 直接完成本地操作。
+归约支持 SUM/MAX/MIN/AVG，AVG 先求和再对最终输出除以 N；整数沿用截断除法。
+所有 rank 必须按相同顺序调用相同操作，保持 count/dtype/op/root 一致；同一 communicator 的调用不得并发。本地参数检查不是跨 rank 错误协商，调用不匹配可能阻塞。
 
 ## 不变式与设计区间
 

@@ -7,6 +7,9 @@
 # launcher is not only used to start the process pair, it also carries the unique id.
 find_package(MPI REQUIRED COMPONENTS CXX)
 
+add_executable(test_collectives test_collectives.cpp collective_cases.cpp)
+target_link_libraries(test_collectives originccl fmt::fmt MPI::MPI_CXX)
+
 add_executable(test_allreduce test_allreduce.cpp)
 target_link_libraries(test_allreduce
     originccl
@@ -64,7 +67,7 @@ target_include_directories(test_transport_rdma
 # CommConfig::get_hostname, so cross-machine edges (TCP) and the local rank view can be
 # asserted without leaving one node. The layout (how many ranks share a machine) is
 # hardcoded inside the test by world size.
-add_executable(test_multi_machine test_multi_machine.cpp)
+add_executable(test_multi_machine test_multi_machine.cpp collective_cases.cpp)
 target_link_libraries(test_multi_machine
     originccl
     fmt::fmt
