@@ -56,7 +56,6 @@ private:
     struct Wire {
         uint64_t base_addr;
         uint32_t rkey;
-        uint32_t magic;
     };
 
     char* SlotData(size_t slot) const {
@@ -72,9 +71,7 @@ private:
     bool OpenChannel();
     bool SetupResources();
     bool Adopt(rdma_cm_id* connection, const Wire& wire);
-    bool AwaitEstablished();
     rdma_cm_event* AwaitEvent(rdma_cm_event_type type);
-    bool ReadWire(const rdma_cm_event& event, Wire& wire) const;
 
     bool PostPoolRecv(size_t index);
     bool PostControlSend(size_t length);
@@ -82,7 +79,6 @@ private:
     bool PostCredit(size_t slots);
 
     bool ProcessCompletions();
-    bool DrainCmEvents();
     bool HandleCompletion(const ibv_wc& completion);
     bool WaitFlag(bool& flag);
     void CloseCm();
@@ -96,10 +92,7 @@ private:
     char* buffer = nullptr;
     Wire peer{};
     uint16_t listen_port = 0;
-    int epoll_fd = -1;
     bool connected = false;
-    bool peer_known = false;
-    bool peer_closed = false;
     bool control_received = false;
     bool control_sent = false;
     size_t control_index = 0;

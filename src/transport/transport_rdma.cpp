@@ -5,12 +5,10 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/epoll.h>
-#include <unistd.h>
 #include "transport/transport_rdma.h"
 #include "logger.h"
 
 namespace {
-constexpr uint32_t kWireMagic = 0x52444331; // "RDC1"
 constexpr uint32_t kCreditImmediate = 0x80000000;
 constexpr size_t kCreditBatch = 8;
 constexpr int kResolveTimeoutMs = 5000;
@@ -144,12 +142,8 @@ std::shared_ptr<Transport> TransportRDMA::Accept() {
     rdma_cm_id* connection = event->id;
     // The active side's private data arrives with the connection request, not with ESTABLISHED.
     Wire wire{};
-    const bool valid = ReadWire(*event, wire);
+    std::memcpy(&wire, event->param.conn.private_data, sizeof(Wire));
     rdma_ack_cm_event(event);
-    if (!valid) {
-        rdma_destroy_id(connection);
-        return nullptr;
-    }
 
     auto transport = std::make_shared<TransportRDMA>();
     if (!transport->Adopt(connection, wire)) {
@@ -169,14 +163,13 @@ bool TransportRDMA::Adopt(rdma_cm_id* connection, const Wire& wire) {
     }
     cm_id = connection;
     peer = wire;
-    peer_known = true;
     connected = true;
 
     if (!SetupResources()) {
         return false;
     }
 
-    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey, kWireMagic};
+    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey};
     rdma_conn_param parameter{};
     parameter.private_data = &mine;
     parameter.private_data_len = sizeof(mine);
@@ -184,7 +177,12 @@ bool TransportRDMA::Adopt(rdma_cm_id* connection, const Wire& wire) {
         LOG_ERROR("Failed to accept the RDMA connection: {}", ErrnoText());
         return false;
     }
-    return AwaitEstablished();
+    rdma_cm_event* event = AwaitEvent(RDMA_CM_EVENT_ESTABLISHED);
+    if (event == nullptr) {
+        return false;
+    }
+    rdma_ack_cm_event(event);
+    return true;
 }
 
 bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
@@ -228,7 +226,7 @@ bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
         return false;
     }
 
-    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey, kWireMagic};
+    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey};
     rdma_conn_param parameter{};
     parameter.retry_count = 7;
     parameter.rnr_retry_count = 7;
@@ -239,7 +237,15 @@ bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
         return false;
     }
     connected = true;
-    return AwaitEstablished();
+
+    event = AwaitEvent(RDMA_CM_EVENT_ESTABLISHED);
+    if (event == nullptr) {
+        return false;
+    }
+    // The active side learns the peer memory region only from the ESTABLISHED private data.
+    std::memcpy(&peer, event->param.conn.private_data, sizeof(Wire));
+    rdma_ack_cm_event(event);
+    return true;
 }
 
 bool TransportRDMA::OpenChannel() {
@@ -249,41 +255,6 @@ bool TransportRDMA::OpenChannel() {
     cm_channel = rdma_create_event_channel();
     if (cm_channel == nullptr) {
         LOG_ERROR("Failed to create an RDMA event channel: {}", ErrnoText());
-        return false;
-    }
-    return true;
-}
-
-bool TransportRDMA::AwaitEstablished() {
-    rdma_cm_event* event = AwaitEvent(RDMA_CM_EVENT_ESTABLISHED);
-    if (event == nullptr) {
-        return false;
-    }
-
-    Wire wire{};
-    // Only the active side still needs the peer announcement here; the passive side has it.
-    const bool valid = peer_known || ReadWire(*event, wire);
-    rdma_ack_cm_event(event);
-    if (!valid) {
-        return false;
-    }
-    if (!peer_known) {
-        peer = wire;
-        peer_known = true;
-    }
-    return true;
-}
-
-bool TransportRDMA::ReadWire(const rdma_cm_event& event, Wire& wire) const {
-    if (event.param.conn.private_data == nullptr || event.param.conn.private_data_len < sizeof(Wire)) {
-        LOG_ERROR("The RDMA peer did not announce its memory region (ptr {}, length {})",
-                  event.param.conn.private_data == nullptr ? "null" : "set",
-                  static_cast<unsigned>(event.param.conn.private_data_len));
-        return false;
-    }
-    std::memcpy(&wire, event.param.conn.private_data, sizeof(Wire));
-    if (wire.magic != kWireMagic) {
-        LOG_ERROR("The RDMA peer is not an OriginCCL RDMA endpoint");
         return false;
     }
     return true;
@@ -373,19 +344,6 @@ bool TransportRDMA::SetupResources() {
             return false;
         }
     }
-
-    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd < 0) {
-        LOG_ERROR("Failed to create the RDMA readiness instance: {}", ErrnoText());
-        return false;
-    }
-    epoll_event interest{};
-    interest.events = EPOLLIN;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, comp_channel->fd, &interest) != 0 ||
-        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cm_channel->fd, &interest) != 0) {
-        LOG_ERROR("Failed to register the RDMA events for readiness: {}", ErrnoText());
-        return false;
-    }
     return true;
 }
 
@@ -471,9 +429,6 @@ bool TransportRDMA::ProcessCompletions() {
             }
         }
     }
-    if (!DrainCmEvents()) {
-        return false;
-    }
 
     ibv_wc completions[16];
     for (;;) {
@@ -493,37 +448,8 @@ bool TransportRDMA::ProcessCompletions() {
     }
 }
 
-bool TransportRDMA::DrainCmEvents() {
-    if (cm_channel == nullptr) {
-        return true;
-    }
-    while (WaitReadable(cm_channel->fd, 0)) {
-        rdma_cm_event* event = nullptr;
-        if (rdma_get_cm_event(cm_channel, &event) != 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return true;
-            }
-            LOG_ERROR("Failed to read an RDMA event: {}", ErrnoText());
-            return false;
-        }
-        const rdma_cm_event_type type = event->event;
-        const int status = event->status;
-        rdma_ack_cm_event(event);
-        if (type == RDMA_CM_EVENT_DISCONNECTED || type == RDMA_CM_EVENT_DEVICE_REMOVAL ||
-            type == RDMA_CM_EVENT_TIMEWAIT_EXIT || type == RDMA_CM_EVENT_REJECTED) {
-            peer_closed = true;
-        } else if (type != RDMA_CM_EVENT_ESTABLISHED) {
-            LOG_DEBUG("Ignoring the RDMA event {} (status {})", rdma_event_str(type), status);
-        }
-    }
-    return true;
-}
-
 bool TransportRDMA::HandleCompletion(const ibv_wc& completion) {
     if (completion.status != IBV_WC_SUCCESS) {
-        if (peer_closed && completion.status == IBV_WC_WR_FLUSH_ERR) {
-            return true;
-        }
         LOG_ERROR("An RDMA completion failed with status {}", ibv_wc_status_str(completion.status));
         return false;
     }
@@ -574,10 +500,6 @@ bool TransportRDMA::WaitFlag(bool& flag) {
         }
         if (flag) {
             return true;
-        }
-        if (peer_closed) {
-            LOG_ERROR("The RDMA peer closed the connection during the control handshake");
-            return false;
         }
         WaitReadable(GetFd(), 10);
     }
@@ -667,10 +589,6 @@ bool TransportRDMA::TrySend(const void* data, size_t size, size_t* progress, boo
     if (!ProcessCompletions()) {
         return false;
     }
-    if (peer_closed) {
-        LOG_INFO("The RDMA peer closed the connection while sending");
-        return false;
-    }
 
     const char* source = static_cast<const char*>(data);
     const size_t limit = credits_received + kRdmaSlotCount;
@@ -721,16 +639,12 @@ bool TransportRDMA::TryRecv(void* data, size_t size, size_t* progress, bool* don
     }
 
     *done = (*progress == size);
-    if (!*done && arrival_head == arrival_tail && peer_closed) {
-        LOG_INFO("The RDMA peer closed the connection while receiving");
-        return false;
-    }
     return true;
 }
 
 int TransportRDMA::GetFd() const {
-    if (epoll_fd >= 0) {
-        return epoll_fd;
+    if (comp_channel != nullptr) {
+        return comp_channel->fd;
     }
     if (cm_channel != nullptr) {
         return cm_channel->fd;
@@ -767,17 +681,11 @@ void TransportRDMA::Close() {
         cm_id = nullptr;
     }
     CloseCm();
-    if (epoll_fd >= 0) {
-        close(epoll_fd);
-        epoll_fd = -1;
-    }
     if (buffer != nullptr) {
         free(buffer);
         buffer = nullptr;
     }
     connected = false;
-    peer_closed = false;
-    peer_known = false;
     control_received = false;
     control_sent = false;
     control_index = 0;
