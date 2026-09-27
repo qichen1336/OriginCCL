@@ -22,8 +22,10 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 | `include/transport/transport_tcp.h` / `src/transport/transport_tcp.cpp` | TCP 实现（含非阻塞、`GetFd`、`GetPollEvents`） |
 | `include/transport/transport_shm.h` / `src/transport/transport_shm.cpp` | 共享内存实现：memfd 环 + 两个 eventfd、rendezvous 控制 socket、方向约束 |
 | `include/transport/transport_rdma.h` / `src/transport/transport_rdma.cpp` | RDMA 实现：CM 建链、RC QP、`WRITE_WITH_IMM` 环形缓冲、credit 回收、completion channel 就绪 fd、设备探测 |
-| `tests/test_transport_shm.cpp` | fork 端点对的传输测试（rendezvous/描述符传递/握手/阻塞与非阻塞/回绕/反压/方向拒绝/释放） |
-| `tests/test_transport_rdma.cpp` | mpirun 端点对的 RDMA 测试（CM 握手、RC、write、槽位回收、1B 到 5MiB 传输） |
+| `tests/test_transport_shm.cpp` | mpirun 端点对的共享内存测试（rendezvous/描述符传递/握手/阻塞与非阻塞/回绕/反压/方向拒绝/释放） |
+| `tests/test_transport_rdma.cpp` | mpirun 端点对的 RDMA 测试（CM 握手、RC、write、槽位回收、边界尺寸到 5 MiB） |
+| `tests/test_transport_tcp.cpp` | mpirun 端点对的 TCP 测试（连上即非阻塞、部分收发、背压与恢复、就绪掩码、有序关闭） |
+| `tests/transport_check.*` | 三种传输共用的接口语义套件；不可共用的差异（方向约束、就绪掩码、对端关闭可检测性）在 `Setup` 里声明 |
 
 # 实现原理
 
@@ -53,10 +55,9 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 # 隐含约定
 
-- **数据面传输只走 `TrySend`/`TryRecv`**（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。历史曾有人把数据面改成阻塞 `Send`/`Recv` 导致死锁。
-- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；communicator 的 channel 握手（`ConnHandshake`）走 Transport 的阻塞 `Send`/`Recv`——这是阻塞接口存在的唯一理由（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`，三种语义一致，调用点不区分传输类型）。
+- **数据面传输只走 `TrySend`/`TryRecv`**（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。历史曾有人把数据面改成阻塞 `Send`/`Recv` 导致死锁。- **对端关闭不是三种传输共有的保证**：TCP 能在对端有序关闭后从 `TryRecv` 得到零长度读；共享内存没有对端死亡信号，RDMA 对端销毁 QP 也不保证 flush 本端接收队列。因此对端关闭后的“失败/空读”断言只对 TCP 成立，另两种只断言本端 `Close()` 释放资源且之后不可再用。- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；communicator 的 channel 握手（`ConnHandshake`）走 Transport 的阻塞 `Send`/`Recv`——这是阻塞接口存在的唯一理由（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`，三种语义一致，调用点不区分传输类型）。
 - **非阻塞语义是硬约束**：`TrySend`/`TryRecv` 绝不阻塞。
-- **方向对 TCP 只是元数据、不是操作许可**：TCP 任何方向都能收发，方向只决定 `GetPollEvents()`。channel 握手恒由主动连接方先 `Send`、被动方先 `Recv`，所以一条标成 `Receive` 的连接的主动端仍要在它上面 `Send`——不要给 TCP 加反向拒绝的防御。共享内存端点才把方向当硬约束。
+- **方向对 TCP 只是元数据、不是操作许可**：TCP 任何方向都能收发，方向只决定 `GetPollEvents()`。channel 握手恒由主动连接方先 `Send`、被动方先 `Recv`，所以一条标成 `Receive` 的连接的主动端仍要在它上面 `Send`——不要给 TCP 加反向拒绝的防御。**共享内存与 RDMA 的数据面都把方向当硬约束**：`TrySend`/`TryRecv` 在 `!IsProducer()`/`IsProducer()` 时 `LOG_ERROR` + `false`（RDMA 的例外只在控制握手，它不看方向）。传输测试据此分支：只有 TCP 校验“反向仍可收发”。
 - **就绪位含义由 transport 决定**：socket 是「可写=发送推进、可读=接收推进」，共享内存发送端等的是可读的 eventfd。executor 一律用 `GetPollEvents()`，用「就绪来自 send 还是 recv transport」决定推进哪个逻辑操作，不得自行把位解释成方向。
 - `GetFd()` 返回的 fd 生命周期由 transport 管理，executor 只注册/注销。channel 边 send/recv 是各自独立 transport，fd 必然不同（含 2 rank `prev == next` 退化情形，见 [communicator.md](communicator.md)）。
 - **共享内存失败即初始化失败**，不得自动回退 TCP（`OCCL_DISABLE_SHM=1` 是显式选择）。RDMA 同理不得自动回退（`OCCL_DISABLE_RDMA=1` 是显式选择）。
@@ -66,4 +67,4 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - **`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ**：直接 poll CQ 不重新 arm 会在 EPOLLET 下漏边沿。
 - **RDMA 地址必须由 `Probe` 从设备的 IPv4-mapped GID 得出**，不能复用 `Utils::GetLocalIPAddress()` 结果。
 - 环容量固定 2 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
-- 改动本层后跑 `scripts/run_tests.sh`：tier 0 测 SHM 传输本身（fork 端点对），tier 11 测 RDMA 传输本身（mpirun 端点对，无设备 SKIP）；2/4 rank 集合通信档位在默认选择与 `OCCL_DISABLE_SHM=1`/`OCCL_DISABLE_RDMA=1` 覆盖下各跑一遍。
+- 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的三个 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP，并把实际路径写进报告（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度）。

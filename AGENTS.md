@@ -29,9 +29,9 @@ include/transport/         transport 头（限定路径引用：#include "transp
 src/                       实现（平铺）
 src/executor/              四种 executor 实现
 src/transport/             TCP、共享内存与 RDMA 传输实现
-tests/                     六个测试二进制 + collective_cases 共享用例
+tests/                     五个测试入口 + test_common / transport_check 共享支持
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
-scripts/                   run_tests.sh / run_all_executors.sh
+scripts/                   run_tests.sh（唯一入口）/ coverage_report.sh
 ```
 
 | 层 | 头文件 | 职责 | 铁律 |
@@ -54,28 +54,26 @@ scripts/                   run_tests.sh / run_all_executors.sh
 测试进程的 rank / world size 来自 MPI（`MPI_Comm_rank` / `MPI_Comm_size`）；bootstrap 的 `UniqueId`（rank0 的 IP + 端口）由 rank0 用 `Communicator::GetUniqueId` 生成后经 `MPI_Bcast` 分发给其余 rank，不再有 `OCCL_MASTER_ADDR` / `OCCL_MASTER_PORT`：
 
 ```bash
-mpirun -np 2 build/tests/test_allreduce
-mpirun -np 4 build/tests/test_allreduce
-mpirun -np 3 build/tests/test_collectives
-mpirun -np 4 build/tests/test_collectives --large
-# 单进程直接跑 = MPI singleton（rank 0、world size 1，走无数据面路径）：
-build/tests/test_allreduce
+# 入口只有一个：run_tests.sh（-h 有完整说明）。等级 0 是本机可跑的最小档。
+scripts/run_tests.sh --level 0 --executor all --profile all -j 2 --oversubscribe
+scripts/run_tests.sh --level 1 --executor all --profile all -j 2 --oversubscribe
+scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
+# 查看某一等级的完整用例矩阵（需先构建一次）：
+scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-- `cmake --build build --target run_test_allreduce` 只跑 **np=2** 一档，不是全矩阵。
-- **完整验证请用脚本**（各 tier 是不同的代码路径，不是“同一条多跑几次”）：
-  - `scripts/run_tests.sh` —— 单次构建下的 tier 0–12，加集合操作的单 rank、np=2/3/4 SHM/TCP 与单 channel 大消息背压测试；RDMA/SHM+RDMA 新操作覆盖复用多机模拟 tier。
-  - `scripts/run_all_executors.sh` —— 对 4 种 executor 各跑一遍完整矩阵，退出码 0 才算全过。
-  - 主要参数：`--coverage` / `--no-build` / `--build-dir` / `--build-type` / `--executor` / `--transport`（`all` / `shm` / `tcp` / `rdma`）/ `--timeout` / `--allow-skip`。
-- 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 失败 / `2` 有 SKIP / `3` 覆盖率报告无法生成。
-- **mpirun 缺失或无可用 RDMA 设备 → 报 SKIP 而非通过**：在一台只跑了单 rank tier、或静默把 RDMA 档位跳过而变绿的机器上，正是该脚本要杜绝的失败模式。
-- 六个测试二进制：
-  - `test_allreduce`：端到端 AllReduce 正确性（各 rank 填 `rank+1`，断言 reduce 结果）。
-  - `test_collectives`：五种操作，覆盖四种 dtype、四种归约、任意 root、不均匀多 channel 布局、空任务、非法任务及原地 AllReduce；`--large` 固定单 channel，测试超过传输窗口的大消息。共享用例位于 `tests/collective_cases.h/.cpp`。
-  - `test_local_info`：单机 local rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）断言。
-  - `test_multi_machine`：单机模拟多机（`CommConfig::get_hostname` 注入按 rank 推导的假 hostname，每机 rank 数按 world size 在测试内写死），断言 local 视角、**每条边的具体传输类型**（参数 `rdma` / `shm+rdma` / `tcp`）与端到端集合操作；复用 `collective_cases`，并重建单 channel communicator 验证大消息背压。
-  - `test_transport_shm`：共享内存传输的 fork 端点对，**无需 mpirun**（rendezvous、描述符传递、控制握手、阻塞/非阻塞、回绕/背压、方向拒绝、拆除）。
-  - `test_transport_rdma`：RDMA 传输的 mpirun 端点对，**需 RDMA 设备**（CM 握手、RC QP、write、槽位回收、1 B 到 5 MiB 传输）；无设备时返回 2，脚本记为 SKIP。
+- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,10240}；等级 1 = 8 rank / 4×2 / 加 65536；等级 2 = 32 rank / 8×4 / 同等级 1 的 count。等级 0 每个接口遍历全部 dtype、op、count；等级 1 补齐两两组合与 `n_channels=3`；等级 2 跑完整合法核心集并加 `n_channels=1`。
+- **只覆盖 polling 与 epoll**（`--executor all` 即这两个）；另外两个 executor 的实现仍在库里，但不在本矩阵内。
+- **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
+- **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP，并把实际路径写进报告。
+- **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
+- 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败、sanitizer 报错或超时 / `2` 只剩 SKIP / `3` 覆盖率报告生成失败 / `4` 参数非法。
+- 五个测试入口：
+  - `test_single_machine`：真实单机的 rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）、每边必须是共享内存，以及全量集合用例。
+  - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 local 视角、**每条环边（`ring.prev`/`ring.next`）的具体传输类型**（同机 SHM、跨机统一 RDMA 或 TCP，且单边 fd 独立）与全量集合用例。
+  - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
+  - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
+- `--profile asan-ubsan` 是必跑的动态检查档（`--profile all` 含它）；`--profile coverage` 出 gcovr/lcov/gcov 报告。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
 
 ## commit rules
 - **提交comment**：简短、小写、朴素英文 —— `add fmt`、`modify channels`、`root ip and port from env`。

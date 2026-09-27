@@ -56,7 +56,7 @@ set(ORIGIN_CCL_SOURCES
 add_library(originccl SHARED ${ORIGIN_CCL_SOURCES})
 
 # Compile-time executor selection. Exactly one strategy is baked into a library build;
-# scripts/run_all_executors.sh builds all of them to cover the full matrix.
+# scripts/run_tests.sh --executor all builds and runs the polling and epoll ones.
 #   cmake -DOCCL_EXECUTOR=epoll|polling|reactor|multi_thread
 set(OCCL_EXECUTOR "multi_thread" CACHE STRING "Executor strategy: multi_thread, epoll, polling, or reactor")
 set_property(CACHE OCCL_EXECUTOR PROPERTY STRINGS multi_thread epoll polling reactor)

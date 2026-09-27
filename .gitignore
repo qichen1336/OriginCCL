@@ -1,8 +1,11 @@
 /build/
 /build-*/
+/build-tests/
+/test-reports/
 
 .cache/
 
 graphify-out/
 .scratch/
 CMakeFiles/
+CMakeCache.txt

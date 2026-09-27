@@ -16,24 +16,40 @@ cmake --build build -j"$(nproc)"
 
 多进程启动只支持 **Open MPI** 的 `mpirun`。rank / world size 都由 MPI 给出，bootstrap 地址也不再从环境变量读：rank0 调 `Communicator::GetUniqueId` 挑一个空闲端口、连同自己的 IP 生成 `UniqueId`，再用 `MPI_Bcast` 发给其余 rank，所以测试必须链接并启动 MPI（不依赖 MPICH、PMI 或 Slurm）。
 
-```bash
-mpirun -np 2 build/tests/test_allreduce
-mpirun -np 4 build/tests/test_allreduce
-mpirun -np 3 build/tests/test_collectives
-mpirun -np 4 build/tests/test_collectives --large
-```
-
-也可以通过构建目标一次完成编译与运行：
+测试入口只有一个脚本，`-h` 有完整说明：
 
 ```bash
-cmake --build build --target run_test_allreduce
+scripts/run_tests.sh -h
+# 本机可跑的最小档（单机 4 rank、模拟多机 4×1、三种传输、集合用例）：
+scripts/run_tests.sh --level 0 --executor all --profile all -j 2 --oversubscribe
 ```
 
-单进程直接运行就是 MPI singleton（rank 0、world size 1，走无数据面路径）：
+等级决定进程布局与数据量：
+
+| 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
+| --- | --- | --- | --- | --- |
+| 0 | 4 rank | 4 机 × 1 rank | 1、1024、10240 | 每个接口遍历全部 dtype / op / count |
+| 1 | 8 rank | 4 机 × 2 rank | 加 65536 | 补齐 dtype/op/count 两两组合 + `n_channels=3` |
+| 2 | 32 rank | 8 机 × 4 rank | 同等级 1 | 完整合法核心集 + `n_channels=3` 与 `1` |
 
 ```bash
-build/tests/test_allreduce
+# 需要足够核数，或加 --oversubscribe：
+scripts/run_tests.sh --level 1 --executor all --profile all -j 2 --oversubscribe
+scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
 ```
 
-完整验证运行 `scripts/run_all_executors.sh --timeout 120`：包含原有测试、新操作的四数据类型/任意 root/多 channel 布局，以及单 channel 大消息背压。
-新操作同时进入 RDMA、SHM+RDMA 和 TCP 多机模拟测试；设备不可用时报告 SKIP，不算完整通过。
+- `--profile all` 顺序跑三种档位：普通构建、**ASan+UBSan**、coverage（gcovr，缺失时回退 lcov / gcov 文本）。
+- 只覆盖 **polling** 与 **epoll** 两个 executor（`--executor all` 即这两个）。
+- **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
+- `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，报告记录实际路径。
+- 无可用 RDMA 设备时 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `3` 报告生成失败 / `4` 参数非法。
+
+查看某一等级的完整用例矩阵（需先构建一次）：
+
+```bash
+scripts/run_tests.sh --level 0 --list-cases --no-build
+```
+
+五个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`。用例生成与结果校验在 `tests/test_common.*`，三种传输共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总，`coverage/` 覆盖率）。
+
+sanitizer 能发现内存与未定义行为风险，但覆盖不到 RDMA DMA 与跨进程共享内存竞态，因此完整数据比对、边界尺寸与就绪活性测试是必要补充。

@@ -48,4 +48,4 @@
 - **机器身份 = hostname**（`Utils::GetHostname()` → `gethostname()`），不是 IP。
 - **`Finalize` 先 `executor->Shutdown()`（多线程需 join worker），再关 channel transport**。`PlanTask` 经 `shared_ptr<Transport>` 保证 transport 在 plan 执行期间有效。
 - **绑核用 `local_rank`（非全局 rank），非致命**：失败只 `LOG_WARN` 并继续初始化，不能让 `Init` 失败。
-- 改动传输选择后跑 `scripts/run_tests.sh --transport all`（或 `run_all_executors.sh`）：tier 5/8 占住 rendezvous 目录断言共享内存失败不回退 / 禁用时照常成功；tier 9/10/12 用假 hostname 断言每条边具体传输类型（RDMA / SHM+RDMA / TCP）。多机行为单机验证走 `tests/test_multi_machine.cpp`（`CommConfig::get_hostname` 注入假 hostname，接受 `rdma` / `shm+rdma` / `tcp` 参数）。
+- 改动传输选择后跑 `scripts/run_tests.sh`：`test_multi_machine` 用 `CommConfig::get_hostname` 注入逻辑 hostname（`rank / ranks_per_machine` 推导机器号），断言 local 视角与**每条环边**（`ring.prev`/`ring.next`）的具体传输类型——同机必为 SHM、跨机必为统一的 RDMA 或 TCP，且 send/recv 两条边的 fd 独立；`test_single_machine` 断言真实单机的每条边都是 SHM。等级决定布局（0/1/2 = 4×1 / 4×2 / 8×4），`OCCL_DISABLE_SHM`/`OCCL_DISABLE_RDMA` 不再是测试维度。
