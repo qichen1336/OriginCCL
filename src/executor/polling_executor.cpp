@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <numeric>
 #include <sched.h>
 #include "executor/polling_executor.h"
 #include "logger.h"
@@ -46,21 +48,31 @@ bool PollingExecutor::Run(const CollPlan& plan) {
             }
             Topology* topo = task->topology.get();
 
-            size_t before_send = task->state.send_progress;
-            size_t before_recv = task->state.recv_progress;
+            size_t before_send =
+                std::accumulate(task->state.send_progress.begin(), task->state.send_progress.end(), size_t{0});
+            size_t before_recv =
+                std::accumulate(task->state.recv_progress.begin(), task->state.recv_progress.end(), size_t{0});
             int before_phase = task->state.phase;
 
-            if (!task->state.send_done && !topo->CollectiveStep(*task, CollEvent::Writable)) {
+            bool send_done =
+                std::all_of(task->state.send_done.begin(), task->state.send_done.end(), [](char d) { return d != 0; });
+            bool recv_done =
+                std::all_of(task->state.recv_done.begin(), task->state.recv_done.end(), [](char d) { return d != 0; });
+
+            if (!send_done && !topo->CollectiveStep(*task, CollEvent::Writable)) {
                 LOG_ERROR("PollingExecutor step failed on channel {}", plan.channels[i].channel_id);
                 return false;
             }
-            if (!task->state.recv_done && !topo->CollectiveStep(*task, CollEvent::Readable)) {
+            if (!recv_done && !topo->CollectiveStep(*task, CollEvent::Readable)) {
                 LOG_ERROR("PollingExecutor step failed on channel {}", plan.channels[i].channel_id);
                 return false;
             }
 
-            if (task->state.send_progress != before_send || task->state.recv_progress != before_recv ||
-                task->state.phase != before_phase) {
+            size_t after_send =
+                std::accumulate(task->state.send_progress.begin(), task->state.send_progress.end(), size_t{0});
+            size_t after_recv =
+                std::accumulate(task->state.recv_progress.begin(), task->state.recv_progress.end(), size_t{0});
+            if (after_send != before_send || after_recv != before_recv || task->state.phase != before_phase) {
                 progressed = true;
             }
 

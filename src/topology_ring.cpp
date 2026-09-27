@@ -88,25 +88,42 @@ int ReduceScatterInputChunk(const PlanTask& task) {
     return (task.rank - task.state.step - 2 + 2 * task.world_size) % task.world_size;
 }
 
+bool SideDone(const std::vector<char>& done) {
+    return std::all_of(done.begin(), done.end(), [](char d) { return d != 0; });
+}
+
+void MarkAllDone(PlanTask& task) {
+    task.state.send_done.assign(task.send_transports.size(), 1);
+    task.state.recv_done.assign(task.recv_transports.size(), 1);
+}
+
 bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* recv_data, size_t send_bytes,
                 size_t recv_bytes, const char* op) {
     CollOpState& s = task.state;
     if (event == CollEvent::Writable) {
-        if (s.send_done) {
-            return true;
+        for (size_t i = 0; i < task.send_transports.size(); ++i) {
+            if (s.send_done[i]) {
+                continue;
+            }
+            bool done = false;
+            if (!task.send_transports[i]->TrySend(send_data, send_bytes, &s.send_progress[i], &done)) {
+                LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
+                return false;
+            }
+            s.send_done[i] = done ? 1 : 0;
         }
-        if (!task.send_transport->TrySend(send_data, send_bytes, &s.send_progress, &s.send_done)) {
-            LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
+        return true;
+    }
+    for (size_t i = 0; i < task.recv_transports.size(); ++i) {
+        if (s.recv_done[i]) {
+            continue;
+        }
+        bool done = false;
+        if (!task.recv_transports[i]->TryRecv(recv_data, recv_bytes, &s.recv_progress[i], &done)) {
+            LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
             return false;
         }
-        return true;
-    }
-    if (s.recv_done) {
-        return true;
-    }
-    if (!task.recv_transport->TryRecv(recv_data, recv_bytes, &s.recv_progress, &s.recv_done)) {
-        LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
-        return false;
+        s.recv_done[i] = done ? 1 : 0;
     }
     return true;
 }
@@ -115,10 +132,12 @@ bool BeginPhase(PlanTask& task, int phase, const char* send_data, char* recv_dat
                 const char* op) {
     CollOpState& s = task.state;
     s.phase = phase;
-    s.send_progress = 0;
-    s.recv_progress = 0;
-    s.send_done = (phase == kPhaseRecv || phase == kPhaseDone) || send_bytes == 0;
-    s.recv_done = (phase == kPhaseSend || phase == kPhaseDone) || recv_bytes == 0;
+    bool send_skip = (phase == kPhaseRecv || phase == kPhaseDone) || send_bytes == 0;
+    bool recv_skip = (phase == kPhaseSend || phase == kPhaseDone) || recv_bytes == 0;
+    s.send_progress.assign(task.send_transports.size(), 0);
+    s.recv_progress.assign(task.recv_transports.size(), 0);
+    s.send_done.assign(task.send_transports.size(), send_skip ? 1 : 0);
+    s.recv_done.assign(task.recv_transports.size(), recv_skip ? 1 : 0);
     return PushBuffer(task, CollEvent::Writable, send_data, recv_data, send_bytes, recv_bytes, op) &&
            PushBuffer(task, CollEvent::Readable, send_data, recv_data, send_bytes, recv_bytes, op);
 }
@@ -143,7 +162,7 @@ char* ReduceScatterRecvPtr(const PlanTask& task) {
 
 bool CompleteBroadcast(PlanTask& task) {
     CollOpState& s = task.state;
-    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+    while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         int next_phase = kPhaseDone;
         if (s.phase == kPhaseRecv && (task.rank + 1) % task.world_size != task.root) {
             next_phase = kPhaseSend;
@@ -158,7 +177,7 @@ bool CompleteBroadcast(PlanTask& task) {
 
 bool CompleteAllGather(PlanTask& task) {
     CollOpState& s = task.state;
-    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+    while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         int next_phase = kPhaseDone;
         if (++s.step < task.world_size - 1) {
             next_phase = kPhaseExchange;
@@ -173,7 +192,7 @@ bool CompleteAllGather(PlanTask& task) {
 
 bool CompleteReduce(PlanTask& task) {
     CollOpState& s = task.state;
-    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+    while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         int next_phase = kPhaseDone;
         if (s.phase == kPhaseRecv) {
             ReduceBlock(task, s.temp_buffer.data() + BlockBytes(task), s.temp_buffer.data());
@@ -196,7 +215,7 @@ bool CompleteReduce(PlanTask& task) {
 
 bool CompleteReduceScatter(PlanTask& task) {
     CollOpState& s = task.state;
-    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+    while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         char* incoming = ReduceScatterRecvPtr(task);
         ReduceBlock(task, InputBlock(task, ReduceScatterInputChunk(task)), incoming);
         int next_phase = kPhaseDone;
@@ -220,7 +239,7 @@ bool CompleteReduceScatter(PlanTask& task) {
 
 bool CompleteAllreduce(PlanTask& task) {
     CollOpState& s = task.state;
-    while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+    while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         size_t type_size = Utils::GetDataTypeSize(task.dtype);
         size_t chunk = task.chunk_size;
         char* data = static_cast<char*>(task.recv_buf);
@@ -275,6 +294,20 @@ void TopologyRing::FillChannels(std::vector<Channel>& channels) const {
 
 int TopologyRing::GetPrevRank(int r) const {
     return (r - 1 + world_size) % world_size;
+}
+
+void TopologyRing::FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
+                                  std::vector<std::shared_ptr<Transport>>& recv_out) const {
+    send_out.clear();
+    recv_out.clear();
+    Connector* send_conn = channel.SendConnector(channel.ring.next);
+    if (send_conn && send_conn->transport) {
+        send_out.push_back(send_conn->transport);
+    }
+    Connector* recv_conn = channel.RecvConnector(channel.ring.prev);
+    if (recv_conn && recv_conn->transport) {
+        recv_out.push_back(recv_conn->transport);
+    }
 }
 
 int TopologyRing::GetNextRank(int r) const {
@@ -332,7 +365,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
 
     if (task.elem_count == 0) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
     if (!task.send_buf || !task.recv_buf) {
@@ -353,7 +386,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
         return true;
     }
 
-    if (!task.send_transport || !task.recv_transport) {
+    if (task.send_transports.empty() || task.recv_transports.empty()) {
         LOG_ERROR("Ring AllReduce received task without transports");
         return false;
     }
@@ -394,7 +427,7 @@ bool TopologyRing::BroadcastInit(PlanTask& task) const noexcept {
     }
     if (task.elem_count == 0) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
     if (!task.recv_buf) {
@@ -403,10 +436,10 @@ bool TopologyRing::BroadcastInit(PlanTask& task) const noexcept {
     }
     if (task.world_size == 1) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
-    if (!task.send_transport || !task.recv_transport) {
+    if (task.send_transports.empty() || task.recv_transports.empty()) {
         LOG_ERROR("Ring Broadcast received task without transports");
         return false;
     }
@@ -441,7 +474,7 @@ bool TopologyRing::AllGatherInit(PlanTask& task) const noexcept {
     }
     if (task.elem_count == 0) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
     if (!task.send_buf || !task.recv_buf) {
@@ -451,10 +484,10 @@ bool TopologyRing::AllGatherInit(PlanTask& task) const noexcept {
     std::memcpy(OutputBlock(task, task.rank), task.send_buf, BlockBytes(task));
     if (task.world_size == 1) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
-    if (!task.send_transport || !task.recv_transport) {
+    if (task.send_transports.empty() || task.recv_transports.empty()) {
         LOG_ERROR("Ring AllGather received task without transports");
         return false;
     }
@@ -488,7 +521,7 @@ bool TopologyRing::ReduceInit(PlanTask& task) const noexcept {
     }
     if (task.elem_count == 0) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
     if (!task.send_buf || (task.rank == task.root && !task.recv_buf)) {
@@ -498,10 +531,10 @@ bool TopologyRing::ReduceInit(PlanTask& task) const noexcept {
     if (task.world_size == 1) {
         std::memcpy(task.recv_buf, task.send_buf, BlockBytes(task));
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
-    if (!task.send_transport || !task.recv_transport) {
+    if (task.send_transports.empty() || task.recv_transports.empty()) {
         LOG_ERROR("Ring Reduce received task without transports");
         return false;
     }
@@ -538,7 +571,7 @@ bool TopologyRing::ReduceScatterInit(PlanTask& task) const noexcept {
     }
     if (task.elem_count == 0) {
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
     if (!task.send_buf || !task.recv_buf) {
@@ -548,10 +581,10 @@ bool TopologyRing::ReduceScatterInit(PlanTask& task) const noexcept {
     if (task.world_size == 1) {
         std::memcpy(task.recv_buf, task.send_buf, BlockBytes(task));
         s.phase = kPhaseDone;
-        s.send_done = s.recv_done = true;
+        MarkAllDone(task);
         return true;
     }
-    if (!task.send_transport || !task.recv_transport) {
+    if (task.send_transports.empty() || task.recv_transports.empty()) {
         LOG_ERROR("Ring ReduceScatter received task without transports");
         return false;
     }

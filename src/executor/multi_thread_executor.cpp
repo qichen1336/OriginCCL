@@ -1,6 +1,9 @@
 #include <cerrno>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <algorithm>
+#include <memory>
+#include <vector>
 #include "executor/multi_thread_executor.h"
 #include "transport/transport.h"
 #include "topology.h"
@@ -84,11 +87,26 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return true;
     };
 
-    bool registered = add_fd(task.recv_transport.get(), 0u) && add_fd(task.send_transport.get(), 1u);
+    const size_t transport_count = task.recv_transports.size() + task.send_transports.size();
+    bool registered = true;
+    for (const auto& transport : task.recv_transports) {
+        if (!add_fd(transport.get(), 0u)) {
+            registered = false;
+            break;
+        }
+    }
+    if (registered) {
+        for (const auto& transport : task.send_transports) {
+            if (!add_fd(transport.get(), 1u)) {
+                registered = false;
+                break;
+            }
+        }
+    }
 
-    struct epoll_event events[2];
+    std::vector<struct epoll_event> events(std::max<size_t>(transport_count, 1));
     while (registered && !topo->CollectiveDone(task)) {
-        int ready = epoll_wait(epfd, events, 2, -1);
+        int ready = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), -1);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;

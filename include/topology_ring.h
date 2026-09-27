@@ -10,6 +10,8 @@ public:
     ~TopologyRing() override = default;
 
     void FillChannels(std::vector<Channel>& channels) const override;
+    void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
+                        std::vector<std::shared_ptr<Transport>>& recv_out) const override;
 
     bool CollectiveInit(PlanTask& task) const noexcept override;
     bool CollectiveStep(PlanTask& task, CollEvent event) const noexcept override;

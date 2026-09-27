@@ -1,3 +1,4 @@
+#include <memory>
 #include <vector>
 #include <unistd.h>
 #include <string.h>
@@ -30,9 +31,12 @@ bool EpollExecutor::EnsureEpoll() {
 
 bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
     const uint32_t tag_base = static_cast<uint32_t>(slot) * 2u;
-    if (task.recv_transport) {
-        int fd = task.recv_transport->GetFd();
-        uint32_t events = task.recv_transport->GetPollEvents();
+    for (const auto& transport : task.recv_transports) {
+        if (!transport) {
+            continue;
+        }
+        int fd = transport->GetFd();
+        uint32_t events = transport->GetPollEvents();
         if (fd >= 0 && events != 0) {
             struct epoll_event ev;
             ev.events = events | EPOLLET;
@@ -43,9 +47,12 @@ bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
             }
         }
     }
-    if (task.send_transport) {
-        int fd = task.send_transport->GetFd();
-        uint32_t events = task.send_transport->GetPollEvents();
+    for (const auto& transport : task.send_transports) {
+        if (!transport) {
+            continue;
+        }
+        int fd = transport->GetFd();
+        uint32_t events = transport->GetPollEvents();
         if (fd >= 0 && events != 0) {
             struct epoll_event ev;
             ev.events = events | EPOLLET;
@@ -60,14 +67,20 @@ bool EpollExecutor::RegisterTask(int slot, const PlanTask& task) {
 }
 
 void EpollExecutor::UnregisterTask(const PlanTask& task) {
-    if (task.recv_transport) {
-        int fd = task.recv_transport->GetFd();
+    for (const auto& transport : task.recv_transports) {
+        if (!transport) {
+            continue;
+        }
+        int fd = transport->GetFd();
         if (fd >= 0) {
             epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         }
     }
-    if (task.send_transport) {
-        int fd = task.send_transport->GetFd();
+    for (const auto& transport : task.send_transports) {
+        if (!transport) {
+            continue;
+        }
+        int fd = transport->GetFd();
         if (fd >= 0) {
             epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
         }
@@ -141,8 +154,16 @@ bool EpollExecutor::Run(const CollPlan& plan) {
             }
 
             size_t side = tag % 2u;
-            Transport* transport = (side == 0) ? task->recv_transport.get() : task->send_transport.get();
-            if (!transport || (events[e].events & transport->GetPollEvents()) == 0) {
+            const std::vector<std::shared_ptr<Transport>>& transports =
+                (side == 0) ? task->recv_transports : task->send_transports;
+            bool ready = false;
+            for (const auto& transport : transports) {
+                if (transport && (events[e].events & transport->GetPollEvents()) != 0) {
+                    ready = true;
+                    break;
+                }
+            }
+            if (!ready) {
                 continue;
             }
 

@@ -80,10 +80,10 @@ enum class CollEvent {
 struct CollOpState {
     int phase = 0;
     int step = 0;
-    size_t send_progress = 0;
-    size_t recv_progress = 0;
-    bool send_done = false;
-    bool recv_done = false;
+    std::vector<size_t> send_progress;
+    std::vector<size_t> recv_progress;
+    std::vector<char> send_done;
+    std::vector<char> recv_done;
     std::vector<char> temp_buffer;
 };
 
@@ -100,8 +100,8 @@ struct PlanTask {
     int world_size = 1;
     int root = 0;
     std::shared_ptr<Topology> topology;
-    std::shared_ptr<Transport> send_transport;
-    std::shared_ptr<Transport> recv_transport;
+    std::vector<std::shared_ptr<Transport>> send_transports;
+    std::vector<std::shared_ptr<Transport>> recv_transports;
     CollOpState state;
 };
 

@@ -18,6 +18,8 @@ public:
     }
 
     virtual void FillChannels(std::vector<Channel>& channels) const = 0;
+    virtual void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
+                                std::vector<std::shared_ptr<Transport>>& recv_out) const = 0;
 
     virtual bool CollectiveInit(PlanTask& task) const noexcept = 0;
     virtual bool CollectiveStep(PlanTask& task, CollEvent event) const noexcept = 0;

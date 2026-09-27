@@ -17,7 +17,7 @@ flowchart LR
     D --> E[每 channel 建立独立 send/recv transport：本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP]
 ```
 
-- 执行链路：五个 collective 公开方法创建 `CollTask` → `planner.Plan` → `executor->Run(plan)`，不在入口展开算法。
+- 执行链路：五个 collective 公开方法创建 `CollTask` → `planner.Plan` → `executor->Run(plan)`，不在入口展开算法。planner 组装 task 时经 `Topology::FillTransports` 把该 channel 的连接（向量）挂到 `PlanTask`；communicator 本身不碰单条 transport 的选取。
 - 暴露本机视角：`GetLocalRank()`、`GetLocalSize()`、`GetLocalRanks()`、`IsSingleMachine()`。
 - 不负责：不决定算法（topology）、不决定等待策略（executor）、不切片（planner）、不实现共享内存环（transport）。
 
@@ -68,7 +68,7 @@ count=0 是成功空操作，允许空缓冲区，但 func/root/world_size 仍�
 | 文件 | 职责 |
 |------|------|
 | `include/communicator.h` | `Communicator` 顶层接口（GetUniqueId / Init / AllReduce / Finalize / local 视图） |
-| `include/channel.h` | `Channel` / `Connector` / `Ring` 结构：`send[p]` / `recv[p]` 是两条有向边的两个槽位，`ring` 由 topology 填（`FillChannels`），transport 由 `InitChannels` 装 |
+| `include/channel.h` | `Channel` / `Connector` / `Ring` 结构：`send[p]` / `recv[p]` 是两条有向边的两个槽位，`ring` 由 topology 填（`FillChannels`），transport 由 `InitChannels` 装；task 用哪几条由 topology 选（`FillTransports`） |
 | `src/communicator.cpp` | `GetUniqueId`（绑 bootstrap listener）+ `Init`（探 RDMA 端点 → 建三类 listener → bootstrap → local 分组 → 绑核 → 全局 RDMA 判定 → InitChannels）+ `#ifdef` 构造 executor + `ConnectActiveEdges` 内联的按边三选一（SHM/RDMA/TCP，各设方向后单次 `Connect`）+ `Finalize` 顺序 |
 | `src/bootstrap.cpp` | master/节点信息交换（按 `NodeInfo` 交换 hostname 与 RDMA 端点） |
 
