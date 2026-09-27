@@ -274,21 +274,9 @@ bool CompleteAllreduce(PlanTask& task) {
 } // namespace
 
 void TopologyRing::FillChannels(std::vector<Channel>& channels) const {
-    for (size_t i = 0; i < channels.size(); ++i) {
-        channels[i].id = static_cast<int>(i);
-        channels[i].ring.prev = GetPrevRank(rank);
-        channels[i].ring.next = GetNextRank(rank);
-
-        channels[i].send.resize(static_cast<size_t>(world_size));
-        channels[i].recv.resize(static_cast<size_t>(world_size));
-        for (int peer = 0; peer < world_size; ++peer) {
-            channels[i].send[static_cast<size_t>(peer)].peer = peer;
-            channels[i].send[static_cast<size_t>(peer)].channel_id = channels[i].id;
-            channels[i].send[static_cast<size_t>(peer)].is_send = true;
-            channels[i].recv[static_cast<size_t>(peer)].peer = peer;
-            channels[i].recv[static_cast<size_t>(peer)].channel_id = channels[i].id;
-            channels[i].recv[static_cast<size_t>(peer)].is_send = false;
-        }
+    for (Channel& channel : channels) {
+        channel.ring.prev = GetPrevRank(rank);
+        channel.ring.next = GetNextRank(rank);
     }
 }
 

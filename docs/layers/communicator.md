@@ -8,8 +8,9 @@
 
 ```mermaid
 flowchart LR
-    A[Communicator::Init] --> B[TopologyRing]
-    B --> L[建数据面 TCP listener + 共享内存 rendezvous listener + RDMA listener]
+    A[Communicator::Init] --> B[TopologyRing 填 ring]
+    B --> K[铺 channel 骨架：id + send/recv 槽位]
+    K --> L[建数据面 TCP listener + 共享内存 rendezvous listener + RDMA listener]
     L --> C[Bootstrap 交换 NodeInfo（含 rdma_addr/rdma_port）]
     C --> P[local 分组 + 按 local_rank 绑核]
     P --> S[全局判定：所有 rank 都有可用 RDMA 才启用 RDMA]
@@ -58,7 +59,7 @@ count=0 是成功空操作，允许空缓冲区，但 func/root/world_size 仍�
 ### 设计区间
 
 - `n_channels` 默认值可调：`config.n_channels<=0` 时取 `kDefaultChannelCount`（当前 4）；初始化建全部 channel 连接，planner 按消息大小选用本次实际数量。
-- 初始化内部步骤可重构，守住生命周期顺序即可。
+- 初始化内部步骤可重构，守住生命周期顺序即可。`Init` 在 `topology->FillChannels`（只填 `ring`）后铺 channel 骨架：逐 channel 置 `id`，按 `world_size` resize `send`/`recv` 并填满各槽位的 `peer`/`channel_id`/`is_send`。这一步与拓扑无关，放 communicator 而非 topology。
 - local 分组可内联实现（现已在 `Init` 内联，不抽纯函数）：取 `all_nodes[config.rank].hostname`，收集 hostname 相同的 rank、升序排序得 `local_ranks`；`local_size = local_ranks.size()`；`local_rank` = 自身 rank 下标；`is_single_machine = (local_size == world_size)`。`world_size<=1` 提前返回（此时**不建任何 listener**，也不装任何 edge）赋 `local_rank=0, local_size=1, local_ranks={0}, is_single_machine=true`（唯一拿不到 `all_nodes` 的分支）。
 - **绑核用 local_rank，不是全局 rank**：`Init` 在两处调 `Utils::PinProcessToCpu(local_rank)`（`world_size<=1` 的提前返回分支与正常 local 分组之后），把进程亲和性设为单核 `local_rank % 在线 CPU 数`。原语只做 `sysconf(_SC_NPROCESSORS_ONLN)` + `sched_setaffinity`（`CPU_SET` 单核），**非致命**：取不到 CPU 数或 `sched_setaffinity` 失败只 `LOG_WARN` 并继续初始化（绑核是性能优化，不是正确性前提，失败不得让 Init 返回 false）。取模而非报错，是为了让一台机器上 local rank 多于 CPU 数的超订场景仍能跑（多个 rank 共享核）。绑核在 bootstrap 之后（此时才知道 `local_rank`），且只执行一次；executor 的 worker 线程继承进程亲和性，不加额外 per-thread 绑定。
 - executor 由编译宏选定（见 [executor.md](executor.md)），`Communicator` 用 `#ifdef` 构造，无运行时注入接口。
@@ -68,7 +69,7 @@ count=0 是成功空操作，允许空缓冲区，但 func/root/world_size 仍�
 | 文件 | 职责 |
 |------|------|
 | `include/communicator.h` | `Communicator` 顶层接口（GetUniqueId / Init / AllReduce / Finalize / local 视图） |
-| `include/channel.h` | `Channel` / `Connector` / `Ring` 结构：`send[p]` / `recv[p]` 是两条有向边的两个槽位，`ring` 由 topology 填（`FillChannels`），transport 由 `InitChannels` 装；task 用哪几条由 topology 选（`FillTransports`） |
+| `include/channel.h` | `Channel` / `Connector` / `Ring` 结构：`send[p]` / `recv[p]` 是两条有向边的两个槽位，骨架（`id` + 各槽位 `peer`/`channel_id`/`is_send`）由 communicator 在 `Init` 中铺（拓扑无关的默认初始化），`ring` 由 topology 填（`FillChannels`），transport 由 `InitChannels` 装；task 用哪几条由 topology 选（`FillTransports`） |
 | `src/communicator.cpp` | `GetUniqueId`（绑 bootstrap listener）+ `Init`（探 RDMA 端点 → 建三类 listener → bootstrap → local 分组 → 绑核 → 全局 RDMA 判定 → InitChannels）+ `#ifdef` 构造 executor + `ConnectActiveEdges` 内联的按边三选一（SHM/RDMA/TCP，各设方向后单次 `Connect`）+ `Finalize` 顺序 |
 | `src/bootstrap.cpp` | master/节点信息交换（按 `NodeInfo` 交换 hostname 与 RDMA 端点） |
 

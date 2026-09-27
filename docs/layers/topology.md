@@ -10,7 +10,7 @@
   - `CollectiveStep(PlanTask&, CollEvent)`：非阻塞推进一次。`CollEvent::Writable` → 推进 send（`TrySend`）；`CollEvent::Readable` → 推进 recv（`TryRecv`）。当前阶段完成后连续结算已完成阶段，并主动尝试新阶段启用的传输，再交还 executor 等待。
   - `CollectiveDone`：**仅表示成功完成**（`phase == kPhaseDone`）。失败通过 Init/Step 的 false 上报，executor 不再推进失败任务。
   - `TopologyRing` 保留 `AllreduceInit/Step/Done`，并提供其余四种操作的具名三件套。通用入口负责分派，executor 不依赖具名方法。既有 `Topology` 派生类需迁移到通用三件套；不保证旧虚接口的 ABI 兼容。
-- `Topology::FillTransports(channel, send_out, recv_out)`：给定 `Channel`，按拓扑语义挑出该 channel 上本 task 真正要用的连接，填进两个 transport 向量。与 `FillChannels` 互补：`FillChannels` 是 topology→communicator（建骨架），`FillTransports` 是 topology→planner（选连接）。planner 不自己看 `ring`/`Connector`。
+- `Topology::FillTransports(channel, send_out, recv_out)`：给定 `Channel`，按拓扑语义挑出该 channel 上本 task 真正要用的连接，填进两个 transport 向量。planner 不自己看 `ring`/`Connector`。`FillChannels` **只填拓扑形状**（`channel.ring`）；`send`/`recv` 槽位骨架是与拓扑无关的默认初始化，由 communicator 在 `Init` 里铺，transport 由 `InitChannels` 装。
 - 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，只存不可现算的最小状态 `phase, step, send_progress, recv_progress, send_done, recv_done, temp_buffer`。后四个是**与 `PlanTask::send_transports`/`recv_transports` 一一对应的向量**（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因为 `Try*` 的 `done` 是 `bool*` 出参，位压缩的 `vector<bool>` 取不到 `bool&`）；整侧完成由 `std::all_of` 现算，空向量视为已完成。失败不存于游标（Init/Step 返回值即错误通道）。
 - 不负责：不监听 fd、不决定等待策略、不开线程；无可变成员状态（算法游标存于 `PlanTask.state`）；不暴露 WantRead/WantWrite（executor 默认对 read+write fd 都监听）。
 

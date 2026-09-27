@@ -103,6 +103,22 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     channels.resize(static_cast<size_t>(n_channels));
     topology->FillChannels(channels);
+    for (size_t i = 0; i < channels.size(); ++i) {
+        Channel& channel = channels[i];
+        channel.id = static_cast<int>(i);
+        channel.send.resize(static_cast<size_t>(config.world_size));
+        channel.recv.resize(static_cast<size_t>(config.world_size));
+        for (int peer = 0; peer < config.world_size; ++peer) {
+            Connector& send = channel.send[static_cast<size_t>(peer)];
+            send.peer = peer;
+            send.channel_id = channel.id;
+            send.is_send = true;
+            Connector& recv = channel.recv[static_cast<size_t>(peer)];
+            recv.peer = peer;
+            recv.channel_id = channel.id;
+            recv.is_send = false;
+        }
+    }
 
     if (!executor) {
         executor = std::make_unique<DefaultExecutor>();
