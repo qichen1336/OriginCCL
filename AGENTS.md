@@ -40,7 +40,7 @@ scripts/                   run_tests.sh / run_all_executors.sh
 | **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | 编译期选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
-| **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露八种集合操作 |
+| **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露五种集合操作 |
 | **bootstrap** | `bootstrap.h` | master/worker 交换 `NodeInfo`（含 `data_port`/`hostname`/`rdma_addr`/`rdma_port`） | 用于本地分组与建连；本地 `NodeInfo` 由 communicator 构造后传入 |
 | **utils / logger / types** | `utils.h` / `logger.h` / `types.h` | 编解码、socket 辅助、reduce 运算、日志宏、公共数据结构 | 日志统一走 `LOG_*` 宏 |
 
@@ -71,7 +71,7 @@ build/tests/test_allreduce
 - **mpirun 缺失或无可用 RDMA 设备 → 报 SKIP 而非通过**：在一台只跑了单 rank tier、或静默把 RDMA 档位跳过而变绿的机器上，正是该脚本要杜绝的失败模式。
 - 六个测试二进制：
   - `test_allreduce`：端到端 AllReduce 正确性（各 rank 填 `rank+1`，断言 reduce 结果）。
-  - `test_collectives`：八种操作，覆盖四种 dtype、四种归约、任意 root、不均匀多 channel 布局、空任务、非法任务及原地 AllReduce；`--large` 固定单 channel，测试超过传输窗口的大消息。共享用例位于 `tests/collective_cases.h/.cpp`。
+  - `test_collectives`：五种操作，覆盖四种 dtype、四种归约、任意 root、不均匀多 channel 布局、空任务、非法任务及原地 AllReduce；`--large` 固定单 channel，测试超过传输窗口的大消息。共享用例位于 `tests/collective_cases.h/.cpp`。
   - `test_local_info`：单机 local rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）断言。
   - `test_multi_machine`：单机模拟多机（`CommConfig::get_hostname` 注入按 rank 推导的假 hostname，每机 rank 数按 world size 在测试内写死），断言 local 视角、**每条边的具体传输类型**（参数 `rdma` / `shm+rdma` / `tcp`）与端到端集合操作；复用 `collective_cases`，并重建单 channel communicator 验证大消息背压。
   - `test_transport_shm`：共享内存传输的 fork 端点对，**无需 mpirun**（rendezvous、描述符传递、控制握手、阻塞/非阻塞、回绕/背压、方向拒绝、拆除）。
