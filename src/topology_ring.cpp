@@ -34,11 +34,13 @@ int AllreduceRecvChunk(const PlanTask& task) {
 }
 
 size_t AllreduceSendBytes(const PlanTask& task) {
-    return ChunkElemCount(task.elem_count, task.chunk_size, AllreduceSendChunk(task)) * Utils::GetDataTypeSize(task.dtype);
+    return ChunkElemCount(task.elem_count, task.chunk_size, AllreduceSendChunk(task)) *
+           Utils::GetDataTypeSize(task.dtype);
 }
 
 size_t AllreduceRecvBytes(const PlanTask& task) {
-    return ChunkElemCount(task.elem_count, task.chunk_size, AllreduceRecvChunk(task)) * Utils::GetDataTypeSize(task.dtype);
+    return ChunkElemCount(task.elem_count, task.chunk_size, AllreduceRecvChunk(task)) *
+           Utils::GetDataTypeSize(task.dtype);
 }
 
 char* AllreduceRecvPtr(const PlanTask& task) {
@@ -82,14 +84,7 @@ void ReduceBlock(const PlanTask& task, const void* input, void* output) {
                          task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
 }
 
-void PackInput(PlanTask& task) {
-    for (int block = 0; block < task.world_size; ++block) {
-        std::memcpy(task.state.temp_buffer.data() + static_cast<size_t>(block) * BlockBytes(task),
-                    InputBlock(task, block), BlockBytes(task));
-    }
-}
-
-int ReducedChunk(const PlanTask& task) {
+int ReduceScatterInputChunk(const PlanTask& task) {
     return (task.rank - task.state.step - 2 + 2 * task.world_size) % task.world_size;
 }
 
@@ -136,14 +131,14 @@ char* AllGatherRecvPtr(const PlanTask& task) {
     return OutputBlock(task, (task.rank - task.state.step - 1 + task.world_size) % task.world_size);
 }
 
-const char* ReduceScatterSendPtr(const PlanTask& task) {
-    return task.state.temp_buffer.data() +
-           static_cast<size_t>((task.rank - task.state.step - 1 + task.world_size) % task.world_size) *
-               BlockBytes(task);
+char* ReduceScatterSendPtr(const PlanTask& task) {
+    return task.state.step % 2 == 0 ? static_cast<char*>(task.recv_buf)
+                                    : const_cast<char*>(task.state.temp_buffer.data());
 }
 
 char* ReduceScatterRecvPtr(const PlanTask& task) {
-    return task.state.temp_buffer.data() + static_cast<size_t>(task.world_size) * BlockBytes(task);
+    return task.state.step % 2 == 0 ? const_cast<char*>(task.state.temp_buffer.data())
+                                    : static_cast<char*>(task.recv_buf);
 }
 
 bool CompleteBroadcast(PlanTask& task) {
@@ -153,8 +148,8 @@ bool CompleteBroadcast(PlanTask& task) {
         if (s.phase == kPhaseRecv && (task.rank + 1) % task.world_size != task.root) {
             next_phase = kPhaseSend;
         }
-        if (!BeginPhase(task, next_phase, static_cast<const char*>(task.recv_buf),
-                        static_cast<char*>(task.recv_buf), BlockBytes(task), BlockBytes(task), "Broadcast")) {
+        if (!BeginPhase(task, next_phase, static_cast<const char*>(task.recv_buf), static_cast<char*>(task.recv_buf),
+                        BlockBytes(task), BlockBytes(task), "Broadcast")) {
             return false;
         }
     }
@@ -202,14 +197,15 @@ bool CompleteReduce(PlanTask& task) {
 bool CompleteReduceScatter(PlanTask& task) {
     CollOpState& s = task.state;
     while (s.send_done && s.recv_done && s.phase != kPhaseDone) {
+        char* incoming = ReduceScatterRecvPtr(task);
+        ReduceBlock(task, InputBlock(task, ReduceScatterInputChunk(task)), incoming);
         int next_phase = kPhaseDone;
-        ReduceBlock(task, s.temp_buffer.data() + static_cast<size_t>(task.world_size) * BlockBytes(task),
-                    s.temp_buffer.data() + static_cast<size_t>(ReducedChunk(task)) * BlockBytes(task));
         if (++s.step < task.world_size - 1) {
             next_phase = kPhaseExchange;
         } else {
-            std::memcpy(task.recv_buf, s.temp_buffer.data() + static_cast<size_t>(task.rank) * BlockBytes(task),
-                        BlockBytes(task));
+            if (incoming != task.recv_buf) {
+                std::memcpy(task.recv_buf, incoming, BlockBytes(task));
+            }
             if (task.reduce_op == ReduceOp::AVG) {
                 Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
             }
@@ -229,10 +225,14 @@ bool CompleteAllreduce(PlanTask& task) {
         size_t chunk = task.chunk_size;
         char* data = static_cast<char*>(task.recv_buf);
         if (s.phase == kPhaseReduceScatter) {
-            size_t recv_count = ChunkElemCount(task.elem_count, chunk, AllreduceRecvChunk(task));
-            Utils::PerformReduce(s.temp_buffer.data(),
-                                 data + static_cast<size_t>(AllreduceRecvChunk(task)) * chunk * type_size, recv_count,
-                                 task.dtype, task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
+            size_t recv_chunk = AllreduceRecvChunk(task);
+            size_t recv_count = ChunkElemCount(task.elem_count, chunk, recv_chunk);
+            char* recv_ptr = data + recv_chunk * chunk * type_size;
+            Utils::PerformReduce(s.temp_buffer.data(), recv_ptr, recv_count, task.dtype,
+                                 task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
+            if (task.reduce_op == ReduceOp::AVG && s.step == task.world_size - 2) {
+                Utils::ApplyAverage(recv_ptr, recv_count, task.dtype, task.world_size);
+            }
         }
 
         ++s.step;
@@ -240,9 +240,6 @@ bool CompleteAllreduce(PlanTask& task) {
             s.phase = kPhaseAllGather;
             s.step = 0;
         } else if (s.phase == kPhaseAllGather && s.step >= task.world_size - 1) {
-            if (task.reduce_op == ReduceOp::AVG) {
-                Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
-            }
             s.phase = kPhaseDone;
             return true;
         }
@@ -558,8 +555,8 @@ bool TopologyRing::ReduceScatterInit(PlanTask& task) const noexcept {
         LOG_ERROR("Ring ReduceScatter received task without transports");
         return false;
     }
-    s.temp_buffer.resize((static_cast<size_t>(task.world_size) + 1) * BlockBytes(task));
-    PackInput(task);
+    s.temp_buffer.resize(BlockBytes(task));
+    std::memcpy(task.recv_buf, InputBlock(task, (task.rank - 1 + task.world_size) % task.world_size), BlockBytes(task));
     return BeginPhase(task, kPhaseExchange, ReduceScatterSendPtr(task), ReduceScatterRecvPtr(task), BlockBytes(task),
                       BlockBytes(task), "ReduceScatter") &&
            CompleteReduceScatter(task);

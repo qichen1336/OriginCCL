@@ -34,14 +34,15 @@
 
 | 操作 | 阶段与布局 |
 |------|------------|
-| AllReduce | 保留 ReduceScatter + AllGather 两阶段，支持原地；AVG 最后除一次 |
+| AllReduce | 保留 ReduceScatter + AllGather 两阶段，支持原地；AVG 在 RS→AG 边界仅对本 rank 完成块除一次 |
 | Broadcast | root 发起，非 root 收齐后转发，root 的前驱只接收 |
 | Reduce | root 的 next 发起部分结果，各节点合并自身输入后转发，root 最后归约；非 root 使用 scratch |
 | AllGather | 先复制本 rank 块，再执行 N-1 轮并发收发，recv_buf 按来源 rank 排列 |
-| ReduceScatter | 将 channel 的各目标块打包到 scratch，N-1 轮并发交换并归约；索引旋转保证最终持有本 rank 块 |
+| ReduceScatter | 滑动部分和：每轮发送当前累计块、接收 prev 的部分和并并入本 rank 对应的输入块；`recv_buf` 与 1 块 scratch 按 step 奇偶交替承担发/收，N-1 轮后结果落在 `recv_buf`；`send_buf` 保持只读 |
 
-Reduce 和 ReduceScatter 的 AVG 均先 SUM，再对最终输出除以 world_size；整数规则复用 `ApplyAverage`。
-临时数据只存于每个任务的 `state.temp_buffer`，不改写 `task.func/root`，不递归调用 communicator 或 executor。
+Reduce、ReduceScatter 与 AllReduce 的 AVG 均先按 SUM 归约，再对最终输出除以 world_size；整数规则复用 `ApplyAverage`。AllReduce 的除法在 ReduceScatter 最后一轮归约后立即对已完成的那个块执行（该块此后不再被接收覆盖，且正是 AllGather 的首发块），避免 AllGather 完成后再整块遍历一次。
+临时数据只存于每个任务的 `state.temp_buffer`（Reduce 2 块、ReduceScatter 1 块、AllReduce 1 个 chunk），不改写 `task.func/root`，不递归调用 communicator 或 executor。
+ReduceScatter 与 AllReduce 的 ReduceScatter 阶段同构：都只保留 1 个在途接收 scratch，不把 `send_buf` 的 N 个块整体打包；区别是 AllReduce 就地把累积块分散在 `recv_buf`，ReduceScatter 因输出只有 1 块，改用 `recv_buf` 与 scratch 按 step 奇偶交替充当「发送块 / 接收块」。
 
 ## 文件介绍
 
