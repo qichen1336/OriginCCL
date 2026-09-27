@@ -8,14 +8,8 @@
 #include <vector>
 #include <mpi.h>
 #include <fmt/format.h>
-#include "channel.h"
 #include "communicator.h"
 #include "logger.h"
-#include "topology.h"
-#include "transport/transport.h"
-#include "transport/transport_rdma.h"
-#include "transport/transport_shm.h"
-#include "transport/transport_tcp.h"
 
 namespace TestCommon {
 namespace {
@@ -334,10 +328,10 @@ const char* OpName(ReduceOp op) {
 
 std::string CaseId(const CaseSpec& spec) {
     if (spec.kind == CaseKind::ZeroCount) {
-        return fmt::format("{}|zero|ch{}", FuncName(spec.func), spec.channels);
+        return fmt::format("{}|zero", FuncName(spec.func));
     }
     if (spec.kind == CaseKind::ExpectFailure) {
-        return fmt::format("{}|invalid{}|root{}|ch{}", FuncName(spec.func), spec.invalid, spec.root, spec.channels);
+        return fmt::format("{}|invalid{}|root{}", FuncName(spec.func), spec.invalid, spec.root);
     }
     std::string id = fmt::format("{}-{}-{}", FuncName(spec.func), DtypeName(spec.dtype), spec.count);
     if (IsReduceFunc(spec.func)) {
@@ -349,7 +343,6 @@ std::string CaseId(const CaseSpec& spec) {
     if (spec.inplace) {
         id += "-inplace";
     }
-    id += fmt::format("-ch{}", spec.channels);
     return id;
 }
 
@@ -364,44 +357,11 @@ int ExpectedRanksPerMachine(int level, bool multi_machine) {
     return level == 0 ? 1 : (level == 1 ? 2 : 4);
 }
 
-std::vector<int> ChannelProfiles(int level) {
-    if (level == 0) {
-        return {4};
-    }
-    if (level == 1) {
-        return {4, 3};
-    }
-    return {4, 3, 1};
-}
-
-std::string EdgeReport::Summary() const {
-    if (!error.empty()) {
-        return error;
-    }
-    if (Total() == 0) {
-        return "no-data-plane";
-    }
-    if (shm == Total()) {
-        return "shm";
-    }
-    if (rdma == Total()) {
-        return "rdma";
-    }
-    if (tcp == Total()) {
-        return "tcp";
-    }
-    return fmt::format("mixed(shm={},tcp={},rdma={})", shm, tcp, rdma);
-}
-
-// One communicator is initialised per channel profile, so the cases are built per profile: the
-// first profile (n_channels = 4) carries the full matrix and the remaining profiles carry one
-// representative case per interface and dtype to cover the planner remainder path.
-std::vector<CaseSpec> BuildCases(int level, int channels) {
+// Cases are built per level: the full matrix of dtype/op/count combinations.
+std::vector<CaseSpec> BuildCases(int level) {
     const std::vector<size_t> counts = CaseCounts(level);
     const int world_size = ExpectedWorldSize(level);
     const std::vector<int> roots = CaseRoots(world_size);
-    const std::vector<int> profiles = ChannelProfiles(level);
-    const bool representative = channels != profiles.front();
 
     std::vector<CaseSpec> cases;
     size_t root_cursor = 0;
@@ -416,9 +376,7 @@ std::vector<CaseSpec> BuildCases(int level, int channels) {
                     continue;
                 }
                 std::vector<size_t> chosen;
-                if (representative) {
-                    chosen = {65536};
-                } else if (level == 0 && IsReduceFunc(func)) {
+                if (level == 0 && IsReduceFunc(func)) {
                     // Level 0 samples one count per (dtype, op) pair; the rotation still walks
                     // every dtype with every op.
                     chosen = {counts[(di + oi) % counts.size()]};
@@ -431,7 +389,6 @@ std::vector<CaseSpec> BuildCases(int level, int channels) {
                     spec.count = count;
                     spec.dtype = kDtypes[di];
                     spec.op = kOps[oi];
-                    spec.channels = channels;
                     if (func == CollFunc::Broadcast || func == CollFunc::Reduce) {
                         spec.root = roots[root_cursor % roots.size()];
                         ++root_cursor;
@@ -445,11 +402,10 @@ std::vector<CaseSpec> BuildCases(int level, int channels) {
     return cases;
 }
 
-// Contract cases run once per binary, on the first channel profile: an empty operation and the
-// tasks the ring must reject before it touches the network.
+// Contract cases run once per binary: an empty operation and the tasks the ring must reject
+// before it touches the network.
 std::vector<CaseSpec> BuildContractCases(int level) {
     const int world_size = ExpectedWorldSize(level);
-    const int channels = ChannelProfiles(level).front();
     const CollFunc funcs[5] = {CollFunc::AllReduce, CollFunc::Broadcast, CollFunc::AllGather, CollFunc::Reduce,
                                CollFunc::ReduceScatter};
 
@@ -457,7 +413,6 @@ std::vector<CaseSpec> BuildContractCases(int level) {
     CaseSpec zero;
     zero.kind = CaseKind::ZeroCount;
     zero.count = 0;
-    zero.channels = channels;
     for (CollFunc func : funcs) {
         zero.func = func;
         cases.push_back(zero);
@@ -545,10 +500,9 @@ void PrintUsage(const char* program) {
                "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 1 1024 10240 65536\n"
                "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 1024 10240 65536\n"
                "\n"
-               "Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations\n"
-               "and the n_channels=3 remainder profile; level 2 runs the full legal core set\n"
-               "plus n_channels=3 and n_channels=1. Multi machine groups ranks by a logical\n"
-               "hostname, so it never leaves one physical host.\n",
+               "Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations;\n"
+               "level 2 runs the full legal core set. All suites use four channels. Multi machine\n"
+               "groups ranks by a logical hostname, so it never leaves one physical host.\n",
                program, program);
 }
 
@@ -566,126 +520,13 @@ bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int worl
     return comm.Init(config);
 }
 
-EdgeReport InspectTransports(const Communicator& comm, const std::string& expected) {
-    EdgeReport report;
-    int local_shm = 0;
-    int local_other = 0;
-    int remote_tcp = 0;
-    int remote_rdma = 0;
-    int remote_shm = 0;
-
-    const std::vector<int>& local_ranks = comm.GetLocalRanks();
-    const auto is_local = [&local_ranks](int peer) {
-        return std::find(local_ranks.begin(), local_ranks.end(), peer) != local_ranks.end();
-    };
-
-    for (int channel_id = 0; channel_id < comm.GetNChannels(); ++channel_id) {
-        const Channel& channel = comm.GetChannel(channel_id);
-        // Only the two ring edges of a channel are connected: send to ring.next and recv from
-        // ring.prev. The other slots stay empty and must not be counted or required.
-        for (int peer : {channel.ring.next}) {
-            const Connector* connector = channel.send.empty()
-                                             ? nullptr
-                                             : (peer >= 0 && static_cast<size_t>(peer) < channel.send.size()
-                                                    ? &channel.send[static_cast<size_t>(peer)]
-                                                    : nullptr);
-            if (connector == nullptr || !connector->transport) {
-                report.error = fmt::format("channel {} has no send edge to its ring successor {}", channel_id, peer);
-                return report;
-            }
-            if (connector->transport->GetDirection() != TransportDirection::Send) {
-                report.error = fmt::format("channel {} send edge to peer {} is not marked Send", channel_id, peer);
-                return report;
-            }
-            if (dynamic_cast<const TransportShm*>(connector->transport.get()) != nullptr) {
-                ++report.shm;
-                is_local(peer) ? ++local_shm : ++remote_shm;
-            } else if (dynamic_cast<const TransportRDMA*>(connector->transport.get()) != nullptr) {
-                ++report.rdma;
-                is_local(peer) ? ++local_other : ++remote_rdma;
-            } else if (dynamic_cast<const TransportTCP*>(connector->transport.get()) != nullptr) {
-                ++report.tcp;
-                is_local(peer) ? ++local_other : ++remote_tcp;
-            } else {
-                report.error =
-                    fmt::format("channel {} send edge to peer {} has an unknown transport", channel_id, peer);
-                return report;
-            }
-        }
-        for (int peer : {channel.ring.prev}) {
-            const Connector* connector = channel.recv.empty()
-                                             ? nullptr
-                                             : (peer >= 0 && static_cast<size_t>(peer) < channel.recv.size()
-                                                    ? &channel.recv[static_cast<size_t>(peer)]
-                                                    : nullptr);
-            if (connector == nullptr || !connector->transport) {
-                report.error =
-                    fmt::format("channel {} has no recv edge from its ring predecessor {}", channel_id, peer);
-                return report;
-            }
-            if (connector->transport->GetDirection() != TransportDirection::Receive) {
-                report.error = fmt::format("channel {} recv edge from peer {} is not marked Receive", channel_id, peer);
-                return report;
-            }
-            if (connector->transport->GetFd() < 0) {
-                report.error =
-                    fmt::format("channel {} recv edge from peer {} has no ready descriptor", channel_id, peer);
-                return report;
-            }
-            const Connector* send_edge = channel.send.empty() || static_cast<size_t>(peer) >= channel.send.size()
-                                             ? nullptr
-                                             : &channel.send[static_cast<size_t>(peer)];
-            if (send_edge != nullptr && send_edge->transport &&
-                send_edge->transport->GetFd() == connector->transport->GetFd()) {
-                report.error =
-                    fmt::format("channel {} peer {} shares one descriptor between send and recv", channel_id, peer);
-                return report;
-            }
-        }
-    }
-
-    if (report.Total() == 0) {
-        report.error = "no data-plane edge was established";
-        return report;
-    }
-    if (expected == "all-shm") {
-        if (report.shm != report.Total()) {
-            report.error = fmt::format("expected every edge to be shared memory, got {}", report.Summary());
-        }
-        return report;
-    }
-    if (expected == "network") {
-        // One rank per machine: there is no same-machine edge at all, so every edge must be on
-        // the same network transport.
-        if (report.shm != 0) {
-            report.error = fmt::format("expected no shared-memory edge, got {}", report.Summary());
-        } else if ((report.tcp == 0) == (report.rdma == 0)) {
-            report.error = fmt::format("expected one network transport for every edge, got {}", report.Summary());
-        }
-        return report;
-    }
-    if (expected == "split") {
-        // Same-machine edges must stay on shared memory; every cross-machine edge must use the
-        // same network transport, because the transport is a cluster-wide decision.
-        if (local_shm == 0 || remote_shm != 0 || local_other != 0) {
-            report.error = fmt::format("expected shared memory only on same-machine edges, got {}", report.Summary());
-            return report;
-        }
-        if ((remote_tcp == 0) == (remote_rdma == 0)) {
-            report.error =
-                fmt::format("expected one network transport for every cross-machine edge, got {}", report.Summary());
-        }
-    }
-    return report;
-}
-
 void ReportOutcome(const std::string& report_path, const std::string& suite, int rank, int world_size,
-                   const std::string& status, const std::string& transport, const std::string& reason,
+                   const std::string& status, const std::string& reason,
                    const std::vector<std::string>& failures) {
     std::string json = fmt::format(
-        "{{\"suite\":\"{}\",\"rank\":{},\"world_size\":{},\"status\":\"{}\",\"transport\":\"{}\",\"reason\":\"{}\","
+        "{{\"suite\":\"{}\",\"rank\":{},\"world_size\":{},\"status\":\"{}\",\"reason\":\"{}\","
         "\"failures\":[",
-        JsonEscape(suite), rank, world_size, JsonEscape(status), JsonEscape(transport), JsonEscape(reason));
+        JsonEscape(suite), rank, world_size, JsonEscape(status), JsonEscape(reason));
     for (size_t i = 0; i < failures.size(); ++i) {
         json += fmt::format("{}\"{}\"", i == 0 ? "" : ",", JsonEscape(failures[i]));
     }
@@ -706,9 +547,8 @@ void ReportOutcome(const std::string& report_path, const std::string& suite, int
     std::fclose(file);
 }
 
-Runner::Runner(Communicator& comm, std::string suite, int level, std::string report_path, std::string transport)
-    : comm_(comm), suite_(std::move(suite)), level_(level), report_path_(std::move(report_path)),
-      transport_(std::move(transport)) {}
+Runner::Runner(Communicator& comm, std::string suite, int level, std::string report_path)
+    : comm_(comm), suite_(std::move(suite)), level_(level), report_path_(std::move(report_path)) {}
 
 void Runner::Skip(const std::string& reason) {
     skip_reason_ = reason;
@@ -746,9 +586,6 @@ bool Runner::RunCase(const CaseSpec& spec, std::string& reason) {
 }
 
 bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason) {
-    const int rank = comm.GetRank();
-    const int world_size = comm.GetWorldSize();
-
     if (spec.kind == CaseKind::ZeroCount) {
         bool ok = false;
         switch (spec.func) {
@@ -774,27 +611,33 @@ bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason) {
         return ok;
     }
 
+    // The invalid cases stay black box: a missing buffer passes nothing, an out-of-range root
+    // passes a valid buffer so that the root check is the one that must reject it.
     if (spec.kind == CaseKind::ExpectFailure) {
-        const std::shared_ptr<Topology> topology = comm.GetTopology();
-        if (!topology) {
-            reason = "the communicator has no topology";
-            return false;
+        double storage = 0.0;
+        void* buffer = spec.invalid == 1 ? nullptr : &storage;
+        bool succeeded = false;
+        switch (spec.func) {
+        case CollFunc::AllReduce:
+            succeeded = comm.AllReduce(buffer, buffer, spec.count, spec.dtype, spec.op);
+            break;
+        case CollFunc::Broadcast:
+            succeeded = comm.Broadcast(buffer, spec.count, spec.dtype, spec.root);
+            break;
+        case CollFunc::AllGather:
+            succeeded = comm.AllGather(buffer, buffer, spec.count, spec.dtype);
+            break;
+        case CollFunc::Reduce:
+            succeeded = comm.Reduce(buffer, buffer, spec.count, spec.dtype, spec.op, spec.root);
+            break;
+        case CollFunc::ReduceScatter:
+            succeeded = comm.ReduceScatter(buffer, buffer, spec.count, spec.dtype, spec.op);
+            break;
         }
-        PlanTask task;
-        task.func = spec.func;
-        task.world_size = world_size;
-        task.rank = rank;
-        task.elem_count = spec.count;
-        task.dtype = spec.dtype;
-        task.reduce_op = spec.op;
-        task.root = spec.root;
-        task.recv_buf = nullptr;
-        task.send_buf = nullptr;
-        const bool accepted = topology->CollectiveInit(task);
-        if (accepted) {
+        if (succeeded) {
             reason = "an invalid task must be rejected";
         }
-        return !accepted;
+        return !succeeded;
     }
 
     switch (spec.dtype) {
@@ -814,7 +657,7 @@ bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason) {
 void Runner::Finish() {
     const std::string status = !skip_reason_.empty() ? "SKIP" : (cases_failed_ == 0 ? "PASS" : "FAIL");
     const std::string reason = !skip_reason_.empty() ? skip_reason_ : JoinFailures(failures_);
-    ReportOutcome(report_path_, suite_, comm_.GetRank(), comm_.GetWorldSize(), status, transport_, reason, failures_);
+    ReportOutcome(report_path_, suite_, comm_.GetRank(), comm_.GetWorldSize(), status, reason, failures_);
     LOG_INFO("Rank {}: suite {} {} ({} cases, {} failed)", comm_.GetRank(), suite_, status, cases_total_,
              cases_failed_);
 }

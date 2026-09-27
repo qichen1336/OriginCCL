@@ -54,8 +54,8 @@ Levels (counts are elements per rank):
   0  single machine 4 ranks       multi machine 4x1 ranks  counts 1 1024 10240
   1  single machine 8 ranks       multi machine 4x2 ranks  counts 1 1024 10240 65536
   2  single machine 32 ranks      multi machine 8x4 ranks  counts 1024 10240 65536
-Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations and the
-n_channels=3 profile; level 2 runs the full legal core set plus n_channels=3 and 1.
+Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations; level 2
+runs the full legal core set. All suites use four channels.
 
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or

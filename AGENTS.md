@@ -62,15 +62,14 @@ scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,10240}；等级 1 = 8 rank / 4×2 / 加 65536；等级 2 = 32 rank / 8×4 / 同等级 1 的 count。等级 0 每个接口遍历全部 dtype、op、count；等级 1 补齐两两组合与 `n_channels=3`；等级 2 跑完整合法核心集并加 `n_channels=1`。
-- **只覆盖 polling 与 epoll**（`--executor all` 即这两个）；另外两个 executor 的实现仍在库里，但不在本矩阵内。
+- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,10240}；等级 1 = 8 rank / 4×2 / 加 65536；等级 2 = 32 rank / 8×4 / 同等级 1 的 count。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（三个 count 间轮转），非 reduce 类遍历全部 dtype×count；
 - **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
-- **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP，并把实际路径写进报告。
+- **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
 - **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败、sanitizer 报错或超时 / `2` 只剩 SKIP / `3` 覆盖率报告生成失败 / `4` 参数非法。
 - 五个测试入口：
-  - `test_single_machine`：真实单机的 rank 视角（`local_rank`/`local_size`/`local_ranks`/`is_single_machine`）、每边必须是共享内存，以及全量集合用例。
-  - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 local 视角、**每条环边（`ring.prev`/`ring.next`）的具体传输类型**（同机 SHM、跨机统一 RDMA 或 TCP，且单边 fd 独立）与全量集合用例。
+  - `test_single_machine`：真实单机，断言 `is_single_machine` / `local_size` / `local_rank`，再跑集合用例矩阵。
+  - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。
   - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
   - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
 - `--profile asan-ubsan` 是必跑的动态检查档（`--profile all` 含它）；`--profile coverage` 出 gcovr/lcov/gcov 报告。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。

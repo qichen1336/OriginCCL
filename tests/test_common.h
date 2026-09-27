@@ -22,7 +22,6 @@ struct CaseSpec {
     DataType dtype = DataType::FLOAT32;
     ReduceOp op = ReduceOp::SUM;
     int root = 0;
-    int channels = 4;
     bool inplace = false;
     CaseKind kind = CaseKind::Normal;
     // 0 = not invalid, 1 = missing buffer, 2 = out-of-range root.
@@ -36,24 +35,6 @@ struct TestOptions {
     std::string report_path;
 };
 
-struct EdgeReport {
-    int shm = 0;
-    int tcp = 0;
-    int rdma = 0;
-    std::string error;
-
-    bool Ok() const {
-        return error.empty();
-    }
-    int Total() const {
-        return shm + tcp + rdma;
-    }
-    bool NetworkUniform() const {
-        return tcp == 0 || rdma == 0;
-    }
-    std::string Summary() const;
-};
-
 const char* FuncName(CollFunc func);
 const char* DtypeName(DataType dtype);
 const char* OpName(ReduceOp op);
@@ -64,23 +45,21 @@ void PrintUsage(const char* program);
 
 int ExpectedWorldSize(int level);
 int ExpectedRanksPerMachine(int level, bool multi_machine);
-std::vector<int> ChannelProfiles(int level);
-std::vector<CaseSpec> BuildCases(int level, int channels);
+std::vector<CaseSpec> BuildCases(int level);
 std::vector<CaseSpec> BuildContractCases(int level);
 std::string CaseListDigest(const std::vector<CaseSpec>& cases);
 
 bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int world_size);
-EdgeReport InspectTransports(const Communicator& comm, const std::string& expected);
 
 bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason);
 
 void ReportOutcome(const std::string& report_path, const std::string& suite, int rank, int world_size,
-                   const std::string& status, const std::string& transport, const std::string& reason,
+                   const std::string& status, const std::string& reason,
                    const std::vector<std::string>& failures);
 
 class Runner {
 public:
-    Runner(Communicator& comm, std::string suite, int level, std::string report_path, std::string transport);
+    Runner(Communicator& comm, std::string suite, int level, std::string report_path);
 
     void Run(const std::vector<CaseSpec>& cases);
     void Skip(const std::string& reason);
@@ -97,7 +76,6 @@ private:
     std::string suite_;
     int level_ = 0;
     std::string report_path_;
-    std::string transport_;
     std::vector<std::string> failures_;
     size_t cases_total_ = 0;
     size_t cases_failed_ = 0;

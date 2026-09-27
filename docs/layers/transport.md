@@ -67,4 +67,4 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - **`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ**：直接 poll CQ 不重新 arm 会在 EPOLLET 下漏边沿。
 - **RDMA 地址必须由 `Probe` 从设备的 IPv4-mapped GID 得出**，不能复用 `Utils::GetLocalIPAddress()` 结果。
 - 环容量固定 2 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
-- 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的三个 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP，并把实际路径写进报告（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度）。
+- 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的三个 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度），但只做黑盒接口断言，不检查具体传输类型。

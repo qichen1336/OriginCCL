@@ -29,8 +29,8 @@ scripts/run_tests.sh --level 0 --executor all --profile all -j 2 --oversubscribe
 | 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
 | --- | --- | --- | --- | --- |
 | 0 | 4 rank | 4 机 × 1 rank | 1、1024、10240 | 每个接口遍历全部 dtype / op / count |
-| 1 | 8 rank | 4 机 × 2 rank | 加 65536 | 补齐 dtype/op/count 两两组合 + `n_channels=3` |
-| 2 | 32 rank | 8 机 × 4 rank | 同等级 1 | 完整合法核心集 + `n_channels=3` 与 `1` |
+| 1 | 8 rank | 4 机 × 2 rank | 加 65536 | 补齐 dtype/op/count 两两组合 |
+| 2 | 32 rank | 8 机 × 4 rank | 同等级 1 | 完整合法核心集 |
 
 ```bash
 # 需要足够核数，或加 --oversubscribe：
@@ -41,7 +41,7 @@ scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
 - `--profile all` 顺序跑三种档位：普通构建、**ASan+UBSan**、coverage（gcovr，缺失时回退 lcov / gcov 文本）。
 - 只覆盖 **polling** 与 **epoll** 两个 executor（`--executor all` 即这两个）。
 - **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
-- `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，报告记录实际路径。
+- `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。
 - 无可用 RDMA 设备时 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `3` 报告生成失败 / `4` 参数非法。
 
 查看某一等级的完整用例矩阵（需先构建一次）：
