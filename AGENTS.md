@@ -31,7 +31,7 @@ src/executor/              四种 executor 实现
 src/transport/             TCP、共享内存与 RDMA 传输实现
 tests/                     五个测试入口 + test_common / transport_check 共享支持
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
-scripts/                   run_tests.sh（唯一入口）/ coverage_report.sh
+scripts/                   run_tests.sh（唯一入口）
 ```
 
 | 层 | 头文件 | 职责 | 铁律 |
@@ -55,24 +55,27 @@ scripts/                   run_tests.sh（唯一入口）/ coverage_report.sh
 
 ```bash
 # 入口只有一个：run_tests.sh（-h 有完整说明）。等级 0 是本机可跑的最小档。
-scripts/run_tests.sh --level 0 --executor all --profile all -j 2 --oversubscribe
-scripts/run_tests.sh --level 1 --executor all --profile all -j 2 --oversubscribe
-scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
+# --executor all 即 polling,epoll。
+scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe
+scripts/run_tests.sh --level 1 --executor all -j 2 --oversubscribe
+scripts/run_tests.sh --level 2 --executor all -j 2 --oversubscribe
 # 查看某一等级的完整用例矩阵（需先构建一次）：
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,10240}；等级 1 = 8 rank / 4×2 / 加 65536；等级 2 = 32 rank / 8×4 / 同等级 1 的 count。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（三个 count 间轮转），非 reduce 类遍历全部 dtype×count；
+- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,8192}；等级 1 = 8 rank / 4×2 / count {8192,32768,65536}；等级 2 = 32 rank / 8×4 / count {8192,32768,65536}。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（三个 count 间轮转），非 reduce 类遍历全部 dtype×count；
+- **只覆盖 polling 与 epoll 两个 executor**（`--executor all` 即这两个，脚本的 `validate_list` 已限定）。`reactor` / `multi_thread` 的实现仍在库里，可 `cmake -DOCCL_EXECUTOR=<name>` 构建（CMake 默认 `multi_thread`），但不在本矩阵内。
 - **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
 - **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
 - **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
-- 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败、sanitizer 报错或超时 / `2` 只剩 SKIP / `3` 覆盖率报告生成失败 / `4` 参数非法。
+- 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
+- 等级2消耗资源较多，尽可能避免自行测试。
 - 五个测试入口：
   - `test_single_machine`：真实单机，断言 `is_single_machine` / `local_size` / `local_rank`，再跑集合用例矩阵。
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。
   - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
   - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
-- `--profile asan-ubsan` 是必跑的动态检查档（`--profile all` 含它）；`--profile coverage` 出 gcovr/lcov/gcov 报告。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
+- 脚本自带 polling/epoll 矩阵。如果通过脚本运行其他两个 executor 或 sanitizer（asan-ubsan）、覆盖率，需要自己配 CMake 构建。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
 
 ## commit rules
 - **提交comment**：简短、小写、朴素英文 —— `add fmt`、`modify channels`、`root ip and port from env`。

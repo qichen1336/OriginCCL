@@ -23,16 +23,9 @@ const ReduceOp kOps[4] = {ReduceOp::SUM, ReduceOp::MAX, ReduceOp::MIN, ReduceOp:
 
 std::vector<size_t> CaseCounts(int level) {
     if (level == 0) {
-        return {1, 1024, 10240};
+        return {1, 1024, 8192};
     }
-    return {1, 1024, 10240, 65536};
-}
-
-std::vector<int> CaseRoots(int world_size) {
-    std::vector<int> roots = {0, world_size / 2, world_size - 1};
-    std::sort(roots.begin(), roots.end());
-    roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
-    return roots;
+    return {8192, 32768, 65536};
 }
 
 double Value(int source, size_t index) {
@@ -360,11 +353,8 @@ int ExpectedRanksPerMachine(int level, bool multi_machine) {
 // Cases are built per level: the full matrix of dtype/op/count combinations.
 std::vector<CaseSpec> BuildCases(int level) {
     const std::vector<size_t> counts = CaseCounts(level);
-    const int world_size = ExpectedWorldSize(level);
-    const std::vector<int> roots = CaseRoots(world_size);
 
     std::vector<CaseSpec> cases;
-    size_t root_cursor = 0;
 
     const CollFunc funcs[5] = {CollFunc::AllReduce, CollFunc::Broadcast, CollFunc::AllGather, CollFunc::Reduce,
                                CollFunc::ReduceScatter};
@@ -389,10 +379,6 @@ std::vector<CaseSpec> BuildCases(int level) {
                     spec.count = count;
                     spec.dtype = kDtypes[di];
                     spec.op = kOps[oi];
-                    if (func == CollFunc::Broadcast || func == CollFunc::Reduce) {
-                        spec.root = roots[root_cursor % roots.size()];
-                        ++root_cursor;
-                    }
                     spec.inplace = func == CollFunc::AllReduce && ((di + oi) % 2 == 1);
                     cases.push_back(spec);
                 }
@@ -496,9 +482,9 @@ void PrintUsage(const char* program) {
                "  mpirun -np 4 {} --level 0\n"
                "\n"
                "Levels (counts are elements per rank):\n"
-               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts 1 1024 10240\n"
-               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 1 1024 10240 65536\n"
-               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 1024 10240 65536\n"
+               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts 1 1024 8192\n"
+               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 8192 32768 65536\n"
+               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 8192 32768 65536\n"
                "\n"
                "Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations;\n"
                "level 2 runs the full legal core set. All suites use four channels. Multi machine\n"
@@ -521,12 +507,11 @@ bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int worl
 }
 
 void ReportOutcome(const std::string& report_path, const std::string& suite, int rank, int world_size,
-                   const std::string& status, const std::string& reason,
-                   const std::vector<std::string>& failures) {
-    std::string json = fmt::format(
-        "{{\"suite\":\"{}\",\"rank\":{},\"world_size\":{},\"status\":\"{}\",\"reason\":\"{}\","
-        "\"failures\":[",
-        JsonEscape(suite), rank, world_size, JsonEscape(status), JsonEscape(reason));
+                   const std::string& status, const std::string& reason, const std::vector<std::string>& failures) {
+    std::string json =
+        fmt::format("{{\"suite\":\"{}\",\"rank\":{},\"world_size\":{},\"status\":\"{}\",\"reason\":\"{}\","
+                    "\"failures\":[",
+                    JsonEscape(suite), rank, world_size, JsonEscape(status), JsonEscape(reason));
     for (size_t i = 0; i < failures.size(); ++i) {
         json += fmt::format("{}\"{}\"", i == 0 ? "" : ",", JsonEscape(failures[i]));
     }

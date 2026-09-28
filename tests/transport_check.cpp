@@ -256,7 +256,9 @@ bool CheckBoundaries(const Setup& setup, int rank, Transport& local, bool local_
 bool CheckBackpressure(const Setup& setup, int rank, Transport& local, bool local_producer, std::vector<char>& payload,
                        std::vector<char>& received) {
     if (!setup.fixed_poll_events) {
-        const int buffer_size = 32 * 1024;
+        // 64 KiB is the smallest window that stalls well short of kStallSize without a
+        // collapsing receive window: at 32 KiB every reopen waits out a 200ms probe.
+        const int buffer_size = 64 * 1024;
         if (setsockopt(local.GetFd(), SOL_SOCKET, local_producer ? SO_SNDBUF : SO_RCVBUF, &buffer_size,
                        sizeof(buffer_size)) != 0) {
             return Fail(setup, rank, "could not bound the TCP socket buffer", strerror(errno));

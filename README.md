@@ -21,28 +21,27 @@ cmake --build build -j"$(nproc)"
 ```bash
 scripts/run_tests.sh -h
 # 本机可跑的最小档（单机 4 rank、模拟多机 4×1、三种传输、集合用例）：
-scripts/run_tests.sh --level 0 --executor all --profile all -j 2 --oversubscribe
+scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe
 ```
 
 等级决定进程布局与数据量：
 
 | 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
 | --- | --- | --- | --- | --- |
-| 0 | 4 rank | 4 机 × 1 rank | 1、1024、10240 | 每个接口遍历全部 dtype / op / count |
-| 1 | 8 rank | 4 机 × 2 rank | 加 65536 | 补齐 dtype/op/count 两两组合 |
-| 2 | 32 rank | 8 机 × 4 rank | 同等级 1 | 完整合法核心集 |
+| 0 | 4 rank | 4 机 × 1 rank | 1、1024、8192 | 每个接口遍历全部 dtype / op / count |
+| 1 | 8 rank | 4 机 × 2 rank | 8192、32768、65536 | 补齐 dtype/op/count 两两组合 |
+| 2 | 32 rank | 8 机 × 4 rank | 8192、32768、65536 | 完整合法核心集 |
 
 ```bash
 # 需要足够核数，或加 --oversubscribe：
-scripts/run_tests.sh --level 1 --executor all --profile all -j 2 --oversubscribe
-scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
+scripts/run_tests.sh --level 1 --executor all -j 2 --oversubscribe
+scripts/run_tests.sh --level 2 --executor all -j 2 --oversubscribe
 ```
 
-- `--profile all` 顺序跑三种档位：普通构建、**ASan+UBSan**、coverage（gcovr，缺失时回退 lcov / gcov 文本）。
 - 只覆盖 **polling** 与 **epoll** 两个 executor（`--executor all` 即这两个）。
 - **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
 - `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。
-- 无可用 RDMA 设备时 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `3` 报告生成失败 / `4` 参数非法。
+- 无可用 RDMA 设备时 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
 
 查看某一等级的完整用例矩阵（需先构建一次）：
 
@@ -50,6 +49,6 @@ scripts/run_tests.sh --level 2 --executor all --profile all -j 2 --oversubscribe
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-五个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`。用例生成与结果校验在 `tests/test_common.*`，三种传输共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总，`coverage/` 覆盖率）。
+五个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`。用例生成与结果校验在 `tests/test_common.*`，三种传输共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
 
-sanitizer 能发现内存与未定义行为风险，但覆盖不到 RDMA DMA 与跨进程共享内存竞态，因此完整数据比对、边界尺寸与就绪活性测试是必要补充。
+集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。

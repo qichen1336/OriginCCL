@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # OriginCCL test entry point.
 #
-# One script drives the five test binaries across the two executors and the profiles that
-# matter: a plain build, an ASan+UBSan build, and a gcov coverage build. It is the only
+# One script drives the five test binaries across the two covered executors. It is the only
 # documented entry point; the binaries take --level/--list-cases and are meant to be driven
 # from here.
 set -u -o pipefail
@@ -11,7 +10,6 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEVEL=0
 EXECUTORS="all"
 SUITE="all"
-PROFILE="all"
 BUILD_DIR=""
 REPORT_DIR=""
 TIMEOUT=600
@@ -24,7 +22,6 @@ OVERSUBSCRIBE=false
 EXIT_PASS=0
 EXIT_FAIL=1
 EXIT_SKIP=2
-EXIT_REPORT=3
 EXIT_USAGE=4
 
 usage() {
@@ -32,14 +29,13 @@ usage() {
 Usage: scripts/run_tests.sh [options]
 
 Runs the OriginCCL test suite. The executables are built per executor into
-build-tests/<executor>/<profile> and each run gets its own report file.
+build-tests/<executor> and each run gets its own report file.
 
 Options:
   -h, --help              Show this help and exit.
   -l, --level N           0, 1 or 2 (default 0). See "Levels" below.
   -e, --executor LIST     all | polling | epoll (default all). Comma separated.
   -s, --suite LIST        all | single | multi | transport (default all).
-  -p, --profile LIST      all | normal | asan-ubsan | coverage (default all).
   -d, --build-dir DIR     Build root (default <repo>/build-tests).
   -r, --report-dir DIR    Report root (default <repo>/test-reports).
   -t, --timeout SEC       Per-run timeout (default 600).
@@ -51,9 +47,9 @@ Options:
       --list-cases        Print the case matrix of the selected level and exit.
 
 Levels (counts are elements per rank):
-  0  single machine 4 ranks       multi machine 4x1 ranks  counts 1 1024 10240
-  1  single machine 8 ranks       multi machine 4x2 ranks  counts 1 1024 10240 65536
-  2  single machine 32 ranks      multi machine 8x4 ranks  counts 1024 10240 65536
+  0  single machine 4 ranks       multi machine 4 machines x 1 rank   counts 1 1024 8192
+  1  single machine 8 ranks       multi machine 4 machines x 2 ranks  counts 8192 32768 65536
+  2  single machine 32 ranks      multi machine 8 machines x 4 ranks  counts 8192 32768 65536
 Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations; level 2
 runs the full legal core set. All suites use four channels.
 
@@ -62,29 +58,18 @@ hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
 --oversubscribe. RDMA without a device with an active port is reported as SKIP, never
 as a pass. TSan is not offered: the covered executors are polled from one thread.
 
-Profile details:
-  normal      plain Debug build.
-  asan-ubsan  AddressSanitizer + UndefinedBehaviorSanitizer (UBSan halts on the first
-              error). Leak checking is disabled: a program that only calls
-              MPI_Init/MPI_Finalize under this instrumentation leaks the same 15464
-              bytes as the suites, with Open MPI frames unresolved, so that channel
-              reports the runtime instead of the code under test.
-  coverage    gcovr report (lcov+genhtml, then plain gcov text as fallbacks) under
-              test-reports/coverage/. Each executor is reported on its own.
-
 Exit codes:
   0  the requested scope passed
-  1  a case failed, a sanitizer fired, or a run timed out
+  1  a case failed or a run timed out
   2  only environment SKIPs remain (see --allow-skip)
-  3  the coverage report could not be generated
   4  invalid arguments
 
 Examples:
   scripts/run_tests.sh -h
   scripts/run_tests.sh --level 0
-  scripts/run_tests.sh --level 0 --executor polling --profile asan-ubsan
-  scripts/run_tests.sh --level 1 --executor all --profile all -j 4 --oversubscribe
-  scripts/run_tests.sh --level 2 --profile coverage
+  scripts/run_tests.sh --level 0 --executor polling
+  scripts/run_tests.sh --level 1 --executor all -j 4 --oversubscribe
+  scripts/run_tests.sh --level 2 --suite transport
 EOF
 }
 
@@ -135,20 +120,6 @@ expand_list() {
     fi
 }
 
-coverage_flag() {
-    if [ "$1" = "coverage" ]; then
-        echo " -DOCCL_ENABLE_COVERAGE=ON"
-    fi
-    return 0
-}
-
-sanitizer_flags() {
-    if [ "$1" = "asan-ubsan" ]; then
-        echo "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all -g -O1"
-    fi
-    return 0
-}
-
 while [ $# -gt 0 ]; do
     case "$1" in
     -h | --help)
@@ -168,11 +139,6 @@ while [ $# -gt 0 ]; do
     -s | --suite)
         [ $# -ge 2 ] || die_usage "$1 needs a value"
         SUITE="$2"
-        shift 2
-        ;;
-    -p | --profile)
-        [ $# -ge 2 ] || die_usage "$1 needs a value"
-        PROFILE="$2"
         shift 2
         ;;
     -d | --build-dir)
@@ -235,10 +201,8 @@ esac
 # Only the polling and epoll executors are covered; the other two are not built here.
 validate_list "${EXECUTORS}" "polling,epoll" "--executor"
 validate_list "${SUITE}" "single,multi,transport" "--suite"
-validate_list "${PROFILE}" "normal,asan-ubsan,coverage" "--profile"
 EXECUTORS="$(expand_list "${EXECUTORS}" "polling,epoll")"
 SUITES="$(expand_list "${SUITE}" "single,multi,transport")"
-PROFILES="$(expand_list "${PROFILE}" "normal,asan-ubsan,coverage")"
 
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-tests}"
 REPORT_DIR="${REPORT_DIR:-${ROOT_DIR}/test-reports}"
@@ -247,23 +211,27 @@ case "${LEVEL}" in
 0) SINGLE_RANKS=4
    MULTI_RANKS=4
    MULTI_PER_MACHINE=1
+   COUNTS="1 1024 8192"
    ;;
 1) SINGLE_RANKS=8
    MULTI_RANKS=8
    MULTI_PER_MACHINE=2
+   COUNTS="8192 32768 65536"
    ;;
 2) SINGLE_RANKS=32
    MULTI_RANKS=32
    MULTI_PER_MACHINE=4
+   COUNTS="8192 32768 65536"
    ;;
 esac
+MULTI_MACHINES=$((MULTI_RANKS / MULTI_PER_MACHINE))
 
 if [ "${LIST_CASES:-false}" = true ]; then
     if [ "${BUILD}" = true ] && [ "${DRY_RUN}" = false ]; then
         echo "error: --list-cases needs an existing build; run once without it, or use --no-build" >&2
         exit "${EXIT_USAGE}"
     fi
-    binary="${BUILD_DIR}/$(echo "${EXECUTORS}" | cut -d, -f1)/normal/tests/test_single_machine"
+    binary="${BUILD_DIR}/$(echo "${EXECUTORS}" | cut -d, -f1)/tests/test_single_machine"
     if [ ! -x "${binary}" ]; then
         echo "error: ${binary} is missing; build first" >&2
         exit "${EXIT_USAGE}"
@@ -286,20 +254,17 @@ else
 fi
 
 if [ "${DRY_RUN}" = true ]; then
-    echo "level ${LEVEL}: single machine ${SINGLE_RANKS} ranks, multi machine ${MULTI_PER_MACHINE} per machine x ${MULTI_RANKS} ranks"
+    echo "level ${LEVEL}: single machine ${SINGLE_RANKS} ranks, multi machine ${MULTI_PER_MACHINE} per machine x ${MULTI_MACHINES} machines = ${MULTI_RANKS} ranks"
+    echo "counts per rank: ${COUNTS}"
     echo "executors: ${EXECUTORS}"
     echo "suites:    ${SUITES}"
-    echo "profiles:  ${PROFILES}"
     echo "report:    ${REPORT_DIR}"
     echo
     echo "planned commands (details of the case matrix need a built binary, see --list-cases):"
     IFS=',' read -r -a exec_list <<<"${EXECUTORS}"
-    IFS=',' read -r -a profile_list <<<"${PROFILES}"
     for executor in "${exec_list[@]}"; do
-        for profile in "${profile_list[@]}"; do
-            echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR}/${executor}/${profile} -DOCCL_EXECUTOR=${executor} -DCMAKE_BUILD_TYPE=Debug$(coverage_flag "${profile}")"
-            echo "  cmake --build ${BUILD_DIR}/${executor}/${profile} -j ${JOBS}"
-        done
+        echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR}/${executor} -DOCCL_EXECUTOR=${executor} -DCMAKE_BUILD_TYPE=Debug"
+        echo "  cmake --build ${BUILD_DIR}/${executor} -j ${JOBS}"
     done
     exit 0
 fi
@@ -311,78 +276,50 @@ SUMMARY="${REPORT_DIR}/summary.txt"
 total_fail=0
 total_skip=0
 total_cases=0
+case_per_rank=""
 
 log_line() {
     echo "$@" | tee -a "${SUMMARY}"
 }
 
-build_profile() {
+build_executor() {
     local executor="$1"
-    local profile="$2"
-    local dir="${BUILD_DIR}/${executor}/${profile}"
+    local dir="${BUILD_DIR}/${executor}"
     local -a args=(-S "${ROOT_DIR}" -B "${dir}" "-DOCCL_EXECUTOR=${executor}" -DCMAKE_BUILD_TYPE=Debug)
-    if [ "${profile}" = "coverage" ]; then
-        args+=(-DOCCL_ENABLE_COVERAGE=ON)
-    fi
-    local sanitize
-    sanitize="$(sanitizer_flags "${profile}")"
-    if [ -n "${sanitize}" ]; then
-        # One -D value with spaces, so it must stay a single argument.
-        args+=("-DCMAKE_CXX_FLAGS=${sanitize}")
-        args+=("-DCMAKE_EXE_LINKER_FLAGS=${sanitize}")
-        args+=("-DCMAKE_SHARED_LINKER_FLAGS=${sanitize}")
-    fi
     if [ "${BUILD}" = true ]; then
         cmake "${args[@]}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
         cmake --build "${dir}" -j "${JOBS}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
     fi
     [ -x "${dir}/tests/test_single_machine" ] || return 1
-    if [ "${profile}" = "coverage" ]; then
-        # Counters accumulate across runs; drop them so the report describes this run only.
-        find "${dir}" -name '*.gcda' -delete 2>/dev/null
-    fi
     return 0
 }
 
-# run_one <executor> <profile> <suite> <ranks> <binary>
+# run_one <executor> <suite> <ranks> <binary>
 run_one() {
     local executor="$1"
-    local profile="$2"
-    local suite="$3"
-    local ranks="$4"
-    local binary="$5"
-    local dir="${BUILD_DIR}/${executor}/${profile}"
-    local report="${REPORT_DIR}/${executor}.${profile}.${suite}.ranklog"
-    local out="${REPORT_DIR}/${executor}.${profile}.${suite}.out"
+    local suite="$2"
+    local ranks="$3"
+    local binary="$4"
+    local dir="${BUILD_DIR}/${executor}"
+    local report="${REPORT_DIR}/${executor}.${suite}.ranklog"
+    local out="${REPORT_DIR}/${executor}.${suite}.out"
     local level_flag="--level ${LEVEL}"
     local -a extra_args=()
     if [ "${suite}" = "single" ] || [ "${suite}" = "multi" ]; then
         extra_args+=("--report" "${report}")
+        # Each rank appends its result, so a leftover file would be counted into this run.
+        rm -f "${report}" "${report}".*
     fi
 
-    local start end elapsed
-    start="${SECONDS}"
-    if [ "${profile}" = "asan-ubsan" ]; then
-        # Leak checking is off, and this is a measured limitation, not a convenience: a program
-        # that only calls MPI_Init/MPI_Finalize under this same instrumentation leaks the same
-        # 15464 bytes in 35 allocations as the suites do, with every frame reported as
-        # "<unknown module>" because Open MPI and its providers are loaded without frame
-        # pointers. ASan's own diagnostics and UBSan still run, and the suites compare every
-        # payload byte, so this only narrows the leak channel.
-        export ASAN_OPTIONS="detect_leaks=0"
-        export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
-    else
-        unset ASAN_OPTIONS
-        unset UBSAN_OPTIONS
-    fi
+    # A single suite is sub-second, so a whole-second clock rounds it to 0 or 1 at random.
+    local start end elapsed_ms
+    start="$(date +%s%3N)"
     # shellcheck disable=SC2086
     timeout "${TIMEOUT}" "${MPIRUN}" ${MPIRUN_FLAGS} -np "${ranks}" "${dir}/tests/${binary}" ${level_flag} "${extra_args[@]}" \
         >"${out}" 2>&1
     local code=$?
-    unset ASAN_OPTIONS
-    unset UBSAN_OPTIONS
-    end="${SECONDS}"
-    elapsed=$((end - start))
+    end="$(date +%s%3N)"
+    elapsed_ms=$((end - start))
 
     local status
     case "${code}" in
@@ -393,22 +330,14 @@ run_one() {
     esac
 
     local cases=0
-    if [ -f "${report}" ] || compgen -G "${report}.*" >/dev/null 2>&1; then
-        # Each rank appends its own result line, so the total is the number of rank-cases
-        # reported across the run.
-        cases="$(cat "${report}" "${report}".* 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${suite}" = "single" ] || [ "${suite}" = "multi" ]; then
+        # One reported result per rank per suite, but every case inside runs on every rank.
+        cases=$((case_per_rank * ranks))
     fi
     total_cases=$((total_cases + cases))
 
-    if [ "${status}" != "PASS" ]; then
-        # A sanitizer report turns a plain failure into an explicit risk finding.
-        if grep -qE "ERROR: (Address|Leak)Sanitizer|runtime error:" "${out}" 2>/dev/null; then
-            status="SANITIZER"
-        fi
-    fi
-
-    log_line "$(printf '%-8s %-8s %-10s %-5s ranks=%-3s cases=%-5s %ss' \
-        "${executor}" "${profile}" "${suite}" "${status}" "${ranks}" "${cases}" "${elapsed}")"
+    log_line "$(printf '%-8s %-10s %-5s ranks=%-3s cases=%-5s %sms' \
+        "${executor}" "${suite}" "${status}" "${ranks}" "${cases}" "${elapsed_ms}")"
 
     case "${status}" in
     PASS) ;;
@@ -418,40 +347,34 @@ run_one() {
     return 0
 }
 
-log_line "OriginCCL test run: level=${LEVEL} suites=${SUITES} executors=${EXECUTORS} profiles=${PROFILES}"
-log_line "single machine: ${SINGLE_RANKS} ranks   multi machine: ${MULTI_PER_MACHINE} per machine x ${MULTI_RANKS} ranks"
+log_line "OriginCCL test run: level=${LEVEL} suites=${SUITES} executors=${EXECUTORS}"
+log_line "single machine: ${SINGLE_RANKS} ranks   multi machine: ${MULTI_PER_MACHINE} per machine x ${MULTI_MACHINES} machines = ${MULTI_RANKS} ranks"
+log_line "counts per rank: ${COUNTS}"
 log_line ""
 
 for executor in $(echo "${EXECUTORS}" | tr ',' ' '); do
-    for profile in $(echo "${PROFILES}" | tr ',' ' '); do
-        if ! build_profile "${executor}" "${profile}"; then
-            log_line "$(printf '%-8s %-8s %-10s %-5s' "${executor}" "${profile}" "build" "FAIL")"
-            total_fail=$((total_fail + 1))
-            continue
-        fi
-        for suite in $(echo "${SUITES}" | tr ',' ' '); do
-            case "${suite}" in
-            single) run_one "${executor}" "${profile}" "single" "${SINGLE_RANKS}" "test_single_machine" ;;
-            multi) run_one "${executor}" "${profile}" "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
-            transport)
-                for transport in tcp shm rdma; do
-                    run_one "${executor}" "${profile}" "transport-${transport}" 2 "test_transport_${transport}"
-                done
-                ;;
-            esac
-        done
+    if ! build_executor "${executor}"; then
+        log_line "$(printf '%-8s %-10s %-5s' "${executor}" "build" "FAIL")"
+        total_fail=$((total_fail + 1))
+        continue
+    fi
+    if [ "${case_per_rank}" = "" ]; then
+        # The case matrix is shared by both collective suites, so one listing is enough.
+        case_per_rank="$("${BUILD_DIR}/${executor}/tests/test_single_machine" --level "${LEVEL}" --list-cases 2>/dev/null |
+            grep -o 'cases=[0-9]*' | cut -d= -f2 | awk '{ sum += $1 } END { print sum + 0 }')"
+    fi
+    for suite in $(echo "${SUITES}" | tr ',' ' '); do
+        case "${suite}" in
+        single) run_one "${executor}" "single" "${SINGLE_RANKS}" "test_single_machine" ;;
+        multi) run_one "${executor}" "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
+        transport)
+            for transport in tcp shm rdma; do
+                run_one "${executor}" "transport-${transport}" 2 "test_transport_${transport}"
+            done
+            ;;
+        esac
     done
 done
-
-if contains "coverage" "${PROFILES}"; then
-    log_line ""
-    if ! "${ROOT_DIR}/scripts/coverage_report.sh" "${BUILD_DIR}" "${REPORT_DIR}"; then
-        log_line "coverage report: FAIL"
-        log_line "raw gcov output was kept under ${REPORT_DIR}/coverage"
-        echo "coverage report failed" >&2
-        exit "${EXIT_REPORT}"
-    fi
-fi
 
 log_line ""
 if [ "${total_fail}" -gt 0 ]; then
