@@ -24,7 +24,7 @@ scripts/run_tests.sh -h
 scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe
 ```
 
-等级决定进程布局与数据量：
+等级决定进程布局与数据量。默认构建带 `-DOCCL_SMALL_TESTS=ON`，chunk 颗粒度与集合用例 count **等比缩小 256 倍**，让低配虚拟机也能跑完整矩阵；下表的 count 是生产值（`--full-data` 的取值，也是物理机验证使用的值）。
 
 | 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
 | --- | --- | --- | --- | --- |
@@ -38,6 +38,13 @@ scripts/run_tests.sh --level 1 --executor all -j 2 --oversubscribe
 scripts/run_tests.sh --level 2 --executor all -j 2 --oversubscribe
 ```
 
+- **低配机器**：`run_tests.sh` 默认按小数据构建/运行（`-DOCCL_SMALL_TESTS=ON`，chunk 32 KiB→128 B，count 同时除 256），等价地覆盖同一批 planner 路径。物理机验证时加 `--full-data` 用生产规模：
+
+```bash
+scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe --full-data
+```
+
+- 传输套件（`test_transport_*`）**不缩放**：其 5 MiB 边界与 8 MiB stall 必须超过 SHM 2 MiB / RDMA 1 MiB 环容量才能验证背压。
 - 只覆盖 **polling** 与 **epoll** 两个 executor（`--executor all` 即这两个）。
 - **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
 - `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。

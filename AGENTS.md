@@ -69,7 +69,7 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
 - **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
 - **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
-- 等级1/2消耗资源较多，尽可能避免自行测试。
+- 默认跑缩小数据量的测试。
 - 五个测试入口：
   - `test_single_machine`：真实单机，断言 `is_single_machine` / `local_size` / `local_rank`，再跑集合用例矩阵。
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。

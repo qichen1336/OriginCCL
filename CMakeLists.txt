@@ -60,6 +60,16 @@ elseif(NOT OCCL_EXECUTOR STREQUAL "multi_thread")
 endif()
 message(STATUS "OriginCCL executor: ${OCCL_EXECUTOR}")
 
+# Low-resource runs: scale the planner's chunk granularity (and, in tests/, the collective
+# counts) down by 256x so the suite fits a small VM. The units_total / channel split, and
+# therefore the planner code path exercised, is unchanged. Real machines build with it OFF;
+# scripts/run_tests.sh passes -DOCCL_SMALL_TESTS=ON unless --full-data is given.
+option(OCCL_SMALL_TESTS "Scale the chunk granularity and test counts down for low-resource runs" OFF)
+if(OCCL_SMALL_TESTS)
+    target_compile_definitions(originccl PRIVATE OCCL_SMALL_TESTS)
+endif()
+message(STATUS "OriginCCL small tests: ${OCCL_SMALL_TESTS}")
+
 target_include_directories(originccl
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

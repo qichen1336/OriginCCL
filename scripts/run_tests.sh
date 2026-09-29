@@ -18,6 +18,7 @@ BUILD=true
 DRY_RUN=false
 ALLOW_SKIP=false
 OVERSUBSCRIBE=false
+FULL_DATA=false
 
 EXIT_PASS=0
 EXIT_FAIL=1
@@ -44,14 +45,22 @@ Options:
       --dry-run           Print the planned commands and exit.
       --allow-skip        Let environment SKIPs keep the exit code at 0.
       --oversubscribe     Pass --oversubscribe to mpirun (fewer cores than ranks).
+      --full-data         Build and run with the production data sizes instead of the
+                          small-test ones. Use this on a machine with real resources.
       --list-cases        Print the case matrix of the selected level and exit.
 
-Levels (counts are elements per rank):
+Levels (counts are elements per rank; small-test reduces them 256x):
   0  single machine 4 ranks       multi machine 4 machines x 1 rank   counts 32768 131072
   1  single machine 8 ranks       multi machine 4 machines x 2 ranks  counts 65536 262144
   2  single machine 32 ranks      multi machine 8 machines x 4 ranks  counts 262144 1048576
 Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations; level 2
 runs the full legal core set. All suites use four channels.
+
+By default the build is configured with -DOCCL_SMALL_TESTS=ON: the library's chunk
+granularity and the collective counts shrink by the same 256x factor, so a small VM runs
+the identical planner path with 256x less memory. --full-data drops the macro and uses
+the production sizes. The transport suites are never scaled: their boundaries and stall
+sizes must exceed the transport ring capacities to still cover backpressure.
 
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
@@ -177,6 +186,10 @@ while [ $# -gt 0 ]; do
         OVERSUBSCRIBE=true
         shift
         ;;
+    --full-data)
+        FULL_DATA=true
+        shift
+        ;;
     --list-cases)
         LIST_CASES=true
         shift
@@ -211,19 +224,32 @@ case "${LEVEL}" in
 0) SINGLE_RANKS=4
    MULTI_RANKS=4
    MULTI_PER_MACHINE=1
-   COUNTS="32768 131072"
+   BASE_COUNTS="32768 131072"
    ;;
 1) SINGLE_RANKS=8
    MULTI_RANKS=8
    MULTI_PER_MACHINE=2
-   COUNTS="65536 262144"
+   BASE_COUNTS="65536 262144"
    ;;
 2) SINGLE_RANKS=32
    MULTI_RANKS=32
    MULTI_PER_MACHINE=4
-   COUNTS="262144 1048576"
+   BASE_COUNTS="262144 1048576"
    ;;
 esac
+
+# The small-test build divides the counts by 256 inside the test binaries; the log line has
+# to divide them here too, because the script only ever sees the base values.
+if [ "${FULL_DATA}" = true ]; then
+    SMALL_TESTS=OFF
+    COUNTS="${BASE_COUNTS}"
+else
+    SMALL_TESTS=ON
+    COUNTS=""
+    for count in ${BASE_COUNTS}; do
+        COUNTS="${COUNTS}${COUNTS:+ }$((count / 256))"
+    done
+fi
 MULTI_MACHINES=$((MULTI_RANKS / MULTI_PER_MACHINE))
 
 if [ "${LIST_CASES:-false}" = true ]; then
@@ -263,7 +289,7 @@ if [ "${DRY_RUN}" = true ]; then
     echo "planned commands (details of the case matrix need a built binary, see --list-cases):"
     IFS=',' read -r -a exec_list <<<"${EXECUTORS}"
     for executor in "${exec_list[@]}"; do
-        echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR}/${executor} -DOCCL_EXECUTOR=${executor} -DCMAKE_BUILD_TYPE=Debug"
+        echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR}/${executor} -DOCCL_EXECUTOR=${executor} -DOCCL_SMALL_TESTS=${SMALL_TESTS} -DCMAKE_BUILD_TYPE=Debug"
         echo "  cmake --build ${BUILD_DIR}/${executor} -j ${JOBS}"
     done
     exit 0
@@ -285,7 +311,8 @@ log_line() {
 build_executor() {
     local executor="$1"
     local dir="${BUILD_DIR}/${executor}"
-    local -a args=(-S "${ROOT_DIR}" -B "${dir}" "-DOCCL_EXECUTOR=${executor}" -DCMAKE_BUILD_TYPE=Debug)
+    local -a args=(-S "${ROOT_DIR}" -B "${dir}" "-DOCCL_EXECUTOR=${executor}" "-DOCCL_SMALL_TESTS=${SMALL_TESTS}"
+        -DCMAKE_BUILD_TYPE=Debug)
     if [ "${BUILD}" = true ]; then
         cmake "${args[@]}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
         cmake --build "${dir}" -j "${JOBS}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
@@ -349,7 +376,7 @@ run_one() {
 
 log_line "OriginCCL test run: level=${LEVEL} suites=${SUITES} executors=${EXECUTORS}"
 log_line "single machine: ${SINGLE_RANKS} ranks   multi machine: ${MULTI_PER_MACHINE} per machine x ${MULTI_MACHINES} machines = ${MULTI_RANKS} ranks"
-log_line "counts per rank: ${COUNTS}"
+log_line "counts per rank: ${COUNTS}   data scale: $( [ "${FULL_DATA}" = true ] && echo 'full' || echo 'small (256x)' )"
 log_line ""
 
 for executor in $(echo "${EXECUTORS}" | tr ',' ' '); do

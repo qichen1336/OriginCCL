@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 #include "communicator.h"
 #include "logger.h"
+#include "occl_config.h"
 
 namespace TestCommon {
 namespace {
@@ -22,13 +23,16 @@ const DataType kDtypes[4] = {DataType::FLOAT32, DataType::FLOAT64, DataType::INT
 const ReduceOp kOps[4] = {ReduceOp::SUM, ReduceOp::MAX, ReduceOp::MIN, ReduceOp::AVG};
 
 std::vector<size_t> CaseCounts(int level) {
+    // Scaled with the planner's chunk granularity, so the byte volumes stay in the same
+    // ratio to the chunk size and every case reaches the same planner path.
+    const size_t scale = OcclConfig::kTestScale;
     if (level == 0) {
-        return {32768, 131072};
+        return {32768 / scale, 131072 / scale};
     }
     if (level == 1) {
-        return {65536, 262144};
+        return {65536 / scale, 262144 / scale};
     }
-    return {262144, 1048576};
+    return {262144 / scale, 1048576 / scale};
 }
 
 double Value(int source, size_t index) {
@@ -478,6 +482,9 @@ TestOptions ParseOptions(int argc, char** argv) {
 }
 
 void PrintUsage(const char* program) {
+    const std::vector<size_t> counts0 = CaseCounts(0);
+    const std::vector<size_t> counts1 = CaseCounts(1);
+    const std::vector<size_t> counts2 = CaseCounts(2);
     fmt::print(stderr,
                "Usage: {} [--level 0|1|2] [--list-cases] [--report PATH]\n"
                "\n"
@@ -485,14 +492,14 @@ void PrintUsage(const char* program) {
                "  mpirun -np 4 {} --level 0\n"
                "\n"
                "Levels (counts are elements per rank):\n"
-               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts 32768 131072\n"
-               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 65536 262144\n"
-               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 262144 1048576\n"
+               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts {} {}\n"
+               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts {} {}\n"
+               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts {} {}\n"
                "\n"
                "Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations;\n"
                "level 2 runs the full legal core set. All suites use four channels. Multi machine\n"
                "groups ranks by a logical hostname, so it never leaves one physical host.\n",
-               program, program);
+               program, program, counts0[0], counts0[1], counts1[0], counts1[1], counts2[0], counts2[1]);
 }
 
 bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int world_size) {

@@ -14,6 +14,12 @@ add_library(occl_transport_support STATIC transport_check.cpp)
 target_link_libraries(occl_transport_support PUBLIC originccl fmt::fmt MPI::MPI_CXX)
 target_include_directories(occl_transport_support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# The collective suites scale their counts with the library's chunk granularity, so the macro
+# has to reach the test sources as well.
+if(OCCL_SMALL_TESTS)
+    target_compile_definitions(occl_test_support PRIVATE OCCL_SMALL_TESTS)
+endif()
+
 # Single-machine and multi-machine collective suites. The multi-machine suite injects a logical
 # hostname through CommConfig::get_hostname, so "several machines" never leaves one host.
 add_executable(test_single_machine test_single_machine.cpp)

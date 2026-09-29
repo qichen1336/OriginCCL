@@ -2,19 +2,17 @@
 #include "planner.h"
 #include "communicator.h"
 #include "channel.h"
+#include "occl_config.h"
 #include "topology.h"
 #include "utils.h"
-
-namespace {
-constexpr size_t kChunkBytes = 32 * 1024;
-}
 
 CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
-    size_t unit_bytes =
-        task.func == CollFunc::AllReduce ? kChunkBytes * static_cast<size_t>(comm.GetWorldSize()) : kChunkBytes;
+    size_t unit_bytes = task.func == CollFunc::AllReduce
+                            ? OcclConfig::kChunkBytes * static_cast<size_t>(comm.GetWorldSize())
+                            : OcclConfig::kChunkBytes;
 
     size_t units_total = total_bytes / unit_bytes;
     size_t rem_bytes = total_bytes % unit_bytes;
