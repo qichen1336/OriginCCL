@@ -23,9 +23,12 @@ const ReduceOp kOps[4] = {ReduceOp::SUM, ReduceOp::MAX, ReduceOp::MIN, ReduceOp:
 
 std::vector<size_t> CaseCounts(int level) {
     if (level == 0) {
-        return {1, 1024, 8192};
+        return {32768, 131072};
     }
-    return {8192, 32768, 65536};
+    if (level == 1) {
+        return {65536, 262144};
+    }
+    return {262144, 1048576};
 }
 
 double Value(int source, size_t index) {
@@ -482,9 +485,9 @@ void PrintUsage(const char* program) {
                "  mpirun -np 4 {} --level 0\n"
                "\n"
                "Levels (counts are elements per rank):\n"
-               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts 1 1024 8192\n"
-               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 8192 32768 65536\n"
-               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 8192 32768 65536\n"
+               "  0  single machine: 4 ranks      multi machine: 4x1 ranks  counts 32768 131072\n"
+               "  1  single machine: 8 ranks      multi machine: 4x2 ranks  counts 65536 262144\n"
+               "  2  single machine: 32 ranks     multi machine: 8x4 ranks  counts 262144 1048576\n"
                "\n"
                "Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations;\n"
                "level 2 runs the full legal core set. All suites use four channels. Multi machine\n"

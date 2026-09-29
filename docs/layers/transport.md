@@ -44,9 +44,9 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - 建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`：`Listen(addr, port)` 用 `rdma_listen`（`port=0` 时内核选端口，用 `rdma_get_local_addr` 读回真实端口）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端 `rdma_accept`，QP 都是 `IBV_QPT_RC`。
 - 对端内存信息走 CM private data（`Wire{base_addr, rkey}`），两端在事件里直接得到；被动端在 `CONNECT_REQUEST`、主动端在 `ESTABLISHED` 事件里。
 - 握手与数据方向解耦：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关——谁主动连接只看 rank 大小（`rank < peer` 的一端 `Connect`）。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`。
-- 数据面是 2 MiB 预注册环形缓冲，`64 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后 post write；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
+- 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后 post write；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
 - 槽位复用只由 credit 一个门控：可发窗口是 `credits_received + kRdmaSlotCount`；credit 蕴含「本地读已完成」，故 `IBV_WC_RDMA_WRITE` 完成事件被忽略。credit 反向归还：consumer 交还整个槽后用一次 `WRITE_WITH_IMM` 写对端控制区（payload 1 B，不受方向限制）。immediate 的位布局是两种用途共用：bit 31 为 credit 标志，bit 16–30 是槽号，bit 0–15 是 `length - 1`（长度减 1 才能双射进 16 bit）。`kCreditBatch = 8` 批量归还，队列排空时立刻归还余数。
-- 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 2 MiB 的消息分多轮推完。
+- 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
 - `WRITE_WITH_IMM` 消耗接收方 RQ 的 WQE，接收队列是纯 credit 池（预投 `kRdmaRecvPool` 个空 WQE，每收到一个 write-imm 立即补投），不预投会 RNR。
 - 就绪与 EPOLLET：`GetFd()` 连接后返回 completion channel fd，监听态返回 CM channel fd；`GetPollEvents()` 恒 `EPOLLIN`。就绪 fd 只表达数据到来，对端消失经被 flush 的接收 WQE 产生 CQE、`HandleCompletion` 判为 `Try*` 的 `false`。`Try*` 非阻塞 drain 后必须 `ibv_get_cq_event` → `ibv_ack_cq_events` → `ibv_req_notify_cq` 重新 arm 再 poll CQ，否则漏下一次边沿。
 - 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，再扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
@@ -66,5 +66,5 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - **RDMA `private_data` 保持裸 `Wire{base_addr, rkey}`**：连接合法性由 CM 保证，无 magic 校验。
 - **`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ**：直接 poll CQ 不重新 arm 会在 EPOLLET 下漏边沿。
 - **RDMA 地址必须由 `Probe` 从设备的 IPv4-mapped GID 得出**，不能复用 `Utils::GetLocalIPAddress()` 结果。
-- 环容量固定 2 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
+- 环容量固定 1 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
 - 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的三个 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度），但只做黑盒接口断言，不检查具体传输类型。

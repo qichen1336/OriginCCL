@@ -8,7 +8,7 @@
 #include <rdma/rdma_cma.h>
 #include "transport/transport.h"
 
-constexpr size_t kRdmaSlotSize = 64 * 1024;
+constexpr size_t kRdmaSlotSize = 32 * 1024;
 constexpr size_t kRdmaSlotCount = 32;
 constexpr size_t kRdmaRingCapacity = kRdmaSlotSize * kRdmaSlotCount;
 constexpr size_t kRdmaControlOffset = 0;

@@ -63,13 +63,13 @@ scripts/run_tests.sh --level 2 --executor all -j 2 --oversubscribe
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {1,1024,8192}；等级 1 = 8 rank / 4×2 / count {8192,32768,65536}；等级 2 = 32 rank / 8×4 / count {8192,32768,65536}。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（三个 count 间轮转），非 reduce 类遍历全部 dtype×count；
+- **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {32768,131072}；等级 1 = 8 rank / 4×2 / count {65536,262144}；等级 2 = 32 rank / 8×4 / count {262144,1048576}。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（两个 count 间轮转），非 reduce 类遍历全部 dtype×count；
 - **只覆盖 polling 与 epoll 两个 executor**（`--executor all` 即这两个，脚本的 `validate_list` 已限定）。`reactor` / `multi_thread` 的实现仍在库里，可 `cmake -DOCCL_EXECUTOR=<name>` 构建（CMake 默认 `multi_thread`），但不在本矩阵内。
 - **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
 - **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
 - **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
-- 等级2消耗资源较多，尽可能避免自行测试。
+- 等级1/2消耗资源较多，尽可能避免自行测试。
 - 五个测试入口：
   - `test_single_machine`：真实单机，断言 `is_single_machine` / `local_size` / `local_rank`，再跑集合用例矩阵。
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。

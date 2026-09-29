@@ -23,7 +23,7 @@
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
 - `PlanTask.topology` 复用 `comm.GetTopology()`，planner 不新建拓扑。
-- 启用 channel 规则：每 channel 最少 `64 KiB`，使用数 `clamp(total_bytes / 64KiB, 1, comm.GetNChannels())`；小消息只触发单 channel。`total_bytes = count*type_size`，多块操作也按单块大小选通道。count=0 仍生成一个立即完成的任务。
+- 启用 channel 规则：AllReduce 每 channel 最小颗粒度 `32 KiB × world_size`，其余操作 `32 KiB`（合称 `unit`）；使用数 `n_used = min(total_bytes / unit, GetNChannels())`，小消息只触发单 channel。`total_bytes = count*type_size`，多块操作也按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`，planner 不重复赋值。
 
 # 隐含约定

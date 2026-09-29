@@ -47,9 +47,9 @@ Options:
       --list-cases        Print the case matrix of the selected level and exit.
 
 Levels (counts are elements per rank):
-  0  single machine 4 ranks       multi machine 4 machines x 1 rank   counts 1 1024 8192
-  1  single machine 8 ranks       multi machine 4 machines x 2 ranks  counts 8192 32768 65536
-  2  single machine 32 ranks      multi machine 8 machines x 4 ranks  counts 8192 32768 65536
+  0  single machine 4 ranks       multi machine 4 machines x 1 rank   counts 32768 131072
+  1  single machine 8 ranks       multi machine 4 machines x 2 ranks  counts 65536 262144
+  2  single machine 32 ranks      multi machine 8 machines x 4 ranks  counts 262144 1048576
 Level 0 samples every dtype/op/count; level 1 adds the pairwise combinations; level 2
 runs the full legal core set. All suites use four channels.
 
@@ -211,17 +211,17 @@ case "${LEVEL}" in
 0) SINGLE_RANKS=4
    MULTI_RANKS=4
    MULTI_PER_MACHINE=1
-   COUNTS="1 1024 8192"
+   COUNTS="32768 131072"
    ;;
 1) SINGLE_RANKS=8
    MULTI_RANKS=8
    MULTI_PER_MACHINE=2
-   COUNTS="8192 32768 65536"
+   COUNTS="65536 262144"
    ;;
 2) SINGLE_RANKS=32
    MULTI_RANKS=32
    MULTI_PER_MACHINE=4
-   COUNTS="8192 32768 65536"
+   COUNTS="262144 1048576"
    ;;
 esac
 MULTI_MACHINES=$((MULTI_RANKS / MULTI_PER_MACHINE))

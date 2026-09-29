@@ -6,27 +6,36 @@
 #include "utils.h"
 
 namespace {
-constexpr size_t kMinBytesPerChannel = 64 * 1024;
+constexpr size_t kChunkBytes = 32 * 1024;
 }
 
 CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
+    size_t unit_bytes =
+        task.func == CollFunc::AllReduce ? kChunkBytes * static_cast<size_t>(comm.GetWorldSize()) : kChunkBytes;
+
+    size_t units_total = total_bytes / unit_bytes;
+    size_t rem_bytes = total_bytes % unit_bytes;
     int n_used = 1;
-    if (kMinBytesPerChannel > 0 && total_bytes >= kMinBytesPerChannel) {
-        n_used = static_cast<int>(total_bytes / kMinBytesPerChannel);
-        n_used = std::clamp(n_used, 1, max_channels);
+    if (units_total > 0) {
+        n_used = static_cast<int>(std::min(units_total, static_cast<size_t>(max_channels)));
     }
 
-    size_t base = task.count / static_cast<size_t>(n_used);
-    size_t rem = task.count % static_cast<size_t>(n_used);
+    size_t base_units = units_total / static_cast<size_t>(n_used);
+    size_t rem_units = units_total % static_cast<size_t>(n_used);
 
     CollPlan plan(n_used);
 
     size_t offset = 0;
     for (int c = 0; c < n_used; ++c) {
-        size_t elem_count = base + (static_cast<size_t>(c) < rem ? 1 : 0);
+        size_t channel_units = base_units + (static_cast<size_t>(c) < rem_units ? 1 : 0);
+        size_t channel_bytes = channel_units * unit_bytes;
+        if (c == n_used - 1) {
+            channel_bytes += rem_bytes;
+        }
+        size_t elem_count = channel_bytes / type_size;
         ChannelPlan& channel = plan.channels[static_cast<size_t>(c)];
         Channel& comm_channel = comm.GetChannel(c);
         PlanTask plantask;

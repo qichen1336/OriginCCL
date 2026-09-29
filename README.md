@@ -28,9 +28,9 @@ scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe
 
 | 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
 | --- | --- | --- | --- | --- |
-| 0 | 4 rank | 4 机 × 1 rank | 1、1024、8192 | 每个接口遍历全部 dtype / op / count |
-| 1 | 8 rank | 4 机 × 2 rank | 8192、32768、65536 | 补齐 dtype/op/count 两两组合 |
-| 2 | 32 rank | 8 机 × 4 rank | 8192、32768、65536 | 完整合法核心集 |
+| 0 | 4 rank | 4 机 × 1 rank | 32768、131072 | 每个接口遍历全部 dtype / op / count |
+| 1 | 8 rank | 4 机 × 2 rank | 65536、262144 | 补齐 dtype/op/count 两两组合 |
+| 2 | 32 rank | 8 机 × 4 rank | 262144、1048576 | 完整合法核心集 |
 
 ```bash
 # 需要足够核数，或加 --oversubscribe：
