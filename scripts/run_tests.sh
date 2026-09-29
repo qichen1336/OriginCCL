@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # OriginCCL test entry point.
 #
-# One script drives the five test binaries across the two covered executors. It is the only
-# documented entry point; the binaries take --level/--list-cases and are meant to be driven
-# from here.
+# One script drives the five test binaries. It is the only documented entry point; the
+# binaries take --level/--list-cases and are meant to be driven from here. The executor is
+# chosen at runtime by the library, so one build covers every run.
 set -u -o pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LEVEL=0
-EXECUTORS="all"
 SUITE="all"
 BUILD_DIR=""
 REPORT_DIR=""
@@ -29,15 +28,14 @@ usage() {
     cat <<'EOF'
 Usage: scripts/run_tests.sh [options]
 
-Runs the OriginCCL test suite. The executables are built per executor into
-build-tests/<executor> and each run gets its own report file.
+Runs the OriginCCL test suite. The executables are built once into
+build/ and each run gets its own report file.
 
 Options:
   -h, --help              Show this help and exit.
   -l, --level N           0, 1 or 2 (default 0). See "Levels" below.
-  -e, --executor LIST     all | polling | epoll (default all). Comma separated.
   -s, --suite LIST        all | single | multi | transport (default all).
-  -d, --build-dir DIR     Build root (default <repo>/build-tests).
+  -d, --build-dir DIR     Build root (default <repo>/build).
   -r, --report-dir DIR    Report root (default <repo>/test-reports).
   -t, --timeout SEC       Per-run timeout (default 600).
   -j, --jobs N            Build parallelism (default 2).
@@ -65,7 +63,8 @@ sizes must exceed the transport ring capacities to still cover backpressure.
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
 --oversubscribe. RDMA without a device with an active port is reported as SKIP, never
-as a pass. TSan is not offered: the covered executors are polled from one thread.
+as a pass. The executor is picked at runtime: polling when the cores cover the local
+ranks, epoll when they do not.
 
 Exit codes:
   0  the requested scope passed
@@ -76,8 +75,8 @@ Exit codes:
 Examples:
   scripts/run_tests.sh -h
   scripts/run_tests.sh --level 0
-  scripts/run_tests.sh --level 0 --executor polling
-  scripts/run_tests.sh --level 1 --executor all -j 4 --oversubscribe
+  scripts/run_tests.sh --level 0 --suite single
+  scripts/run_tests.sh --level 1 -j 4 --oversubscribe
   scripts/run_tests.sh --level 2 --suite transport
 EOF
 }
@@ -138,11 +137,6 @@ while [ $# -gt 0 ]; do
     -l | --level)
         [ $# -ge 2 ] || die_usage "$1 needs a value"
         LEVEL="$2"
-        shift 2
-        ;;
-    -e | --executor)
-        [ $# -ge 2 ] || die_usage "$1 needs a value"
-        EXECUTORS="$2"
         shift 2
         ;;
     -s | --suite)
@@ -211,13 +205,10 @@ case "${JOBS}" in
 '' | *[!0-9]*) die_usage "invalid --jobs '${JOBS}'" ;;
 esac
 
-# Only the polling and epoll executors are covered; the other two are not built here.
-validate_list "${EXECUTORS}" "polling,epoll" "--executor"
 validate_list "${SUITE}" "single,multi,transport" "--suite"
-EXECUTORS="$(expand_list "${EXECUTORS}" "polling,epoll")"
 SUITES="$(expand_list "${SUITE}" "single,multi,transport")"
 
-BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build-tests}"
+BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 REPORT_DIR="${REPORT_DIR:-${ROOT_DIR}/test-reports}"
 
 case "${LEVEL}" in
@@ -257,7 +248,7 @@ if [ "${LIST_CASES:-false}" = true ]; then
         echo "error: --list-cases needs an existing build; run once without it, or use --no-build" >&2
         exit "${EXIT_USAGE}"
     fi
-    binary="${BUILD_DIR}/$(echo "${EXECUTORS}" | cut -d, -f1)/tests/test_single_machine"
+    binary="${BUILD_DIR}/tests/test_single_machine"
     if [ ! -x "${binary}" ]; then
         echo "error: ${binary} is missing; build first" >&2
         exit "${EXIT_USAGE}"
@@ -282,16 +273,12 @@ fi
 if [ "${DRY_RUN}" = true ]; then
     echo "level ${LEVEL}: single machine ${SINGLE_RANKS} ranks, multi machine ${MULTI_PER_MACHINE} per machine x ${MULTI_MACHINES} machines = ${MULTI_RANKS} ranks"
     echo "counts per rank: ${COUNTS}"
-    echo "executors: ${EXECUTORS}"
     echo "suites:    ${SUITES}"
     echo "report:    ${REPORT_DIR}"
     echo
     echo "planned commands (details of the case matrix need a built binary, see --list-cases):"
-    IFS=',' read -r -a exec_list <<<"${EXECUTORS}"
-    for executor in "${exec_list[@]}"; do
-        echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR}/${executor} -DOCCL_EXECUTOR=${executor} -DOCCL_SMALL_TESTS=${SMALL_TESTS} -DCMAKE_BUILD_TYPE=Debug"
-        echo "  cmake --build ${BUILD_DIR}/${executor} -j ${JOBS}"
-    done
+    echo "  cmake -S ${ROOT_DIR} -B ${BUILD_DIR} -DOCCL_SMALL_TESTS=${SMALL_TESTS} -DCMAKE_BUILD_TYPE=Debug"
+    echo "  cmake --build ${BUILD_DIR} -j ${JOBS}"
     exit 0
 fi
 
@@ -308,28 +295,23 @@ log_line() {
     echo "$@" | tee -a "${SUMMARY}"
 }
 
-build_executor() {
-    local executor="$1"
-    local dir="${BUILD_DIR}/${executor}"
-    local -a args=(-S "${ROOT_DIR}" -B "${dir}" "-DOCCL_EXECUTOR=${executor}" "-DOCCL_SMALL_TESTS=${SMALL_TESTS}"
-        -DCMAKE_BUILD_TYPE=Debug)
+build() {
+    local -a args=(-S "${ROOT_DIR}" -B "${BUILD_DIR}" "-DOCCL_SMALL_TESTS=${SMALL_TESTS}" -DCMAKE_BUILD_TYPE=Debug)
     if [ "${BUILD}" = true ]; then
         cmake "${args[@]}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
-        cmake --build "${dir}" -j "${JOBS}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
+        cmake --build "${BUILD_DIR}" -j "${JOBS}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
     fi
-    [ -x "${dir}/tests/test_single_machine" ] || return 1
+    [ -x "${BUILD_DIR}/tests/test_single_machine" ] || return 1
     return 0
 }
 
-# run_one <executor> <suite> <ranks> <binary>
+# run_one <suite> <ranks> <binary>
 run_one() {
-    local executor="$1"
-    local suite="$2"
-    local ranks="$3"
-    local binary="$4"
-    local dir="${BUILD_DIR}/${executor}"
-    local report="${REPORT_DIR}/${executor}.${suite}.ranklog"
-    local out="${REPORT_DIR}/${executor}.${suite}.out"
+    local suite="$1"
+    local ranks="$2"
+    local binary="$3"
+    local report="${REPORT_DIR}/${suite}.ranklog"
+    local out="${REPORT_DIR}/${suite}.out"
     local level_flag="--level ${LEVEL}"
     local -a extra_args=()
     if [ "${suite}" = "single" ] || [ "${suite}" = "multi" ]; then
@@ -342,7 +324,7 @@ run_one() {
     local start end elapsed_ms
     start="$(date +%s%3N)"
     # shellcheck disable=SC2086
-    timeout "${TIMEOUT}" "${MPIRUN}" ${MPIRUN_FLAGS} -np "${ranks}" "${dir}/tests/${binary}" ${level_flag} "${extra_args[@]}" \
+    timeout "${TIMEOUT}" "${MPIRUN}" ${MPIRUN_FLAGS} -np "${ranks}" "${BUILD_DIR}/tests/${binary}" ${level_flag} "${extra_args[@]}" \
         >"${out}" 2>&1
     local code=$?
     end="$(date +%s%3N)"
@@ -363,8 +345,8 @@ run_one() {
     fi
     total_cases=$((total_cases + cases))
 
-    log_line "$(printf '%-8s %-10s %-5s ranks=%-3s cases=%-5s %sms' \
-        "${executor}" "${suite}" "${status}" "${ranks}" "${cases}" "${elapsed_ms}")"
+    log_line "$(printf '%-16s %-5s ranks=%-3s cases=%-5s %sms' \
+        "${suite}" "${status}" "${ranks}" "${cases}" "${elapsed_ms}")"
 
     case "${status}" in
     PASS) ;;
@@ -374,34 +356,32 @@ run_one() {
     return 0
 }
 
-log_line "OriginCCL test run: level=${LEVEL} suites=${SUITES} executors=${EXECUTORS}"
+log_line "OriginCCL test run: level=${LEVEL} suites=${SUITES}"
 log_line "single machine: ${SINGLE_RANKS} ranks   multi machine: ${MULTI_PER_MACHINE} per machine x ${MULTI_MACHINES} machines = ${MULTI_RANKS} ranks"
 log_line "counts per rank: ${COUNTS}   data scale: $( [ "${FULL_DATA}" = true ] && echo 'full' || echo 'small (256x)' )"
 log_line ""
 
-for executor in $(echo "${EXECUTORS}" | tr ',' ' '); do
-    if ! build_executor "${executor}"; then
-        log_line "$(printf '%-8s %-10s %-5s' "${executor}" "build" "FAIL")"
-        total_fail=$((total_fail + 1))
-        continue
-    fi
-    if [ "${case_per_rank}" = "" ]; then
-        # The case matrix is shared by both collective suites, so one listing is enough.
-        case_per_rank="$("${BUILD_DIR}/${executor}/tests/test_single_machine" --level "${LEVEL}" --list-cases 2>/dev/null |
-            grep -o 'cases=[0-9]*' | cut -d= -f2 | awk '{ sum += $1 } END { print sum + 0 }')"
-    fi
+if ! build; then
+    log_line "$(printf '%-16s %-5s' "build" "FAIL")"
+    total_fail=$((total_fail + 1))
+fi
+
+# The case matrix is shared by both collective suites, so one listing is enough.
+if [ "${total_fail}" -eq 0 ]; then
+    case_per_rank="$("${BUILD_DIR}/tests/test_single_machine" --level "${LEVEL}" --list-cases 2>/dev/null |
+        grep -o 'cases=[0-9]*' | cut -d= -f2 | awk '{ sum += $1 } END { print sum + 0 }')"
     for suite in $(echo "${SUITES}" | tr ',' ' '); do
         case "${suite}" in
-        single) run_one "${executor}" "single" "${SINGLE_RANKS}" "test_single_machine" ;;
-        multi) run_one "${executor}" "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
+        single) run_one "single" "${SINGLE_RANKS}" "test_single_machine" ;;
+        multi) run_one "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
         transport)
             for transport in tcp shm rdma; do
-                run_one "${executor}" "transport-${transport}" 2 "test_transport_${transport}"
+                run_one "transport-${transport}" 2 "test_transport_${transport}"
             done
             ;;
         esac
     done
-done
+fi
 
 log_line ""
 if [ "${total_fail}" -gt 0 ]; then

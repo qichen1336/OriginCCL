@@ -39,7 +39,7 @@ scripts/                   run_tests.sh（唯一入口）
 | **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态） |
 | **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
-| **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | 编译期选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
+| **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | `Init` 按核数与 local rank 数在 polling 与 epoll 间**运行时**选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
 | **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露五种集合操作 |
 | **bootstrap** | `bootstrap.h` | master/worker 交换 `NodeInfo`（含 `data_port`/`hostname`/`rdma_addr`/`rdma_port`） | 用于本地分组与建连；本地 `NodeInfo` 由 communicator 构造后传入 |
 | **utils / logger / types** | `utils.h` / `logger.h` / `types.h` | 编解码、socket 辅助、reduce 运算、日志宏、公共数据结构 | 日志统一走 `LOG_*` 宏 |
@@ -55,16 +55,15 @@ scripts/                   run_tests.sh（唯一入口）
 
 ```bash
 # 入口只有一个：run_tests.sh（-h 有完整说明）。等级 0 是本机可跑的最小档。
-# --executor all 即 polling,epoll。
-scripts/run_tests.sh --level 0 --executor all -j 2 --oversubscribe
-scripts/run_tests.sh --level 1 --executor all -j 2 --oversubscribe
-scripts/run_tests.sh --level 2 --executor all -j 2 --oversubscribe
+scripts/run_tests.sh --level 0 -j 2 --oversubscribe
+scripts/run_tests.sh --level 1 -j 2 --oversubscribe
+scripts/run_tests.sh --level 2 -j 2 --oversubscribe
 # 查看某一等级的完整用例矩阵（需先构建一次）：
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
 - **等级决定进程布局与数据量**：等级 0 = 单机 4 rank / 多机 4×1 rank / count {32768,131072}；等级 1 = 8 rank / 4×2 / count {65536,262144}；等级 2 = 32 rank / 8×4 / count {262144,1048576}。用例矩阵：等级 0 对 reduce 类在每个 (dtype, op) 上只采样一个 count（两个 count 间轮转），非 reduce 类遍历全部 dtype×count；
-- **只覆盖 polling 与 epoll 两个 executor**（`--executor all` 即这两个，脚本的 `validate_list` 已限定）。`reactor` / `multi_thread` 的实现仍在库里，可 `cmake -DOCCL_EXECUTOR=<name>` 构建（CMake 默认 `multi_thread`），但不在本矩阵内。
+- **executor 由库在 `Init` 时运行时选取**：`sysconf(_SC_NPROCESSORS_ONLN)` 全机在线核数 ≥ 本机 rank 数（每 rank 已绑核独占一核）用 `polling`，否则用 `epoll`。一次构建覆盖全部运行，脚本无 executor 维度（`--executor` 已删除）。`reactor` / `multi_thread` 的实现仍全量编译在库里，但已无选取路径。
 - **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
 - **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
 - **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
@@ -75,7 +74,7 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。
   - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
   - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
-- 脚本自带 polling/epoll 矩阵。如果通过脚本运行其他两个 executor 或 sanitizer（asan-ubsan）、覆盖率，需要自己配 CMake 构建。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
+- 想要 sanitizer（asan-ubsan）或覆盖率，需要自己配 CMake 构建。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
 
 ## commit rules
 - **提交comment**：简短、小写、朴素英文 —— `add fmt`、`modify channels`、`root ip and port from env`。

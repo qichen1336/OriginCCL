@@ -17,38 +17,28 @@
 #include "transport/transport_shm.h"
 #include "transport/transport_rdma.h"
 #include "topology_ring.h"
-
-#if defined(OCCL_EXECUTOR_EPOLL)
 #include "executor/epoll_executor.h"
-#elif defined(OCCL_EXECUTOR_POLLING)
 #include "executor/polling_executor.h"
-#elif defined(OCCL_EXECUTOR_REACTOR)
-#include "executor/reactor_executor.h"
-#else
-#include "executor/multi_thread_executor.h"
-#endif
 
 namespace {
-#if defined(OCCL_EXECUTOR_EPOLL)
-constexpr const char* kExecutorName = "epoll";
-using DefaultExecutor = EpollExecutor;
-#elif defined(OCCL_EXECUTOR_POLLING)
-constexpr const char* kExecutorName = "polling";
-using DefaultExecutor = PollingExecutor;
-#elif defined(OCCL_EXECUTOR_REACTOR)
-constexpr const char* kExecutorName = "reactor";
-using DefaultExecutor = ReactorExecutor;
-#else
-constexpr const char* kExecutorName = "multi_thread";
-using DefaultExecutor = MultiThreadExecutor;
-#endif
-
 constexpr int kDefaultChannelCount = 4;
 
 constexpr int kConnectRetryCount = 5;
 constexpr int kConnectRetryIntervalMs = 100;
 
 constexpr const char* kRendezvousDir = "/tmp/originccl";
+
+// Each rank pins itself to one core, so a machine where the local ranks already saturate the
+// cores gives polling its own CPU; an oversubscribed one blocks in epoll instead of spinning.
+std::unique_ptr<Executor> MakeExecutor(int local_size) {
+    const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores >= local_size) {
+        LOG_INFO("Using the polling executor ({} cores for {} local ranks)", cores, local_size);
+        return std::make_unique<PollingExecutor>();
+    }
+    LOG_INFO("Using the epoll executor ({} cores for {} local ranks)", cores, local_size);
+    return std::make_unique<EpollExecutor>();
+}
 
 bool SharedMemoryEnabled() {
     const char* value = std::getenv("OCCL_DISABLE_SHM");
@@ -120,13 +110,9 @@ bool Communicator::Init(const CommConfig& cfg) {
         }
     }
 
-    if (!executor) {
-        executor = std::make_unique<DefaultExecutor>();
-    }
-
     const bool use_shm = SharedMemoryEnabled();
-    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {}, executor = {}", config.rank,
-             config.world_size, n_channels, topology->GetName(), kExecutorName);
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {}", config.rank,
+             config.world_size, n_channels, topology->GetName());
 
     if (config.world_size <= 1) {
         local_rank = 0;
@@ -135,6 +121,7 @@ bool Communicator::Init(const CommConfig& cfg) {
         is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
         Utils::PinProcessToCpu(local_rank);
+        executor = MakeExecutor(local_size);
         return true;
     }
 
@@ -227,6 +214,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     LOG_INFO("Rank {}: local_rank = {}, local_size = {}, single_machine = {}, hostname = {}", config.rank, local_rank,
              local_size, is_single_machine, my_hostname);
 
+    executor = MakeExecutor(local_size);
     Utils::PinProcessToCpu(local_rank);
 
     if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {

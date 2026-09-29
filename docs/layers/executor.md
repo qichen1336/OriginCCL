@@ -10,7 +10,7 @@ executor 与 transport 单独成目录，其余层仍平铺。头文件从 inclu
 - 等待 task 各 transport 的就绪（`GetFd()` + `GetPollEvents()`），把就绪喂给 `Topology::CollectiveStep`；不展开算法步骤。
 - 就绪到逻辑操作的映射由 transport 在 task 中的位置决定：`send_transports` 任一连接就绪推进 Writable（send），`recv_transports` 任一连接就绪推进 Readable（recv）。executor 不认具体 transport 类型，也不把就绪位当成方向（共享内存发送端等的是可读的 eventfd）。
 - 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进；隐含保证 worker/单线程独占自己 channel，`PlanTask.state` 单写者，不加锁。
-- 编译期选定：CMake `OCCL_EXECUTOR`（`multi_thread`/`epoll`/`polling`/`reactor`，默认 `multi_thread`）→ 编译宏 → `Communicator` 用 `#ifdef` 构造。一次构建一种，无运行时切换接口。
+- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `polling`，核数不够（已超订）用 `epoll`，不忙等抢 CPU。`multi_thread` / `reactor` 仍编译在库里，但没有选取它们的路径。
 
 # 文件介绍
 
@@ -29,7 +29,7 @@ executor 与 transport 单独成目录，其余层仍平铺。头文件从 inclu
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Collective*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job（job 带逻辑 step 位，不带原始 epoll 位），worker 用 mutex + completion 队列 + eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
 - task 的就绪注册由各 executor 遍历 `send_transports`/`recv_transports`、用 `GetFd()` + `GetPollEvents()` 逐条拼出；epoll/reactor 的事件 tag 为 `slot * 2 + side`（side 0 = recv、side 1 = send），同一 side 的多个连接共用 tag，分发时遍历该侧 transport 用 `GetPollEvents()` 复核。
-- 新增 executor 须在 CMake `OCCL_EXECUTOR`、编译宏、`Communicator` 的 `#ifdef` 构造处同步注册；只实现 `Run`/`Shutdown`，只推进 `CollectiveStep`，不改 `PlanTask` 算法语义字段（只推进 `state`）。
+- 新增 executor 须在 `Communicator` 的选取处（`MakeExecutor`）注册；只实现 `Run`/`Shutdown`，只推进 `CollectiveStep`，不改 `PlanTask` 算法语义字段（只推进 `state`）。
 
 # 隐含约定
 

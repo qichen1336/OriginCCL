@@ -43,22 +43,7 @@ set(ORIGIN_CCL_SOURCES
 
 add_library(originccl SHARED ${ORIGIN_CCL_SOURCES})
 
-# Compile-time executor selection. Exactly one strategy is baked into a library build;
-# scripts/run_tests.sh --executor all builds and runs the polling and epoll ones.
-#   cmake -DOCCL_EXECUTOR=epoll|polling|reactor|multi_thread
-set(OCCL_EXECUTOR "multi_thread" CACHE STRING "Executor strategy: multi_thread, epoll, polling, or reactor")
-set_property(CACHE OCCL_EXECUTOR PROPERTY STRINGS multi_thread epoll polling reactor)
-if(OCCL_EXECUTOR STREQUAL "epoll")
-    target_compile_definitions(originccl PRIVATE OCCL_EXECUTOR_EPOLL)
-elseif(OCCL_EXECUTOR STREQUAL "polling")
-    target_compile_definitions(originccl PRIVATE OCCL_EXECUTOR_POLLING)
-elseif(OCCL_EXECUTOR STREQUAL "reactor")
-    target_compile_definitions(originccl PRIVATE OCCL_EXECUTOR_REACTOR)
-elseif(NOT OCCL_EXECUTOR STREQUAL "multi_thread")
-    message(FATAL_ERROR
-        "Unknown OCCL_EXECUTOR '${OCCL_EXECUTOR}' (expected multi_thread, epoll, polling, or reactor)")
-endif()
-message(STATUS "OriginCCL executor: ${OCCL_EXECUTOR}")
+# The executor is picked at runtime by the communicator, not by the build.
 
 # Low-resource runs: scale the planner's chunk granularity (and, in tests/, the collective
 # counts) down by 256x so the suite fits a small VM. The units_total / channel split, and
