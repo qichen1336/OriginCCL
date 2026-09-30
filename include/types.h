@@ -79,12 +79,19 @@ enum class CollEvent {
 
 struct CollOpState {
     int phase = 0;
-    int step = 0;
     std::vector<size_t> send_progress;
     std::vector<size_t> recv_progress;
     std::vector<char> send_done;
     std::vector<char> recv_done;
     std::vector<char> temp_buffer;
+    union {
+        struct {
+            int step;
+        } ring;
+        struct {
+            int step;
+        } tree;
+    } algo;
 };
 
 struct PlanTask {

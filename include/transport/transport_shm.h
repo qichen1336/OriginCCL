@@ -75,7 +75,7 @@ private:
     }
 
     bool CreateRing();
-    bool MapRing(int fd);
+    bool MapRing(int fd, bool initialize);
     bool Adopt(const RingResources& incoming, TransportDirection direction);
     bool SendResources(int fd) const;
     bool RecvResources(int fd, RingResources* incoming, TransportDirection* direction) const;

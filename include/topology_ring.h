@@ -9,7 +9,8 @@ public:
     }
     ~TopologyRing() override = default;
 
-    void FillChannels(std::vector<Channel>& channels) const override;
+    void FillChannels(const Communicator& comm, std::vector<Channel>& channels) override;
+    void FillPeers(const Channel& channel, std::vector<TopoEdge>& edges) const override;
     void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
                         std::vector<std::shared_ptr<Transport>>& recv_out) const override;
 

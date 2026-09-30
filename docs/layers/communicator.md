@@ -4,9 +4,9 @@
 
 # 核心职责边界
 
-- 初始化链路：`TopologyRing` 填 ring → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 按 `local_rank` 绑核 → 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → `InitChannels` 逐 channel 建独立 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
+- 初始化链路：同时构造 `TopologyRing` 与 `TopologyTree` → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 机器分组（写入成员）+ 按 `local_rank` 绑核 → 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → 两个拓扑 `FillChannels(*this, channels)` → `InitChannels` 按 `FillPeers` 的边并集建 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
 - 执行链路：五个 collective 公开方法创建 `CollTask` → `planner.Plan` → `executor->Run(plan)`，不在入口展开算法。planner 组装 task 时经 `Topology::FillTransports` 把该 channel 的连接（向量）挂到 `PlanTask`；communicator 不碰单条 transport 的选取。
-- 暴露本机视角：`GetLocalRank()` / `GetLocalSize()` / `GetLocalRanks()` / `IsSingleMachine()`。
+- 暴露本机视角：`GetLocalRank()` / `GetLocalSize()` / `GetLocalRanks()` / `IsSingleMachine()`；以及两个拓扑的访问器 `GetRingTopology()` / `GetTreeTopology()`（planner 用它二选一，见 [planner.md](planner.md)）。
 - 不负责：不决定算法（topology）、不决定等待策略（executor）、不切片（planner）、不实现共享内存环（transport）。
 
 # 文件介绍
@@ -14,15 +14,15 @@
 | 文件 | 职责 |
 |------|------|
 | `include/communicator.h` | `Communicator` 顶层接口（GetUniqueId / Init / 五种 collective / Finalize / local 视图） |
-| `include/channel.h` | `Channel` / `Connector` / `Ring`：`send[p]` / `recv[p]` 是两条有向边的两个槽位；骨架（id + 各槽位 peer/channel_id/is_send）由 communicator 在 `Init` 铺，`ring` 由 topology 填，transport 由 `InitChannels` 装 |
-| `src/communicator.cpp` | `GetUniqueId` + `Init` + `#ifdef` 构造 executor + `ConnectActiveEdges` 内联按边三选一（SHM/RDMA/TCP）+ `Finalize` |
+| `include/channel.h` | `Channel` / `Connector` / `Ring` / `Tree`：`send[p]` / `recv[p]` 是两条有向边的两个槽位；骨架（id + 各槽位 peer/channel_id/is_send）由 communicator 在 `Init` 铺，`ring` 与 `tree`（`parent`/`children`/`star_peers`）由 topology 填，transport 由 `InitChannels` 装 |
+| `src/communicator.cpp` | `GetUniqueId` + `Init`（双拓扑 + 机器分组 + `FillPeers` 建边）+ 构造 executor + `ConnectActiveEdges` 内联按边三选一（SHM/RDMA/TCP）+ `Finalize` |
 | `src/bootstrap.cpp` | master/worker 交换 `NodeInfo`（hostname 与 RDMA 端点） |
 
 # 实现原理
 
 - **unique id**：`GetUniqueId` 只 `CreateListenSocket(0)` 绑空闲端口（fd 记在 `bootstrap_listen_fd`，持到 `Finalize`），把 IP + 端口装进定长 `UniqueId` 返回，不做通信；分发给其余 rank 是启动方责任（`tests/` 用 `MPI_Bcast` 播原始字节）。ip/port 都从 `config.unique_id` 读。
 - **listener 在 bootstrap 前绑好并持有**：bootstrap listener 就是 `GetUniqueId` 绑的那个 fd，`Bootstrap::RunMaster` 只借用不关闭；数据面 TCP listener 在 bootstrap 前 `Listen("", 0)` 建好（`NodeInfo.data_port` 就是它），channel init 完才 `Close()`；RDMA listener 同理，全局不用 RDMA 随即关闭；共享内存 listener 在 bootstrap 前 `Listen(<path>, 0)` 绑 `/tmp/originccl/<port>-<rank>.sock`。
-- **连边方向**：每 channel 连 prev/next 两条边，按 `rank < peer` 决定主动 connect、否则被动 accept（避免启动死锁）。
+- **连边方向**：每 channel 按拓扑 `FillPeers` 返回的有向边集合（ring ∪ tree 的去重并集）逐条建边，按 `rank < peer` 决定主动 connect、否则被动 accept（避免启动死锁）。连接是**公共池**：ring 边与 tree 边共用同一套 `send[p]`/`recv[p]` 槽位，同一条 (i,j) 边只建一次，ring 与 tree 复用同一 transport（同一 channel 同一时刻只有一个算法在跑，方向固定无冲突）。
 - **主动边 5 次重试**：`ConnectActiveEdges` 每条边最多试 `kConnectRetryCount`（5）次、间隔 `kConnectRetryIntervalMs`（100ms），每次失败先 `transport->Close()` 复位再重试，耗尽才初始化失败。
 - **传输选择**：本机 edge（`peer hostname == 本机 hostname`）用共享内存，仅 `OCCL_DISABLE_SHM` 恰好等于 `"1"` 时禁用；网络 edge 是全局决策——所有 rank 都 `rdma_port != 0` 才统一用 RDMA，否则统一 TCP（`OCCL_DISABLE_RDMA=1` 等价本 rank 宣布不支持）。被动端用同一规则（`handshake.rank` → `all_nodes[rank]`），两端判定必然一致。
 - **集合接口语义**：
@@ -42,6 +42,7 @@
 - **unique id 只由 rank0 生成**，其余 rank 从外部拿到同一份 id 调 `Init`；不做「非 rank0」校验，同一对象重复调用 `GetUniqueId` 明确报错。
 - **listener 都在 bootstrap 前绑好并持有**，id 公布出去的端口不可能在首次 accept 前被抢走——不能退回「先取空闲端口 → 关闭 → 重绑」。
 - **连边方向 `rank < peer` 勿回退**（改方向重引入启动死锁）；传输选择不影响方向判定。
+- **机器分组在 bootstrap 后从 `all_nodes` 现算并存进 `Communicator` 成员**：按 hostname 首见序给机器编号（`machine_index`），`machine_leaders[m]` 取第 m 台机器上最小的 rank（即 `local_ranks[0]`）。两个拓扑的 `FillChannels(*this, channels)` 读取这份成员：ring 填 `ring.next/prev`，tree 填 `tree.{parent,children,star_peers}` 并记 `roles_`/`is_leader_`。`FillChannels` 必须在 `InitChannels` 之前调用。
 - **channel 边是有向的，每条边一个独立 transport**：`send[p]` 只发送、`recv[p]` 只接收，是两条有向边、两个 `Connector`、两个 fd。2 rank 时 `prev == next`，同一对 rank 仍是两条独立边、两个 transport，不因 peer 相同而合并。
 - **主动边有 5 次连接重试**（非无重试）；listener 先于 bootstrap 绑好，重试是防御性的。
 - **共享内存失败即初始化失败**，无自动回退 TCP；RDMA 同理，全局选定后建链/QP/MR 错误直接 `LOG_ERROR` + `false`，不静默改走 TCP（`OCCL_DISABLE_RDMA=1` 是显式选择而非回退）。

@@ -164,7 +164,7 @@ bool TransportShm::CreateRing() {
         LOG_ERROR("Failed to size the shared-memory ring: {}", ErrnoText());
         return false;
     }
-    if (!MapRing(resources.ring)) {
+    if (!MapRing(resources.ring, true)) {
         return false;
     }
     resources.data_ready = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -176,7 +176,7 @@ bool TransportShm::CreateRing() {
     return true;
 }
 
-bool TransportShm::MapRing(int fd) {
+bool TransportShm::MapRing(int fd, bool initialize) {
     resources.ring = fd;
     void* addr = mmap(nullptr, kShmRingMapSize, PROT_READ | PROT_WRITE, MAP_SHARED, resources.ring, 0);
     if (addr == MAP_FAILED) {
@@ -185,14 +185,16 @@ bool TransportShm::MapRing(int fd) {
         return false;
     }
     map = static_cast<char*>(addr);
-    new (map) ShmRingCursors{};
+    if (initialize) {
+        new (map) ShmRingCursors{};
+    }
     return true;
 }
 
 bool TransportShm::Adopt(const RingResources& incoming, TransportDirection direction) {
     resources = incoming;
     direction_ = direction;
-    if (!MapRing(resources.ring)) {
+    if (!MapRing(resources.ring, false)) {
         return false;
     }
     connected = true;

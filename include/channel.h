@@ -9,6 +9,12 @@ struct Ring {
     int next = -1;
 };
 
+struct Tree {
+    int parent = -1;
+    std::vector<int> children;
+    std::vector<int> star_peers;
+};
+
 class Connector {
 public:
     int peer = -1;
@@ -21,6 +27,7 @@ class Channel {
 public:
     int id = 0;
     Ring ring;
+    Tree tree;
     std::vector<Connector> send;
     std::vector<Connector> recv;
 

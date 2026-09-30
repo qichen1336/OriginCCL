@@ -32,6 +32,7 @@ set(ORIGIN_CCL_SOURCES
     src/transport/transport_shm.cpp
     src/transport/transport_rdma.cpp
     src/topology_ring.cpp
+    src/topology_tree.cpp
     src/bootstrap.cpp
     src/planner.cpp
     src/executor/multi_thread_executor.cpp

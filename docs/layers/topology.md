@@ -1,4 +1,4 @@
-# Topology 层（`include/topology*.h`、`src/topology_ring.cpp`）
+# Topology 层（`include/topology*.h`、`src/topology_ring.cpp`、`src/topology_tree.cpp`）
 
 集合算法层。**只做事件处理**，把"如何等待 socket 就绪"完全交给 executor。改动算法或状态机前阅读本文件。
 
@@ -9,16 +9,19 @@
   - `CollectiveInit(PlanTask&)`：按 `task.func` 分派初始化，按操作和 rank 角色检查缓冲区。合法零元素任务直接完成；单 rank 只做本地操作，无数据面。
   - `CollectiveStep(PlanTask&, CollEvent)`：非阻塞推进一次。`Writable` → 推进 send，`Readable` → 推进 recv；当前阶段完成后连续结算已完成阶段并主动尝试新阶段启用的传输。
   - `CollectiveDone`：仅表示成功完成（`phase == kPhaseDone`）；失败经 Init/Step 的 false 上报。
-- `FillTransports(channel, send_out, recv_out)`：按拓扑语义挑出该 channel 上本 task 真正要用的连接；planner 不自己看 `ring`/`Connector`。`FillChannels` 只填拓扑形状（`channel.ring`），send/recv 槽位骨架由 communicator 铺。
-- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，只存 `phase, step, send_progress, recv_progress, send_done, recv_done, temp_buffer`。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
+- `FillChannels(comm, channels)`：bootstrap 之后、`FillPeers`/`InitChannels` 之前调用，把拓扑形状写入每个 `Channel`（ring 填 `channel.ring.prev/next`，tree 填 `channel.tree` 的 `parent`/`children`/`star_peers`）；本机视角与机器分组从 `comm` 成员读取，tree 同时把运行时角色 `roles_`/`is_leader_` 记到自己成员。
+- `FillPeers(channel, edges)`：返回本 rank 在该拓扑下要连接的全部 peer（`TopoEdge{peer, is_send}`，每条有向边一条），形状来源是 `channel`（ring 读 `channel.ring`，tree 读 `channel.tree` 三桶）。communicator 据此建连接（见 [communicator.md](communicator.md)）。
+- `FillTransports(channel, send_out, recv_out)`：按拓扑语义挑出该 channel 上本 task 真正要用的连接；planner 不自己看 `ring`/`Connector`。tree 按 `[star_peers, children, parent]` 顺序输出，与 `roles_` 一一对齐。
+- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有的 `algo` union**（`algo.ring.step` 与 `algo.tree.step` 互斥重叠，同一时刻只有当前拓扑的一份有效）。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
 - 不负责：不监听 fd、不决定等待策略、不开线程；无可变成员状态。
 
 # 文件介绍
 
 | 文件 | 职责 |
 |------|------|
-| `include/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillTransports`） |
-| `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport |
+| `include/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillPeers` / `FillTransports`）+ `TopoEdge` |
+| `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport；`FillPeers` 返回 next/prev 两条有向边 |
+| `include/topology_tree.h` / `src/topology_tree.cpp` | Tree 实现：机器内星型 + 机器间 double binary tree（DBT），见下节 |
 
 # 实现原理
 
@@ -36,12 +39,22 @@
 - 临时数据只存于 `state.temp_buffer`（Reduce 2 块、ReduceScatter 1 块、AllReduce 1 个 chunk），不改写 `task.func/root`，不递归调用 communicator 或 executor。
 - 多连接数据面语义：`TrySend`/`TryRecv` 的 `size` 是「每条连接各收发多少字节」，同一份 `send_data`/`recv_data` 对每条连接各自维护进度。
 
+# Tree 拓扑（`TopologyTree`）
+
+- **形态**：机器内星型（同机非 leader 全部只连本机 leader）+ 机器间 DBT（double binary tree，两棵互补二叉堆，leader 参与）。星型是 DBT 的前/后置一跳，不是第三棵树。`channel.tree` 三桶按角色填：leader 的 `star_peers`=本机其余 rank、`children`/`parent`=DBT 子/父；非 leader 只有 `star_peers=[本机 leader]`，`children`/`parent` 为空/-1。
+- **机器分组来自 `Communicator` 成员（`GetLocalRank`/`GetLocalRanks`/`GetMachineIndex`/`GetMachineCount`/`GetMachineLeaders`），由 `FillChannels` 读取**：`local_ranks` 是本机 rank 排序序列，`machine_index` 是本机在首见序机器列表里的下标，`machine_leaders[m]` 是第 m 台机器的 `local_ranks[0]`。`is_leader_` 即 `local_rank == 0`。DBT 父/子（Tree0，根 = machine 0）：`parent(m) = ⌊(m-1)/2⌋`、`children(m) = {2m+1, 2m+2}`，换算到 `machine_leaders` 里的全局 rank；机器数与机器内节点数都假设为 2 的幂，否则 `FillChannels`/`CollectiveInit` `LOG_ERROR` + `false`。单机（`machine_count == 1`）时 DBT 退化为只有 leader 自己，机器间阶段立即完成。
+- **只实现三种操作**：AllReduce / ReduceScatter / AllGather。Broadcast / Reduce 永远走 ring，planner 不选树（见 [planner.md](planner.md)），树的 `CollectiveInit` 收到不支持 func 时 `LOG_ERROR` + `false` 防御。
+- **阶段机**（leader 视角；每 chunk 走一遍）：`StarUp`（收 local children → 归约）→ `DbtUpRecv`（收 DBT children → 归约）→ `DbtUpSend`（发 DBT parent）→ `DbtDownRecv`（收 DBT parent 结果）→ `DbtDownSend`（发 DBT children）→ `StarDown`（发 local children）；非 leader 只有 `StarUp`（发 leader）→ `StarDown`（收 leader）。chunk 粒度是 `kChunkBytes`（见 [planner.md](planner.md)），`algo.tree.step` 是 chunk 游标，逐 chunk 流水推进；chunk 数 `ceil(total / chunk_size)` 由 `TotalElems` 现算。
+- **连接角色**：`roles_` 是与连接输出顺序并行的向量，取值 `Star / T0Down / T0Up`；`FillTransports` 按 `channel.tree` 三桶顺序（先 `star_peers`、再 `children`、再 `parent`）输出连接，`CollectiveStep` 用 `roles_` + 当前 phase 现算每条连接活跃与否，不活跃置 `done = 1` 跳过（等价于"不同阶段用连接子集的交集"）。leader 归约多连接时，每条连接收到的数据落在独立 scratch 槽（`state.temp_buffer` 的 `TotalElems` 之后），收齐后逐条 `PerformReduce` 进累加区。
+- **两棵树共享状态不互斥**：`CollOpState.algo.tree` 只有一个 `step`；两棵 DBT 树的阶段推进由同一 phase 机串行表达（先收子、再发父、再收父、再发子），不再为每棵树维护独立 phase。
+
 # 隐含约定
 
 - **一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等 → 死锁。故"一步"不是原子状态：send/recv 各有独立 progress + done 标志（各自又是与连接一一对应的向量）。
 - **一条连接一份进度，遍历在 topology 层**：`PushBuffer` 按 `CollEvent` 选定一侧后遍历该侧全部 transport 逐条 `TrySend`/`TryRecv`；`Try*` 接口本身保持单连接语义。未就绪连接无进展不影响其他连接；一条失败即整体 false。该侧每次事件语义是「推进该侧全部连接一次」。
 - **错误只有一个通道**：`CollectiveInit`/`CollectiveStep` 及具名 Init/Step 是 `noexcept`，返回 `false` 即失败（拓扑内已 `LOG_ERROR`）；executor 见到 false 立即放弃。意外异常（如 `bad_alloc`）直接终止，不转换为可恢复失败。
 - executor 只使用 `CollectiveInit/CollectiveStep/CollectiveDone`；新增操作不修改 executor，不向 plan 添加函数指针或回调。
-- 并发交换的收发必须同时推进；依赖接收结果的转发阶段必须先收齐再发送。阶段转换经 `BeginPhase` 主动尝试传输，遵守 EPOLLET 契约。
+- 并发交换的收发必须同时推进；依赖接收结果的转发阶段必须先收齐再发送。阶段转换经 `BeginPhase`（ring）/`Activate`（tree）主动尝试传输，遵守 EPOLLET 契约。
 - **`send_done`/`recv_done` 不可改成 `vector<bool>`**（`Try*` 的 done 是 `bool*` 出参，位压缩取不到 `bool&`）。
-- 新增拓扑只实现 `FillTransports` 即可；新增算法实现须继承 `Topology` 基类，实现三件套接口，算法步骤不得在 planner/executor 展开。
+- 新增拓扑只实现 `FillChannels` + `FillPeers` + `FillTransports` 即可；新增算法实现须继承 `Topology` 基类，实现三件套接口，算法步骤不得在 planner/executor 展开。
+- **`algo` union 一次只有一种拓扑有效**：ring 写 `algo.ring.step`、tree 写 `algo.tree.step`，同一 task 由 planner 二选一绑定拓扑，不会交叉读写。

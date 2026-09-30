@@ -33,6 +33,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 - 与 TCP 同构的 listener/connection 双形态：`Listen(path, 0)` + `Accept()`（被动端），`Connect(rendezvous_path, port)`（主动端，`port` 忽略）。`Listen` 的 `port` 参数无意义，`GetListenPort()` 恒返回 0。
 - 建立流程：主动端建 2 MiB 数据容量的 memfd 环 + data-ready/space-ready 两个 eventfd，用 `SOCK_SEQPACKET` + `SCM_RIGHTS` 一次性传给对端并带方向；被动端取补方向。环元数据是 cache line 分隔、单调递增的 `std::atomic<uint64_t>` head/tail（producer 写 head、consumer 写 tail，acquire/release 配对）。
+- **环光标只由主动端（建环方）初始化一次**：`MapRing(fd, initialize)` 仅在 `CreateRing` 传 `initialize=true` 时 placement-new `ShmRingCursors{}`；被动端 `Adopt` 传 `false`，只 mmap 不重写。若两端都初始化，被动端稍晚的映射会把共享 head/tail 归零，与主动端已写入/推进的光标竞争，在连接数较多（如 tree 拓扑）时表现为接收端读不到数据而活锁。这是共享内存映射的隐含约定：**谁创建谁初始化，采用者只读**。
 - 控制 socket 与数据面分开：调用方第一次阻塞 `Send`/`Recv`（即 communicator 握手）走 control socket，接收方回 1 字节 ack，双方随即关闭；之后所有操作走环。
 - 方向在此是约束：producer 只 `Send`、consumer 只 `Recv`，反向 `LOG_ERROR` + `false`。方向只约束数据面。
 - 就绪：`GetFd()` listening 返回 rendezvous fd，建立后返回本端 eventfd（producer 等 space-ready，consumer 等 data-ready）；`GetPollEvents()` 恒 `EPOLLIN`。space-ready 初值 1（事件驱动 producer 首发送不必先轮询），data-ready 初值 0。eventfd 计数单调累积（`Notify` 只增、`Drain` 只在 `Try*` 内），是 EPOLLET 的前提。
@@ -55,7 +56,10 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 # 隐含约定
 
-- **数据面传输只走 `TrySend`/`TryRecv`**（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。历史曾有人把数据面改成阻塞 `Send`/`Recv` 导致死锁。- **对端关闭不是三种传输共有的保证**：TCP 能在对端有序关闭后从 `TryRecv` 得到零长度读；共享内存没有对端死亡信号，RDMA 对端销毁 QP 也不保证 flush 本端接收队列。因此对端关闭后的“失败/空读”断言只对 TCP 成立，另两种只断言本端 `Close()` 释放资源且之后不可再用。- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；communicator 的 channel 握手（`ConnHandshake`）走 Transport 的阻塞 `Send`/`Recv`——这是阻塞接口存在的唯一理由（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`，三种语义一致，调用点不区分传输类型）。
+- **数据面传输只走 `TrySend`/`TryRecv`**（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。历史曾有人把数据面改成阻塞 `Send`/`Recv` 导致死锁。
+- **共享内存环光标「谁创建谁初始化」**：`MapRing` 的 `initialize` 参数只对建环方（`CreateRing`）为真；`Adopt` 采用已有环时传假。给采用方也跑一次 placement-new 会清掉共享光标（见实现原理）。
+- **对端关闭不是三种传输共有的保证**：TCP 能在对端有序关闭后从 `TryRecv` 得到零长度读；共享内存没有对端死亡信号，RDMA 对端销毁 QP 也不保证 flush 本端接收队列。因此对端关闭后的"失败/空读"断言只对 TCP 成立，另两种只断言本端 `Close()` 释放资源且之后不可再用。
+- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；communicator 的 channel 握手（`ConnHandshake`）走 Transport 的阻塞 `Send`/`Recv`——这是阻塞接口存在的唯一理由（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`，三种语义一致，调用点不区分传输类型）。
 - **非阻塞语义是硬约束**：`TrySend`/`TryRecv` 绝不阻塞。
 - **方向对 TCP 只是元数据、不是操作许可**：TCP 任何方向都能收发，方向只决定 `GetPollEvents()`。channel 握手恒由主动连接方先 `Send`、被动方先 `Recv`，所以一条标成 `Receive` 的连接的主动端仍要在它上面 `Send`——不要给 TCP 加反向拒绝的防御。**共享内存与 RDMA 的数据面都把方向当硬约束**：`TrySend`/`TryRecv` 在 `!IsProducer()`/`IsProducer()` 时 `LOG_ERROR` + `false`（RDMA 的例外只在控制握手，它不看方向）。传输测试据此分支：只有 TCP 校验“反向仍可收发”。
 - **就绪位含义由 transport 决定**：socket 是「可写=发送推进、可读=接收推进」，共享内存发送端等的是可读的 eventfd。executor 一律用 `GetPollEvents()`，用「就绪来自 send 还是 recv transport」决定推进哪个逻辑操作，不得自行把位解释成方向。

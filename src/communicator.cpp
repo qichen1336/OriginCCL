@@ -17,6 +17,7 @@
 #include "transport/transport_shm.h"
 #include "transport/transport_rdma.h"
 #include "topology_ring.h"
+#include "topology_tree.h"
 #include "executor/epoll_executor.h"
 #include "executor/polling_executor.h"
 
@@ -84,15 +85,16 @@ bool Communicator::GetUniqueId(UniqueId& unique_id) {
 bool Communicator::Init(const CommConfig& cfg) {
     config = cfg;
 
-    topology = std::make_shared<TopologyRing>();
+    ring_topology_ = std::make_shared<TopologyRing>();
+    tree_topology_ = std::make_shared<TopologyTree>();
     int n_channels = config.n_channels > 0 ? config.n_channels : kDefaultChannelCount;
-    if (!topology->Init(config.rank, config.world_size, n_channels)) {
+    if (!ring_topology_->Init(config.rank, config.world_size, n_channels) ||
+        !tree_topology_->Init(config.rank, config.world_size, n_channels)) {
         LOG_ERROR("Rank {}: Failed to init Topology", config.rank);
         return false;
     }
 
     channels.resize(static_cast<size_t>(n_channels));
-    topology->FillChannels(channels);
     for (size_t i = 0; i < channels.size(); ++i) {
         Channel& channel = channels[i];
         channel.id = static_cast<int>(i);
@@ -111,8 +113,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     }
 
     const bool use_shm = SharedMemoryEnabled();
-    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {}", config.rank,
-             config.world_size, n_channels, topology->GetName());
+    LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {} + {}", config.rank,
+             config.world_size, n_channels, ring_topology_->GetName(), tree_topology_->GetName());
 
     if (config.world_size <= 1) {
         local_rank = 0;
@@ -213,6 +215,27 @@ bool Communicator::Init(const CommConfig& cfg) {
     is_single_machine = (local_size == config.world_size);
     LOG_INFO("Rank {}: local_rank = {}, local_size = {}, single_machine = {}, hostname = {}", config.rank, local_rank,
              local_size, is_single_machine, my_hostname);
+
+    std::vector<std::string> machine_hosts;
+    for (const auto& node : all_nodes) {
+        if (std::find(machine_hosts.begin(), machine_hosts.end(), node.hostname) == machine_hosts.end()) {
+            machine_hosts.push_back(node.hostname);
+        }
+    }
+    machine_count = static_cast<int>(machine_hosts.size());
+    auto machine_it = std::find(machine_hosts.begin(), machine_hosts.end(), my_hostname);
+    machine_index = static_cast<int>(std::distance(machine_hosts.begin(), machine_it));
+    machine_leaders.assign(machine_hosts.size(), -1);
+    for (const auto& node : all_nodes) {
+        auto it = std::find(machine_hosts.begin(), machine_hosts.end(), node.hostname);
+        const int m = static_cast<int>(std::distance(machine_hosts.begin(), it));
+        if (machine_leaders[static_cast<size_t>(m)] < 0) {
+            machine_leaders[static_cast<size_t>(m)] = node.rank;
+        }
+    }
+
+    ring_topology_->FillChannels(*this, channels);
+    tree_topology_->FillChannels(*this, channels);
 
     executor = MakeExecutor(local_size);
     Utils::PinProcessToCpu(local_rank);
@@ -319,17 +342,32 @@ bool Communicator::InitChannels(const std::vector<NodeInfo>& all_nodes,
     std::vector<ChannelEdge> accept_edges;
 
     for (auto& channel : channels) {
-        ChannelEdge send_edge{channel.id, channel.ring.next, true};
-        ChannelEdge recv_edge{channel.id, channel.ring.prev, false};
-        if (config.rank < send_edge.peer) {
-            connect_edges.push_back(send_edge);
-        } else {
-            accept_edges.push_back(send_edge);
-        }
-        if (config.rank < recv_edge.peer) {
-            connect_edges.push_back(recv_edge);
-        } else {
-            accept_edges.push_back(recv_edge);
+        std::vector<TopoEdge> peers;
+        std::vector<TopoEdge> ring_peers;
+        std::vector<TopoEdge> tree_peers;
+        ring_topology_->FillPeers(channel, ring_peers);
+        tree_topology_->FillPeers(channel, tree_peers);
+        peers.insert(peers.end(), ring_peers.begin(), ring_peers.end());
+        peers.insert(peers.end(), tree_peers.begin(), tree_peers.end());
+        std::sort(peers.begin(), peers.end(), [](const TopoEdge& a, const TopoEdge& b) {
+            return a.peer != b.peer ? a.peer < b.peer : a.is_send < b.is_send;
+        });
+        peers.erase(std::unique(peers.begin(), peers.end(),
+                                [](const TopoEdge& a, const TopoEdge& b) {
+                                    return a.peer == b.peer && a.is_send == b.is_send;
+                                }),
+                    peers.end());
+
+        for (const TopoEdge& peer : peers) {
+            if (peer.peer < 0 || peer.peer >= config.world_size || peer.peer == config.rank) {
+                continue;
+            }
+            ChannelEdge edge{channel.id, peer.peer, peer.is_send};
+            if (config.rank < peer.peer) {
+                connect_edges.push_back(edge);
+            } else {
+                accept_edges.push_back(edge);
+            }
         }
     }
 

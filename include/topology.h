@@ -6,6 +6,13 @@
 #include "channel.h"
 #include "types.h"
 
+class Communicator;
+
+struct TopoEdge {
+    int peer = -1;
+    bool is_send = false;
+};
+
 class Topology {
 public:
     virtual ~Topology() = default;
@@ -17,7 +24,8 @@ public:
         return true;
     }
 
-    virtual void FillChannels(std::vector<Channel>& channels) const = 0;
+    virtual void FillChannels(const Communicator& comm, std::vector<Channel>& channels) = 0;
+    virtual void FillPeers(const Channel& channel, std::vector<TopoEdge>& edges) const = 0;
     virtual void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
                                 std::vector<std::shared_ptr<Transport>>& recv_out) const = 0;
 

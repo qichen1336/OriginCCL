@@ -43,9 +43,21 @@ public:
     bool IsSingleMachine() const {
         return is_single_machine;
     }
+    int GetMachineIndex() const {
+        return machine_index;
+    }
+    int GetMachineCount() const {
+        return machine_count;
+    }
+    const std::vector<int>& GetMachineLeaders() const {
+        return machine_leaders;
+    }
 
-    std::shared_ptr<Topology> GetTopology() const {
-        return topology;
+    std::shared_ptr<Topology> GetRingTopology() const {
+        return ring_topology_;
+    }
+    std::shared_ptr<Topology> GetTreeTopology() const {
+        return tree_topology_;
     }
 
     Channel& GetChannel(int channel_id);
@@ -80,7 +92,8 @@ private:
 
 private:
     CommConfig config;
-    std::shared_ptr<Topology> topology;
+    std::shared_ptr<Topology> ring_topology_;
+    std::shared_ptr<Topology> tree_topology_;
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;
@@ -89,4 +102,7 @@ private:
     int local_size = 1;
     std::vector<int> local_ranks;
     bool is_single_machine = true;
+    int machine_index = 0;
+    int machine_count = 0;
+    std::vector<int> machine_leaders;
 };

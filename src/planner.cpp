@@ -5,11 +5,28 @@
 #include "occl_config.h"
 #include "topology.h"
 #include "utils.h"
+#include "logger.h"
 
 CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
+
+    const bool use_tree = (task.func == CollFunc::AllReduce || task.func == CollFunc::ReduceScatter ||
+                           task.func == CollFunc::AllGather) &&
+                          total_bytes / OcclConfig::kChunkBytes < OcclConfig::kTreeThresholdChunks;
+    std::shared_ptr<Topology> topology = use_tree ? comm.GetTreeTopology() : comm.GetRingTopology();
+    const char* func_name = task.func == CollFunc::AllReduce       ? "AllReduce"
+                            : task.func == CollFunc::ReduceScatter ? "ReduceScatter"
+                                                                   : "AllGather";
+    LOG_INFO("Rank {}: {} uses the {} topology for {} bytes", comm.GetRank(), func_name, use_tree ? "tree" : "ring",
+             total_bytes);
+
+    int channel_cap = max_channels;
+    if (use_tree && (task.func == CollFunc::AllGather || task.func == CollFunc::ReduceScatter)) {
+        channel_cap = 1;
+    }
+
     size_t unit_bytes = task.func == CollFunc::AllReduce
                             ? OcclConfig::kChunkBytes * static_cast<size_t>(comm.GetWorldSize())
                             : OcclConfig::kChunkBytes;
@@ -18,7 +35,7 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     size_t rem_bytes = total_bytes % unit_bytes;
     int n_used = 1;
     if (units_total > 0) {
-        n_used = static_cast<int>(std::min(units_total, static_cast<size_t>(max_channels)));
+        n_used = static_cast<int>(std::min(units_total, static_cast<size_t>(channel_cap)));
     }
 
     size_t base_units = units_total / static_cast<size_t>(n_used);
@@ -38,7 +55,7 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
         Channel& comm_channel = comm.GetChannel(c);
         PlanTask plantask;
         plantask.func = task.func;
-        plantask.topology = comm.GetTopology();
+        plantask.topology = topology;
         plantask.send_buf = task.send_buf ? static_cast<const char*>(task.send_buf) + offset * type_size : nullptr;
         plantask.recv_buf = task.recv_buf ? static_cast<char*>(task.recv_buf) + offset * type_size : nullptr;
         plantask.elem_count = elem_count;
@@ -48,8 +65,9 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
         plantask.reduce_op = task.op;
         plantask.rank = comm.GetRank();
         plantask.world_size = comm.GetWorldSize();
-        plantask.chunk_size =
-            (elem_count + static_cast<size_t>(plantask.world_size) - 1) / static_cast<size_t>(plantask.world_size);
+        plantask.chunk_size = use_tree ? OcclConfig::kChunkBytes / type_size
+                                       : (elem_count + static_cast<size_t>(plantask.world_size) - 1) /
+                                             static_cast<size_t>(plantask.world_size);
         plantask.topology->FillTransports(comm_channel, plantask.send_transports, plantask.recv_transports);
         channel.tasks.push_back(std::move(plantask));
         offset += elem_count;

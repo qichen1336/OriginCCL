@@ -20,17 +20,17 @@ size_t ChunkElemCount(size_t count, size_t chunk_size, int chunk_index) {
 int AllreduceSendChunk(const PlanTask& task) {
     const CollOpState& s = task.state;
     if (s.phase == kPhaseReduceScatter) {
-        return (task.rank - s.step + task.world_size) % task.world_size;
+        return (task.rank - s.algo.ring.step + task.world_size) % task.world_size;
     }
-    return (task.rank - s.step + 1 + task.world_size) % task.world_size;
+    return (task.rank - s.algo.ring.step + 1 + task.world_size) % task.world_size;
 }
 
 int AllreduceRecvChunk(const PlanTask& task) {
     const CollOpState& s = task.state;
     if (s.phase == kPhaseReduceScatter) {
-        return (task.rank - s.step + task.world_size - 1) % task.world_size;
+        return (task.rank - s.algo.ring.step + task.world_size - 1) % task.world_size;
     }
-    return (task.rank - s.step + task.world_size) % task.world_size;
+    return (task.rank - s.algo.ring.step + task.world_size) % task.world_size;
 }
 
 size_t AllreduceSendBytes(const PlanTask& task) {
@@ -85,7 +85,7 @@ void ReduceBlock(const PlanTask& task, const void* input, void* output) {
 }
 
 int ReduceScatterInputChunk(const PlanTask& task) {
-    return (task.rank - task.state.step - 2 + 2 * task.world_size) % task.world_size;
+    return (task.rank - task.state.algo.ring.step - 2 + 2 * task.world_size) % task.world_size;
 }
 
 bool SideDone(const std::vector<char>& done) {
@@ -107,7 +107,8 @@ bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* re
             }
             bool done = false;
             if (!task.send_transports[i]->TrySend(send_data, send_bytes, &s.send_progress[i], &done)) {
-                LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
+                LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", op, task.rank, s.phase,
+                          s.algo.ring.step);
                 return false;
             }
             s.send_done[i] = done ? 1 : 0;
@@ -120,7 +121,7 @@ bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* re
         }
         bool done = false;
         if (!task.recv_transports[i]->TryRecv(recv_data, recv_bytes, &s.recv_progress[i], &done)) {
-            LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.step);
+            LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.algo.ring.step);
             return false;
         }
         s.recv_done[i] = done ? 1 : 0;
@@ -143,21 +144,21 @@ bool BeginPhase(PlanTask& task, int phase, const char* send_data, char* recv_dat
 }
 
 const char* AllGatherSendPtr(const PlanTask& task) {
-    return OutputBlock(task, (task.rank - task.state.step + task.world_size) % task.world_size);
+    return OutputBlock(task, (task.rank - task.state.algo.ring.step + task.world_size) % task.world_size);
 }
 
 char* AllGatherRecvPtr(const PlanTask& task) {
-    return OutputBlock(task, (task.rank - task.state.step - 1 + task.world_size) % task.world_size);
+    return OutputBlock(task, (task.rank - task.state.algo.ring.step - 1 + task.world_size) % task.world_size);
 }
 
 char* ReduceScatterSendPtr(const PlanTask& task) {
-    return task.state.step % 2 == 0 ? static_cast<char*>(task.recv_buf)
-                                    : const_cast<char*>(task.state.temp_buffer.data());
+    return task.state.algo.ring.step % 2 == 0 ? static_cast<char*>(task.recv_buf)
+                                              : const_cast<char*>(task.state.temp_buffer.data());
 }
 
 char* ReduceScatterRecvPtr(const PlanTask& task) {
-    return task.state.step % 2 == 0 ? const_cast<char*>(task.state.temp_buffer.data())
-                                    : static_cast<char*>(task.recv_buf);
+    return task.state.algo.ring.step % 2 == 0 ? const_cast<char*>(task.state.temp_buffer.data())
+                                              : static_cast<char*>(task.recv_buf);
 }
 
 bool CompleteBroadcast(PlanTask& task) {
@@ -179,7 +180,7 @@ bool CompleteAllGather(PlanTask& task) {
     CollOpState& s = task.state;
     while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         int next_phase = kPhaseDone;
-        if (++s.step < task.world_size - 1) {
+        if (++s.algo.ring.step < task.world_size - 1) {
             next_phase = kPhaseExchange;
         }
         if (!BeginPhase(task, next_phase, AllGatherSendPtr(task), AllGatherRecvPtr(task), BlockBytes(task),
@@ -219,7 +220,7 @@ bool CompleteReduceScatter(PlanTask& task) {
         char* incoming = ReduceScatterRecvPtr(task);
         ReduceBlock(task, InputBlock(task, ReduceScatterInputChunk(task)), incoming);
         int next_phase = kPhaseDone;
-        if (++s.step < task.world_size - 1) {
+        if (++s.algo.ring.step < task.world_size - 1) {
             next_phase = kPhaseExchange;
         } else {
             if (incoming != task.recv_buf) {
@@ -249,16 +250,16 @@ bool CompleteAllreduce(PlanTask& task) {
             char* recv_ptr = data + recv_chunk * chunk * type_size;
             Utils::PerformReduce(s.temp_buffer.data(), recv_ptr, recv_count, task.dtype,
                                  task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
-            if (task.reduce_op == ReduceOp::AVG && s.step == task.world_size - 2) {
+            if (task.reduce_op == ReduceOp::AVG && s.algo.ring.step == task.world_size - 2) {
                 Utils::ApplyAverage(recv_ptr, recv_count, task.dtype, task.world_size);
             }
         }
 
-        ++s.step;
-        if (s.phase == kPhaseReduceScatter && s.step >= task.world_size - 1) {
+        ++s.algo.ring.step;
+        if (s.phase == kPhaseReduceScatter && s.algo.ring.step >= task.world_size - 1) {
             s.phase = kPhaseAllGather;
-            s.step = 0;
-        } else if (s.phase == kPhaseAllGather && s.step >= task.world_size - 1) {
+            s.algo.ring.step = 0;
+        } else if (s.phase == kPhaseAllGather && s.algo.ring.step >= task.world_size - 1) {
             s.phase = kPhaseDone;
             return true;
         }
@@ -273,11 +274,17 @@ bool CompleteAllreduce(PlanTask& task) {
 
 } // namespace
 
-void TopologyRing::FillChannels(std::vector<Channel>& channels) const {
+void TopologyRing::FillChannels(const Communicator&, std::vector<Channel>& channels) {
     for (Channel& channel : channels) {
         channel.ring.prev = GetPrevRank(rank);
         channel.ring.next = GetNextRank(rank);
     }
+}
+
+void TopologyRing::FillPeers(const Channel& channel, std::vector<TopoEdge>& edges) const {
+    edges.clear();
+    edges.push_back(TopoEdge{channel.ring.next, true});
+    edges.push_back(TopoEdge{channel.ring.prev, false});
 }
 
 int TopologyRing::GetPrevRank(int r) const {
@@ -381,7 +388,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
 
     s.temp_buffer.resize(task.chunk_size * type_size);
     s.phase = kPhaseReduceScatter;
-    s.step = 0;
+    s.algo.ring.step = 0;
     return BeginPhase(task, kPhaseReduceScatter, AllreduceSendPtr(task), AllreduceRecvPtr(task),
                       AllreduceSendBytes(task), AllreduceRecvBytes(task), "AllReduce") &&
            CompleteAllreduce(task);
