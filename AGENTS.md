@@ -74,6 +74,8 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。
   - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
   - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
+- **回归只看摘要，不读 `.out`**：`run_tests.sh` 已把结果既打到 stdout 又写进 `test-reports/summary.txt`。摘要非 PASS 时才用 `grep -n` 在对应 `.out` 里定位。`single.out` / `multi.out` 每个约 29k token、等级 2 更大，一旦读进上下文会随每轮重发，是主要的 token 开销来源。
+- **PASS 的 run 里本来就带 `[ERROR]` 行**，全部来自 contract 的 6 个负向用例（`ExpectFailure`）× rank 数：`AllReduce/AllGather/ReduceScatter` 缺 buffer 走 tree、`Broadcast` 两个越界 root、`Reduce` 一个越界 root 走 ring，每条各产生一次 topology 的 `LOG_ERROR` 与一次 executor 的 `failed to init task on channel 0`。这是「库正确拒绝非法 task」的直接证据，不是失败信号。
 - 想要 sanitizer（asan-ubsan）或覆盖率，需要自己配 CMake 构建。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。
 
 ## commit rules

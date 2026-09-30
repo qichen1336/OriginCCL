@@ -19,8 +19,8 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     const char* func_name = task.func == CollFunc::AllReduce       ? "AllReduce"
                             : task.func == CollFunc::ReduceScatter ? "ReduceScatter"
                                                                    : "AllGather";
-    LOG_INFO("Rank {}: {} uses the {} topology for {} bytes", comm.GetRank(), func_name, use_tree ? "tree" : "ring",
-             total_bytes);
+    LOG_DEBUG("Rank {}: {} uses the {} topology for {} bytes", comm.GetRank(), func_name, use_tree ? "tree" : "ring",
+              total_bytes);
 
     int channel_cap = max_channels;
     if (use_tree && (task.func == CollFunc::AllGather || task.func == CollFunc::ReduceScatter)) {
