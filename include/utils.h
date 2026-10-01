@@ -48,6 +48,7 @@ inline size_t AlignUp(size_t size, size_t alignment) {
 }
 
 size_t GetDataTypeSize(DataType dtype);
+const char* GetCollFuncName(CollFunc func);
 const char* GetDataTypeName(DataType dtype);
 const char* GetReduceOpName(ReduceOp op);
 };

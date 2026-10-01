@@ -11,6 +11,7 @@
 #include "communicator.h"
 #include "logger.h"
 #include "occl_config.h"
+#include "utils.h"
 
 namespace TestCommon {
 namespace {
@@ -231,7 +232,7 @@ bool ExecuteCase(Communicator& comm, const CaseSpec& spec, std::string& reason) 
                 return false;
             }
         }
-        return CheckSentinels(send, spec.count, send_sentinel, "Broadcast", reason);
+        return CheckSentinels(send, spec.count, send_sentinel, Utils::GetCollFuncName(spec.func), reason);
     }
 
     std::vector<Item> expected(output_count);
@@ -262,10 +263,10 @@ bool ExecuteCase(Communicator& comm, const CaseSpec& spec, std::string& reason) 
     if (spec.func == CollFunc::Reduce && rank != spec.root) {
         return true;
     }
-    if (!CheckAllEqual(recv.data(), expected.data(), output_count, FuncName(spec.func), reason)) {
+    if (!CheckAllEqual(recv.data(), expected.data(), output_count, Utils::GetCollFuncName(spec.func), reason)) {
         return false;
     }
-    if (!CheckSentinels(recv, output_count, recv_sentinel, FuncName(spec.func), reason)) {
+    if (!CheckSentinels(recv, output_count, recv_sentinel, Utils::GetCollFuncName(spec.func), reason)) {
         return false;
     }
     if (!spec.inplace && spec.func != CollFunc::Broadcast) {
@@ -282,60 +283,17 @@ bool ExecuteCase(Communicator& comm, const CaseSpec& spec, std::string& reason) 
 
 } // namespace
 
-const char* FuncName(CollFunc func) {
-    switch (func) {
-    case CollFunc::AllReduce:
-        return "AllReduce";
-    case CollFunc::Broadcast:
-        return "Broadcast";
-    case CollFunc::AllGather:
-        return "AllGather";
-    case CollFunc::Reduce:
-        return "Reduce";
-    case CollFunc::ReduceScatter:
-        return "ReduceScatter";
-    }
-    return "Unknown";
-}
-
-const char* DtypeName(DataType dtype) {
-    switch (dtype) {
-    case DataType::FLOAT32:
-        return "FLOAT32";
-    case DataType::FLOAT64:
-        return "FLOAT64";
-    case DataType::INT32:
-        return "INT32";
-    case DataType::INT64:
-        return "INT64";
-    }
-    return "Unknown";
-}
-
-const char* OpName(ReduceOp op) {
-    switch (op) {
-    case ReduceOp::SUM:
-        return "SUM";
-    case ReduceOp::MAX:
-        return "MAX";
-    case ReduceOp::MIN:
-        return "MIN";
-    case ReduceOp::AVG:
-        return "AVG";
-    }
-    return "Unknown";
-}
-
 std::string CaseId(const CaseSpec& spec) {
     if (spec.kind == CaseKind::ZeroCount) {
-        return fmt::format("{}|zero", FuncName(spec.func));
+        return fmt::format("{}|zero", Utils::GetCollFuncName(spec.func));
     }
     if (spec.kind == CaseKind::ExpectFailure) {
-        return fmt::format("{}|invalid{}|root{}", FuncName(spec.func), spec.invalid, spec.root);
+        return fmt::format("{}|invalid{}|root{}", Utils::GetCollFuncName(spec.func), spec.invalid, spec.root);
     }
-    std::string id = fmt::format("{}-{}-{}", FuncName(spec.func), DtypeName(spec.dtype), spec.count);
+    std::string id =
+        fmt::format("{}-{}-{}", Utils::GetCollFuncName(spec.func), Utils::GetDataTypeName(spec.dtype), spec.count);
     if (IsReduceFunc(spec.func)) {
-        id += fmt::format("-{}", OpName(spec.op));
+        id += fmt::format("-{}", Utils::GetReduceOpName(spec.op));
     }
     if (spec.func == CollFunc::Broadcast || spec.func == CollFunc::Reduce) {
         id += fmt::format("-root{}", spec.root);

@@ -35,9 +35,6 @@ struct TestOptions {
     std::string report_path;
 };
 
-const char* FuncName(CollFunc func);
-const char* DtypeName(DataType dtype);
-const char* OpName(ReduceOp op);
 std::string CaseId(const CaseSpec& spec);
 
 TestOptions ParseOptions(int argc, char** argv);
@@ -54,8 +51,7 @@ bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int worl
 bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason);
 
 void ReportOutcome(const std::string& report_path, const std::string& suite, int rank, int world_size,
-                   const std::string& status, const std::string& reason,
-                   const std::vector<std::string>& failures);
+                   const std::string& status, const std::string& reason, const std::vector<std::string>& failures);
 
 class Runner {
 public:

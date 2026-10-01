@@ -98,7 +98,7 @@ void MarkAllDone(PlanTask& task) {
 }
 
 bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* recv_data, size_t send_bytes,
-                size_t recv_bytes, const char* op) {
+                size_t recv_bytes) {
     CollOpState& s = task.state;
     if (event == CollEvent::Writable) {
         for (size_t i = 0; i < task.send_transports.size(); ++i) {
@@ -107,8 +107,8 @@ bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* re
             }
             bool done = false;
             if (!task.send_transports[i]->TrySend(send_data, send_bytes, &s.send_progress[i], &done)) {
-                LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", op, task.rank, s.phase,
-                          s.algo.ring.step);
+                LOG_ERROR("Ring {} send failed on rank {} (phase {}, step {})", Utils::GetCollFuncName(task.func),
+                          task.rank, s.phase, s.algo.ring.step);
                 return false;
             }
             s.send_done[i] = done ? 1 : 0;
@@ -121,7 +121,8 @@ bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* re
         }
         bool done = false;
         if (!task.recv_transports[i]->TryRecv(recv_data, recv_bytes, &s.recv_progress[i], &done)) {
-            LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", op, task.rank, s.phase, s.algo.ring.step);
+            LOG_ERROR("Ring {} recv failed on rank {} (phase {}, step {})", Utils::GetCollFuncName(task.func),
+                      task.rank, s.phase, s.algo.ring.step);
             return false;
         }
         s.recv_done[i] = done ? 1 : 0;
@@ -129,8 +130,8 @@ bool PushBuffer(PlanTask& task, CollEvent event, const char* send_data, char* re
     return true;
 }
 
-bool BeginPhase(PlanTask& task, int phase, const char* send_data, char* recv_data, size_t send_bytes, size_t recv_bytes,
-                const char* op) {
+bool BeginPhase(PlanTask& task, int phase, const char* send_data, char* recv_data, size_t send_bytes,
+                size_t recv_bytes) {
     CollOpState& s = task.state;
     s.phase = phase;
     bool send_skip = (phase == kPhaseRecv || phase == kPhaseDone) || send_bytes == 0;
@@ -139,8 +140,8 @@ bool BeginPhase(PlanTask& task, int phase, const char* send_data, char* recv_dat
     s.recv_progress.assign(task.recv_transports.size(), 0);
     s.send_done.assign(task.send_transports.size(), send_skip ? 1 : 0);
     s.recv_done.assign(task.recv_transports.size(), recv_skip ? 1 : 0);
-    return PushBuffer(task, CollEvent::Writable, send_data, recv_data, send_bytes, recv_bytes, op) &&
-           PushBuffer(task, CollEvent::Readable, send_data, recv_data, send_bytes, recv_bytes, op);
+    return PushBuffer(task, CollEvent::Writable, send_data, recv_data, send_bytes, recv_bytes) &&
+           PushBuffer(task, CollEvent::Readable, send_data, recv_data, send_bytes, recv_bytes);
 }
 
 const char* AllGatherSendPtr(const PlanTask& task) {
@@ -169,7 +170,7 @@ bool CompleteBroadcast(PlanTask& task) {
             next_phase = kPhaseSend;
         }
         if (!BeginPhase(task, next_phase, static_cast<const char*>(task.recv_buf), static_cast<char*>(task.recv_buf),
-                        BlockBytes(task), BlockBytes(task), "Broadcast")) {
+                        BlockBytes(task), BlockBytes(task))) {
             return false;
         }
     }
@@ -184,7 +185,7 @@ bool CompleteAllGather(PlanTask& task) {
             next_phase = kPhaseExchange;
         }
         if (!BeginPhase(task, next_phase, AllGatherSendPtr(task), AllGatherRecvPtr(task), BlockBytes(task),
-                        BlockBytes(task), "AllGather")) {
+                        BlockBytes(task))) {
             return false;
         }
     }
@@ -207,7 +208,7 @@ bool CompleteReduce(PlanTask& task) {
             }
         }
         if (!BeginPhase(task, next_phase, s.temp_buffer.data(), s.temp_buffer.data() + BlockBytes(task),
-                        BlockBytes(task), BlockBytes(task), "Reduce")) {
+                        BlockBytes(task), BlockBytes(task))) {
             return false;
         }
     }
@@ -231,7 +232,7 @@ bool CompleteReduceScatter(PlanTask& task) {
             }
         }
         if (!BeginPhase(task, next_phase, ReduceScatterSendPtr(task), ReduceScatterRecvPtr(task), BlockBytes(task),
-                        BlockBytes(task), "ReduceScatter")) {
+                        BlockBytes(task))) {
             return false;
         }
     }
@@ -265,7 +266,7 @@ bool CompleteAllreduce(PlanTask& task) {
         }
 
         if (!BeginPhase(task, s.phase, AllreduceSendPtr(task), AllreduceRecvPtr(task), AllreduceSendBytes(task),
-                        AllreduceRecvBytes(task), "AllReduce")) {
+                        AllreduceRecvBytes(task))) {
             return false;
         }
     }
@@ -390,7 +391,7 @@ bool TopologyRing::AllreduceInit(PlanTask& task) const noexcept {
     s.phase = kPhaseReduceScatter;
     s.algo.ring.step = 0;
     return BeginPhase(task, kPhaseReduceScatter, AllreduceSendPtr(task), AllreduceRecvPtr(task),
-                      AllreduceSendBytes(task), AllreduceRecvBytes(task), "AllReduce") &&
+                      AllreduceSendBytes(task), AllreduceRecvBytes(task)) &&
            CompleteAllreduce(task);
 }
 
@@ -406,7 +407,7 @@ bool TopologyRing::AllreduceStep(PlanTask& task, CollEvent event) const noexcept
     }
 
     if (!PushBuffer(task, event, AllreduceSendPtr(task), AllreduceRecvPtr(task), AllreduceSendBytes(task),
-                    AllreduceRecvBytes(task), "AllReduce")) {
+                    AllreduceRecvBytes(task))) {
         return false;
     }
     return CompleteAllreduce(task);
@@ -440,7 +441,7 @@ bool TopologyRing::BroadcastInit(PlanTask& task) const noexcept {
     }
     int phase = task.rank == task.root ? kPhaseSend : kPhaseRecv;
     return BeginPhase(task, phase, static_cast<const char*>(task.recv_buf), static_cast<char*>(task.recv_buf),
-                      BlockBytes(task), BlockBytes(task), "Broadcast") &&
+                      BlockBytes(task), BlockBytes(task)) &&
            CompleteBroadcast(task);
 }
 
@@ -453,7 +454,7 @@ bool TopologyRing::BroadcastStep(PlanTask& task, CollEvent event) const noexcept
         return true;
     }
     if (!PushBuffer(task, event, static_cast<const char*>(task.recv_buf), static_cast<char*>(task.recv_buf),
-                    BlockBytes(task), BlockBytes(task), "Broadcast")) {
+                    BlockBytes(task), BlockBytes(task))) {
         return false;
     }
     return CompleteBroadcast(task);
@@ -487,7 +488,7 @@ bool TopologyRing::AllGatherInit(PlanTask& task) const noexcept {
         return false;
     }
     return BeginPhase(task, kPhaseExchange, AllGatherSendPtr(task), AllGatherRecvPtr(task), BlockBytes(task),
-                      BlockBytes(task), "AllGather") &&
+                      BlockBytes(task)) &&
            CompleteAllGather(task);
 }
 
@@ -499,8 +500,7 @@ bool TopologyRing::AllGatherStep(PlanTask& task, CollEvent event) const noexcept
     if (s.phase == kPhaseDone) {
         return true;
     }
-    if (!PushBuffer(task, event, AllGatherSendPtr(task), AllGatherRecvPtr(task), BlockBytes(task), BlockBytes(task),
-                    "AllGather")) {
+    if (!PushBuffer(task, event, AllGatherSendPtr(task), AllGatherRecvPtr(task), BlockBytes(task), BlockBytes(task))) {
         return false;
     }
     return CompleteAllGather(task);
@@ -537,7 +537,7 @@ bool TopologyRing::ReduceInit(PlanTask& task) const noexcept {
     std::memcpy(s.temp_buffer.data(), task.send_buf, BlockBytes(task));
     int phase = RootPosition(task) == 1 ? kPhaseSend : kPhaseRecv;
     return BeginPhase(task, phase, s.temp_buffer.data(), s.temp_buffer.data() + BlockBytes(task), BlockBytes(task),
-                      BlockBytes(task), "Reduce") &&
+                      BlockBytes(task)) &&
            CompleteReduce(task);
 }
 
@@ -550,7 +550,7 @@ bool TopologyRing::ReduceStep(PlanTask& task, CollEvent event) const noexcept {
         return true;
     }
     if (!PushBuffer(task, event, s.temp_buffer.data(), s.temp_buffer.data() + BlockBytes(task), BlockBytes(task),
-                    BlockBytes(task), "Reduce")) {
+                    BlockBytes(task))) {
         return false;
     }
     return CompleteReduce(task);
@@ -586,7 +586,7 @@ bool TopologyRing::ReduceScatterInit(PlanTask& task) const noexcept {
     s.temp_buffer.resize(BlockBytes(task));
     std::memcpy(task.recv_buf, InputBlock(task, (task.rank - 1 + task.world_size) % task.world_size), BlockBytes(task));
     return BeginPhase(task, kPhaseExchange, ReduceScatterSendPtr(task), ReduceScatterRecvPtr(task), BlockBytes(task),
-                      BlockBytes(task), "ReduceScatter") &&
+                      BlockBytes(task)) &&
            CompleteReduceScatter(task);
 }
 
@@ -599,7 +599,7 @@ bool TopologyRing::ReduceScatterStep(PlanTask& task, CollEvent event) const noex
         return true;
     }
     if (!PushBuffer(task, event, ReduceScatterSendPtr(task), ReduceScatterRecvPtr(task), BlockBytes(task),
-                    BlockBytes(task), "ReduceScatter")) {
+                    BlockBytes(task))) {
         return false;
     }
     return CompleteReduceScatter(task);

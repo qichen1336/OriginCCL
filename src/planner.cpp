@@ -16,18 +16,11 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
                            task.func == CollFunc::AllGather) &&
                           total_bytes / OcclConfig::kChunkBytes < OcclConfig::kTreeThresholdChunks;
     std::shared_ptr<Topology> topology = use_tree ? comm.GetTreeTopology() : comm.GetRingTopology();
-    const char* func_name = task.func == CollFunc::AllReduce       ? "AllReduce"
-                            : task.func == CollFunc::ReduceScatter ? "ReduceScatter"
-                                                                   : "AllGather";
+    const char* func_name = Utils::GetCollFuncName(task.func);
     LOG_DEBUG("Rank {}: {} uses the {} topology for {} bytes", comm.GetRank(), func_name, use_tree ? "tree" : "ring",
               total_bytes);
 
-    int channel_cap = max_channels;
-    if (use_tree && (task.func == CollFunc::AllGather || task.func == CollFunc::ReduceScatter)) {
-        channel_cap = 1;
-    }
-
-    size_t unit_bytes = task.func == CollFunc::AllReduce
+    size_t unit_bytes = (use_tree || task.func == CollFunc::AllReduce)
                             ? OcclConfig::kChunkBytes * static_cast<size_t>(comm.GetWorldSize())
                             : OcclConfig::kChunkBytes;
 
@@ -35,7 +28,7 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
     size_t rem_bytes = total_bytes % unit_bytes;
     int n_used = 1;
     if (units_total > 0) {
-        n_used = static_cast<int>(std::min(units_total, static_cast<size_t>(channel_cap)));
+        n_used = static_cast<int>(std::min(units_total, static_cast<size_t>(max_channels)));
     }
 
     size_t base_units = units_total / static_cast<size_t>(n_used);

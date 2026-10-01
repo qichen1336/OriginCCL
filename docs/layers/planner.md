@@ -24,8 +24,8 @@
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
 - `PlanTask.topology` 复用 communicator 的 `GetRingTopology()`/`GetTreeTopology()`，planner 不新建拓扑。
-- 启用 channel 规则：AllReduce 每 channel 最小颗粒度 `OcclConfig::kChunkBytes × world_size`，其余操作 `kChunkBytes`（合称 `unit`）；使用数 `n_used = min(total_bytes / unit, GetNChannels())`，小消息只触发单 channel。`total_bytes = count*type_size`，多块操作也按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
-- tree 下 AllGather / ReduceScatter 强制单 channel（`channel_cap = 1`），因它们的块布局跨度 `rank_stride = count`，切多 channel 会破坏「每 rank 一整块」的对齐；AllReduce 仍可按 unit 多 channel 切。
+- 启用 channel 规则：tree 下的全部操作（AllReduce / ReduceScatter / AllGather）与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
+- 三种 tree 操作都可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 内部把各 rank 的切片紧凑打包后再搬运，因此「每 rank 一整块」的对齐不受切片影响。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`，planner 不重复赋值。
 
 # 隐含约定

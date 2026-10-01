@@ -420,6 +420,23 @@ size_t GetDataTypeSize(DataType dtype) {
     }
 }
 
+const char* GetCollFuncName(CollFunc func) {
+    switch (func) {
+    case CollFunc::AllReduce:
+        return "AllReduce";
+    case CollFunc::Broadcast:
+        return "Broadcast";
+    case CollFunc::AllGather:
+        return "AllGather";
+    case CollFunc::Reduce:
+        return "Reduce";
+    case CollFunc::ReduceScatter:
+        return "ReduceScatter";
+    default:
+        return "UNKNOWN";
+    }
+}
+
 const char* GetDataTypeName(DataType dtype) {
     switch (dtype) {
     case DataType::FLOAT32:

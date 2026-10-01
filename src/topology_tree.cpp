@@ -9,17 +9,21 @@
 namespace {
 
 constexpr int kPhaseUnstarted = 0;
-constexpr int kPhaseStarUp = 1;
-constexpr int kPhaseDbtUpRecv = 2;
-constexpr int kPhaseDbtUpSend = 3;
-constexpr int kPhaseDbtDownRecv = 4;
-constexpr int kPhaseDbtDownSend = 5;
-constexpr int kPhaseStarDown = 6;
+constexpr int kPhaseUpStar = 1;
+constexpr int kPhaseUpTreeRecv = 2;
+constexpr int kPhaseUpTreeSend = 3;
+constexpr int kPhaseDownTreeRecv = 4;
+constexpr int kPhaseDownTreeSend = 5;
+constexpr int kPhaseDownStar = 6;
 constexpr int kPhaseDone = 7;
 
 constexpr int kRoleStar = 0;
 constexpr int kRoleT0Down = 1;
 constexpr int kRoleT0Up = 2;
+
+constexpr uint32_t kStarMask = 1u << kRoleStar;
+constexpr uint32_t kDownMask = 1u << kRoleT0Down;
+constexpr uint32_t kUpMask = 1u << kRoleT0Up;
 
 size_t TypeSize(const PlanTask& task) {
     return Utils::GetDataTypeSize(task.dtype);
@@ -29,10 +33,18 @@ size_t TotalElems(const PlanTask& task) {
     if (task.func == CollFunc::AllReduce) {
         return task.elem_count;
     }
-    return static_cast<size_t>(task.world_size) * task.rank_stride;
+    return static_cast<size_t>(task.world_size) * task.elem_count;
 }
 
-size_t ChunkElems(const PlanTask& task, size_t total, size_t chunk) {
+size_t ChunkCount(const PlanTask& task) {
+    if (task.chunk_size == 0) {
+        return 0;
+    }
+    return (TotalElems(task) + task.chunk_size - 1) / task.chunk_size;
+}
+
+size_t ChunkElems(const PlanTask& task, size_t chunk) {
+    size_t total = TotalElems(task);
     size_t start = chunk * task.chunk_size;
     return start >= total ? 0 : std::min(task.chunk_size, total - start);
 }
@@ -72,41 +84,52 @@ size_t CountReduceRecv(const std::vector<int>& roles) {
 
 void SeedAccumulator(PlanTask& task) {
     size_t type_size = TypeSize(task);
+    size_t stride = task.elem_count;
     char* acc = Accumulator(task);
     if (task.func == CollFunc::AllReduce) {
-        std::memcpy(acc, task.send_buf, task.elem_count * type_size);
-    } else if (task.func == CollFunc::ReduceScatter) {
-        std::memcpy(acc, task.send_buf, TotalElems(task) * type_size);
-    } else {
-        std::memset(acc, 0, TotalElems(task) * type_size);
-        std::memcpy(acc + static_cast<size_t>(task.rank) * task.rank_stride * type_size, task.send_buf,
-                    task.elem_count * type_size);
+        std::memcpy(acc, task.send_buf, stride * type_size);
+        return;
     }
+    if (task.func == CollFunc::ReduceScatter) {
+        for (int block = 0; block < task.world_size; ++block) {
+            std::memcpy(acc + static_cast<size_t>(block) * stride * type_size,
+                        static_cast<const char*>(task.send_buf) +
+                            static_cast<size_t>(block) * task.rank_stride * type_size,
+                        stride * type_size);
+        }
+        return;
+    }
+    std::memset(acc, 0, TotalElems(task) * type_size);
+    std::memcpy(acc + static_cast<size_t>(task.rank) * stride * type_size, task.send_buf, stride * type_size);
 }
 
 void ExtractResult(PlanTask& task) {
     size_t type_size = TypeSize(task);
-    char* acc = Accumulator(task);
+    size_t stride = task.elem_count;
+    const char* acc = Accumulator(task);
     if (task.func == CollFunc::AllReduce) {
-        std::memcpy(task.recv_buf, acc, task.elem_count * type_size);
+        std::memcpy(task.recv_buf, acc, stride * type_size);
         if (task.reduce_op == ReduceOp::AVG) {
-            Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
+            Utils::ApplyAverage(task.recv_buf, stride, task.dtype, task.world_size);
         }
-    } else if (task.func == CollFunc::ReduceScatter) {
-        std::memcpy(task.recv_buf, acc + static_cast<size_t>(task.rank) * task.rank_stride * type_size,
-                    task.rank_stride * type_size);
+        return;
+    }
+    if (task.func == CollFunc::ReduceScatter) {
+        std::memcpy(task.recv_buf, acc + static_cast<size_t>(task.rank) * stride * type_size, stride * type_size);
         if (task.reduce_op == ReduceOp::AVG) {
-            Utils::ApplyAverage(task.recv_buf, task.rank_stride, task.dtype, task.world_size);
+            Utils::ApplyAverage(task.recv_buf, stride, task.dtype, task.world_size);
         }
-    } else {
-        std::memcpy(task.recv_buf, acc, TotalElems(task) * type_size);
+        return;
+    }
+    for (int block = 0; block < task.world_size; ++block) {
+        std::memcpy(static_cast<char*>(task.recv_buf) + static_cast<size_t>(block) * task.rank_stride * type_size,
+                    acc + static_cast<size_t>(block) * stride * type_size, stride * type_size);
     }
 }
 
-void CombineRole(PlanTask& task, const std::vector<int>& roles, int role, size_t chunk) {
-    size_t total = TotalElems(task);
-    size_t nelems = ChunkElems(task, total, chunk);
+void CombineChunk(PlanTask& task, const std::vector<int>& roles, size_t chunk, int role) {
     size_t type_size = TypeSize(task);
+    size_t nelems = ChunkElems(task, chunk);
     char* acc = Accumulator(task) + chunk * task.chunk_size * type_size;
     ReduceOp op = CombineOp(task);
     for (size_t i = 0; i < task.recv_transports.size(); ++i) {
@@ -151,14 +174,13 @@ bool PushRecv(PlanTask& task, char* shared_recv, size_t recv_bytes, bool per_con
 }
 
 bool RecvPerConn(int phase) {
-    return phase == kPhaseStarUp || phase == kPhaseDbtUpRecv;
+    return phase == kPhaseUpStar || phase == kPhaseUpTreeRecv;
 }
 
-void SetActive(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask, uint32_t recv_mask) {
+bool Activate(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask, uint32_t recv_mask, size_t chunk) {
     CollOpState& s = task.state;
     for (size_t i = 0; i < task.send_transports.size(); ++i) {
-        bool active = (send_mask & Bit(roles[i])) != 0;
-        if (active) {
+        if ((send_mask & Bit(roles[i])) != 0) {
             if (s.send_done[i]) {
                 s.send_done[i] = 0;
                 s.send_progress[i] = 0;
@@ -168,8 +190,7 @@ void SetActive(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask
         }
     }
     for (size_t i = 0; i < task.recv_transports.size(); ++i) {
-        bool active = (recv_mask & Bit(roles[i])) != 0;
-        if (active) {
+        if ((recv_mask & Bit(roles[i])) != 0) {
             if (s.recv_done[i]) {
                 s.recv_done[i] = 0;
                 s.recv_progress[i] = 0;
@@ -178,116 +199,125 @@ void SetActive(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask
             s.recv_done[i] = 1;
         }
     }
-}
-
-bool Activate(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask, uint32_t recv_mask) {
-    SetActive(task, roles, send_mask, recv_mask);
-    CollOpState& s = task.state;
-    size_t total = TotalElems(task);
-    size_t nelems = ChunkElems(task, total, s.algo.tree.step);
-    size_t nbytes = nelems * TypeSize(task);
-    char* acc_chunk = Accumulator(task) + s.algo.tree.step * task.chunk_size * TypeSize(task);
+    size_t nbytes = ChunkElems(task, chunk) * TypeSize(task);
+    char* acc_chunk = Accumulator(task) + chunk * task.chunk_size * TypeSize(task);
     return PushSend(task, acc_chunk, nbytes) && PushRecv(task, acc_chunk, nbytes, RecvPerConn(s.phase));
 }
 
-bool StartStarUp(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    task.state.phase = kPhaseStarUp;
-    return Activate(task, roles, is_leader ? 0 : Bit(kRoleStar), is_leader ? Bit(kRoleStar) : 0);
+bool StartUpStar(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    task.state.phase = kPhaseUpStar;
+    return Activate(task, roles, is_leader ? 0 : kStarMask, is_leader ? kStarMask : 0, task.state.algo.tree.step);
 }
 
-bool StartDbtUpRecv(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDbtUpRecv;
-    return Activate(task, roles, 0, Bit(kRoleT0Down));
+bool StartUpTreeRecv(PlanTask& task, const std::vector<int>& roles) {
+    task.state.phase = kPhaseUpTreeRecv;
+    return Activate(task, roles, 0, kDownMask, task.state.algo.tree.step);
 }
 
-bool StartDbtUpSend(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDbtUpSend;
-    return Activate(task, roles, Bit(kRoleT0Up), 0);
+bool StartUpTreeSend(PlanTask& task, const std::vector<int>& roles) {
+    task.state.phase = kPhaseUpTreeSend;
+    return Activate(task, roles, kUpMask, 0, task.state.algo.tree.step);
 }
 
-bool StartDbtDownRecv(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDbtDownRecv;
-    return Activate(task, roles, 0, Bit(kRoleT0Up));
+bool StartDownTreeRecv(PlanTask& task, const std::vector<int>& roles) {
+    task.state.phase = kPhaseDownTreeRecv;
+    return Activate(task, roles, 0, kUpMask, task.state.algo.tree.step);
 }
 
-bool StartDbtDownSend(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDbtDownSend;
-    return Activate(task, roles, Bit(kRoleT0Down), 0);
+bool StartDownTreeSend(PlanTask& task, const std::vector<int>& roles) {
+    task.state.phase = kPhaseDownTreeSend;
+    return Activate(task, roles, kDownMask, 0, task.state.algo.tree.step);
 }
 
-bool StartStarDown(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    task.state.phase = kPhaseStarDown;
-    return Activate(task, roles, is_leader ? Bit(kRoleStar) : 0, is_leader ? 0 : Bit(kRoleStar));
+bool StartDownStar(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    task.state.phase = kPhaseDownStar;
+    return Activate(task, roles, is_leader ? kStarMask : 0, is_leader ? 0 : kStarMask, task.state.algo.tree.step);
 }
 
-bool AdvanceChunk(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+bool StartDown(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    if (is_leader) {
+        return StartDownTreeRecv(task, roles);
+    }
+    return StartDownStar(task, roles, is_leader);
+}
+
+bool NextUpChunk(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
     CollOpState& s = task.state;
-    size_t total = TotalElems(task);
-    if (static_cast<size_t>(s.algo.tree.step + 1) * task.chunk_size >= total) {
+    if (static_cast<size_t>(s.algo.tree.step + 1) >= ChunkCount(task)) {
+        s.algo.tree.step = 0;
+        return StartDown(task, roles, is_leader);
+    }
+    ++s.algo.tree.step;
+    return StartUpStar(task, roles, is_leader);
+}
+
+bool NextDownChunk(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    CollOpState& s = task.state;
+    if (static_cast<size_t>(s.algo.tree.step + 1) >= ChunkCount(task)) {
         s.phase = kPhaseDone;
         ExtractResult(task);
         return true;
     }
     ++s.algo.tree.step;
-    return StartStarUp(task, roles, is_leader);
+    return StartDown(task, roles, is_leader);
 }
 
 bool Complete(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
     CollOpState& s = task.state;
     while (s.phase != kPhaseDone) {
         switch (s.phase) {
-        case kPhaseStarUp:
+        case kPhaseUpStar:
             if (is_leader) {
                 if (!SideDone(s.recv_done)) {
                     return true;
                 }
-                CombineRole(task, roles, kRoleStar, s.algo.tree.step);
-                if (!StartDbtUpRecv(task, roles)) {
+                CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleStar);
+                if (!StartUpTreeRecv(task, roles)) {
                     return false;
                 }
             } else {
                 if (!SideDone(s.send_done)) {
                     return true;
                 }
-                if (!StartStarDown(task, roles, is_leader)) {
+                if (!NextUpChunk(task, roles, is_leader)) {
                     return false;
                 }
             }
             continue;
-        case kPhaseDbtUpRecv:
+        case kPhaseUpTreeRecv:
             if (!SideDone(s.recv_done)) {
                 return true;
             }
-            CombineRole(task, roles, kRoleT0Down, s.algo.tree.step);
-            if (!StartDbtUpSend(task, roles)) {
+            CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleT0Down);
+            if (!StartUpTreeSend(task, roles)) {
                 return false;
             }
             continue;
-        case kPhaseDbtUpSend:
+        case kPhaseUpTreeSend:
             if (!SideDone(s.send_done)) {
                 return true;
             }
-            if (!StartDbtDownRecv(task, roles)) {
+            if (!NextUpChunk(task, roles, is_leader)) {
                 return false;
             }
             continue;
-        case kPhaseDbtDownRecv:
+        case kPhaseDownTreeRecv:
             if (!SideDone(s.recv_done)) {
                 return true;
             }
-            if (!StartDbtDownSend(task, roles)) {
+            if (!StartDownTreeSend(task, roles)) {
                 return false;
             }
             continue;
-        case kPhaseDbtDownSend:
+        case kPhaseDownTreeSend:
             if (!SideDone(s.send_done)) {
                 return true;
             }
-            if (!StartStarDown(task, roles, is_leader)) {
+            if (!StartDownStar(task, roles, is_leader)) {
                 return false;
             }
             continue;
-        case kPhaseStarDown:
+        case kPhaseDownStar:
             if (is_leader) {
                 if (!SideDone(s.send_done)) {
                     return true;
@@ -297,7 +327,7 @@ bool Complete(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
                     return true;
                 }
             }
-            if (!AdvanceChunk(task, roles, is_leader)) {
+            if (!NextDownChunk(task, roles, is_leader)) {
                 return false;
             }
             continue;
@@ -310,10 +340,9 @@ bool Complete(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
 
 bool PushStep(PlanTask& task, CollEvent event) {
     CollOpState& s = task.state;
-    size_t total = TotalElems(task);
-    size_t nelems = ChunkElems(task, total, s.algo.tree.step);
-    size_t nbytes = nelems * TypeSize(task);
-    char* acc_chunk = Accumulator(task) + s.algo.tree.step * task.chunk_size * TypeSize(task);
+    size_t chunk = static_cast<size_t>(s.algo.tree.step);
+    size_t nbytes = ChunkElems(task, chunk) * TypeSize(task);
+    char* acc_chunk = Accumulator(task) + chunk * task.chunk_size * TypeSize(task);
     if (event == CollEvent::Writable) {
         return PushSend(task, acc_chunk, nbytes);
     }
@@ -360,7 +389,7 @@ bool TreeInit(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
         return false;
     }
 
-    return StartStarUp(task, roles, is_leader) && Complete(task, roles, is_leader);
+    return StartUpStar(task, roles, is_leader) && Complete(task, roles, is_leader);
 }
 
 } // namespace
