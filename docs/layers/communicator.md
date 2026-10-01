@@ -42,7 +42,7 @@
 - **unique id 只由 rank0 生成**，其余 rank 从外部拿到同一份 id 调 `Init`；不做「非 rank0」校验，同一对象重复调用 `GetUniqueId` 明确报错。
 - **listener 都在 bootstrap 前绑好并持有**，id 公布出去的端口不可能在首次 accept 前被抢走——不能退回「先取空闲端口 → 关闭 → 重绑」。
 - **连边方向 `rank < peer` 勿回退**（改方向重引入启动死锁）；传输选择不影响方向判定。
-- **机器分组在 bootstrap 后从 `all_nodes` 现算并存进 `Communicator` 成员**：按 hostname 首见序给机器编号（`machine_index`），`machine_leaders[m]` 取第 m 台机器上最小的 rank（即 `local_ranks[0]`）。两个拓扑的 `FillChannels(*this, channels)` 读取这份成员：ring 填 `ring.next/prev`，tree 填 `tree.{parent,children,star_peers}` 并记 `roles_`/`is_leader_`。`FillChannels` 必须在 `InitChannels` 之前调用。
+- **机器分组在 bootstrap 后从 `all_nodes` 现算并存进 `Communicator` 成员**：按 hostname 首见序给机器编号（`machine_index`），`machine_leaders[m]` 取第 m 台机器上最小的 rank（即 `local_ranks[0]`）。两个拓扑的 `FillChannels(*this, channels)` 读取这份成员：ring 填 `ring.next/prev`，tree 填 `tree.{parent,children,star_peers}` 并按 channel 记 `channel_roles_`/`is_leader_`。`FillChannels` 必须在 `InitChannels` 之前调用。
 - **channel 边是有向的，每条边一个独立 transport**：`send[p]` 只发送、`recv[p]` 只接收，是两条有向边、两个 `Connector`、两个 fd。2 rank 时 `prev == next`，同一对 rank 仍是两条独立边、两个 transport，不因 peer 相同而合并。
 - **主动边有 5 次连接重试**（非无重试）；listener 先于 bootstrap 绑好，重试是防御性的。
 - **共享内存失败即初始化失败**，无自动回退 TCP；RDMA 同理，全局选定后建链/QP/MR 错误直接 `LOG_ERROR` + `false`，不静默改走 TCP（`OCCL_DISABLE_RDMA=1` 是显式选择而非回退）。

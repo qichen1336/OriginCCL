@@ -7,7 +7,7 @@
 - `CollTask` 表达五种 collective 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`。无根操作忽略 root，非归约操作忽略 op。
 - `Planner::Plan(Communicator&, const CollTask&)` → `CollPlan`：按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
 - **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce 永远 ring；AllReduce / ReduceScatter / AllGather 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。
-- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、rank_stride、topology 指针、**对应 channel 的 send/recv transport 向量**。
+- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
 - 两个 transport 向量由 `Topology::FillTransports` 填充：planner 只构造 `PlanTask`（先设 `topology`）再调它，**不自己取 `Channel::ring` / `Connector`**。哪条 `Connector` 属于本 task 是拓扑语义；`FillTransports` 过滤 null 后输出「该 task 真正要用的全部连接」。
 - 不负责：不展开算法步骤（topology）、不决定等待策略（executor）。
 
@@ -23,7 +23,7 @@
 - `PlanTask.chunk_size` 语义按拓扑解释：ring = `ceil(elem_count / world_size)`（AllReduce 块划分）；tree = `kChunkBytes / type_size`（流水粒度，逐 chunk 推进）。
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
-- `PlanTask.topology` 复用 communicator 的 `GetRingTopology()`/`GetTreeTopology()`，planner 不新建拓扑。
+- `PlanTask.topology` 复用 communicator 的 `GetRingTopology()`/`GetTreeTopology()`，planner 不新建拓扑；`PlanTask.channel_id` 取 `comm_channel.id`，tree 拓扑据此为该 channel 选择树形与运行时角色（见 [topology.md](topology.md)），executor 不解释该字段。
 - 启用 channel 规则：tree 下的全部操作（AllReduce / ReduceScatter / AllGather）与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
 - 三种 tree 操作都可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 内部把各 rank 的切片紧凑打包后再搬运，因此「每 rank 一整块」的对齐不受切片影响。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`，planner 不重复赋值。

@@ -56,6 +56,7 @@ CollPlan Planner::Plan(Communicator& comm, const CollTask& task) const {
         plantask.root = task.root;
         plantask.dtype = task.dtype;
         plantask.reduce_op = task.op;
+        plantask.channel_id = comm_channel.id;
         plantask.rank = comm.GetRank();
         plantask.world_size = comm.GetWorldSize();
         plantask.chunk_size = use_tree ? OcclConfig::kChunkBytes / type_size

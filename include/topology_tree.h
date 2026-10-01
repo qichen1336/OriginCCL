@@ -25,5 +25,5 @@ private:
     }
 
     bool is_leader_ = false;
-    std::vector<int> roles_;
+    std::vector<std::vector<int>> channel_roles_;
 };

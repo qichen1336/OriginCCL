@@ -18,12 +18,12 @@ constexpr int kPhaseDownStar = 6;
 constexpr int kPhaseDone = 7;
 
 constexpr int kRoleStar = 0;
-constexpr int kRoleT0Down = 1;
-constexpr int kRoleT0Up = 2;
+constexpr int kRoleTreeDown = 1;
+constexpr int kRoleTreeUp = 2;
 
 constexpr uint32_t kStarMask = 1u << kRoleStar;
-constexpr uint32_t kDownMask = 1u << kRoleT0Down;
-constexpr uint32_t kUpMask = 1u << kRoleT0Up;
+constexpr uint32_t kDownMask = 1u << kRoleTreeDown;
+constexpr uint32_t kUpMask = 1u << kRoleTreeUp;
 
 size_t TypeSize(const PlanTask& task) {
     return Utils::GetDataTypeSize(task.dtype);
@@ -75,7 +75,7 @@ ReduceOp CombineOp(const PlanTask& task) {
 size_t CountReduceRecv(const std::vector<int>& roles) {
     size_t n = 0;
     for (int role : roles) {
-        if (role == kRoleStar || role == kRoleT0Down) {
+        if (role == kRoleStar || role == kRoleTreeDown) {
             ++n;
         }
     }
@@ -288,7 +288,7 @@ bool Complete(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
             if (!SideDone(s.recv_done)) {
                 return true;
             }
-            CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleT0Down);
+            CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleTreeDown);
             if (!StartUpTreeSend(task, roles)) {
                 return false;
             }
@@ -402,40 +402,53 @@ void TopologyTree::FillChannels(const Communicator& comm, std::vector<Channel>& 
     const std::vector<int>& machine_leaders = comm.GetMachineLeaders();
 
     std::vector<int> star_peers;
-    std::vector<int> children;
-    int parent = -1;
-    roles_.clear();
     if (is_leader_) {
-        int parent_machine = (machine_index == 0) ? -1 : (machine_index - 1) / 2;
-        if (parent_machine >= 0) {
-            parent = machine_leaders[static_cast<size_t>(parent_machine)];
-        }
-        int c0 = 2 * machine_index + 1;
-        int c1 = 2 * machine_index + 2;
-        if (c0 < machine_count) {
-            children.push_back(machine_leaders[static_cast<size_t>(c0)]);
-        }
-        if (c1 < machine_count) {
-            children.push_back(machine_leaders[static_cast<size_t>(c1)]);
-        }
-
         for (size_t i = 1; i < local_ranks.size(); ++i) {
             star_peers.push_back(local_ranks[i]);
-            roles_.push_back(kRoleStar);
-        }
-        roles_.insert(roles_.end(), children.size(), kRoleT0Down);
-        if (parent >= 0) {
-            roles_.push_back(kRoleT0Up);
         }
     } else {
         star_peers.push_back(local_ranks[0]);
-        roles_.push_back(kRoleStar);
     }
 
+    channel_roles_.assign(channels.size(), std::vector<int>{});
     for (Channel& channel : channels) {
+        std::vector<int> children;
+        int parent = -1;
+        if (is_leader_) {
+            const bool mirrored = channel.id % 2 != 0;
+            int node = mirrored ? (machine_count - 1 - machine_index) : machine_index;
+            int parent_node = (node == 0) ? -1 : (node - 1) / 2;
+            int child0 = 2 * node + 1;
+            int child1 = 2 * node + 2;
+            if (mirrored) {
+                parent_node = (parent_node < 0) ? -1 : (machine_count - 1 - parent_node);
+                child0 = (child0 < machine_count) ? (machine_count - 1 - child0) : machine_count;
+                child1 = (child1 < machine_count) ? (machine_count - 1 - child1) : machine_count;
+            }
+            if (parent_node >= 0) {
+                parent = machine_leaders[static_cast<size_t>(parent_node)];
+            }
+            if (child0 < machine_count) {
+                children.push_back(machine_leaders[static_cast<size_t>(child0)]);
+            }
+            if (child1 < machine_count) {
+                children.push_back(machine_leaders[static_cast<size_t>(child1)]);
+            }
+        }
         channel.tree.parent = parent;
         channel.tree.children = children;
         channel.tree.star_peers = star_peers;
+
+        std::vector<int>& roles = channel_roles_[static_cast<size_t>(channel.id)];
+        if (is_leader_) {
+            roles.insert(roles.end(), star_peers.size(), kRoleStar);
+            roles.insert(roles.end(), children.size(), kRoleTreeDown);
+            if (parent >= 0) {
+                roles.push_back(kRoleTreeUp);
+            }
+        } else {
+            roles.push_back(kRoleStar);
+        }
     }
 }
 
@@ -486,7 +499,7 @@ bool TopologyTree::CollectiveInit(PlanTask& task) const noexcept {
     case CollFunc::AllReduce:
     case CollFunc::ReduceScatter:
     case CollFunc::AllGather:
-        return TreeInit(task, roles_, IsLeader());
+        return TreeInit(task, channel_roles_[static_cast<size_t>(task.channel_id)], IsLeader());
     default:
         LOG_ERROR("Tree received unsupported collective");
         return false;
@@ -495,7 +508,8 @@ bool TopologyTree::CollectiveInit(PlanTask& task) const noexcept {
 
 bool TopologyTree::CollectiveStep(PlanTask& task, CollEvent event) const noexcept {
     CollOpState& s = task.state;
-    if (s.phase == kPhaseUnstarted && !TreeInit(task, roles_, IsLeader())) {
+    const std::vector<int>& roles = channel_roles_[static_cast<size_t>(task.channel_id)];
+    if (s.phase == kPhaseUnstarted && !TreeInit(task, roles, IsLeader())) {
         return false;
     }
     if (s.phase == kPhaseDone) {
@@ -504,7 +518,7 @@ bool TopologyTree::CollectiveStep(PlanTask& task, CollEvent event) const noexcep
     if (!PushStep(task, event)) {
         return false;
     }
-    return Complete(task, roles_, IsLeader());
+    return Complete(task, roles, IsLeader());
 }
 
 bool TopologyTree::CollectiveDone(const PlanTask& task) const {

@@ -103,6 +103,7 @@ struct PlanTask {
     size_t rank_stride = 0;
     DataType dtype = DataType::FLOAT32;
     ReduceOp reduce_op = ReduceOp::SUM;
+    int channel_id = 0;
     int rank = 0;
     int world_size = 1;
     int root = 0;
