@@ -15,17 +15,6 @@ constexpr int kResolveTimeoutMs = 5000;
 constexpr int kEstablishTimeoutMs = 15000;
 constexpr int kControlTimeoutMs = 30000;
 
-// RoCE and IPoIB advertise an IPv4 address as ::ffff:a.b.c.d, so a GID whose first ten bytes
-// are zero and whose next two are 0xff carries the address in its last four bytes.
-bool IsIpv4MappedGid(const ibv_gid& gid) {
-    for (int i = 0; i < 10; ++i) {
-        if (gid.raw[i] != 0) {
-            return false;
-        }
-    }
-    return gid.raw[10] == 0xFF && gid.raw[11] == 0xFF;
-}
-
 uint32_t EncodeDataImmediate(size_t slot, size_t length) {
     return static_cast<uint32_t>((slot << 16) | (length - 1));
 }
@@ -51,6 +40,17 @@ bool WaitReadable(int fd, int timeout_ms) {
     return ready > 0;
 }
 } // namespace
+
+// RoCE and IPoIB advertise an IPv4 address as ::ffff:a.b.c.d, so a GID whose first ten bytes
+// are zero and whose next two are 0xff carries the address in its last four bytes.
+bool TransportRDMA::IsIpv4MappedGid(const ibv_gid& gid) {
+    for (int i = 0; i < 10; ++i) {
+        if (gid.raw[i] != 0) {
+            return false;
+        }
+    }
+    return gid.raw[10] == 0xFF && gid.raw[11] == 0xFF;
+}
 
 TransportRDMA::TransportRDMA() {}
 
@@ -84,7 +84,7 @@ bool TransportRDMA::Probe(std::string& addr) {
                 for (int index = 0; index < attributes.gid_tbl_len && !found; ++index) {
                     ibv_gid gid{};
                     char text[INET_ADDRSTRLEN] = {};
-                    if (ibv_query_gid(context, port, index, &gid) == 0 && IsIpv4MappedGid(gid) &&
+                    if (ibv_query_gid(context, port, index, &gid) == 0 && TransportRDMA::IsIpv4MappedGid(gid) &&
                         inet_ntop(AF_INET, &gid.raw[12], text, sizeof(text)) != nullptr) {
                         addr = text;
                         found = true;
@@ -145,7 +145,7 @@ std::shared_ptr<Transport> TransportRDMA::Accept() {
     std::memcpy(&wire, event->param.conn.private_data, sizeof(Wire));
     rdma_ack_cm_event(event);
 
-    auto transport = std::make_shared<TransportRDMA>();
+    std::shared_ptr<TransportRDMA> transport = MakePeer();
     if (!transport->Adopt(connection, wire)) {
         // Adopt took ownership of the connection id, so the destructor releases it.
         return nullptr;
@@ -169,7 +169,10 @@ bool TransportRDMA::Adopt(rdma_cm_id* connection, const Wire& wire) {
         return false;
     }
 
-    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey};
+    Wire mine{};
+    mine.base_addr = reinterpret_cast<uint64_t>(buffer);
+    mine.rkey = mr->rkey;
+    PrepareWire(mine);
     rdma_conn_param parameter{};
     parameter.private_data = &mine;
     parameter.private_data_len = sizeof(mine);
@@ -182,7 +185,7 @@ bool TransportRDMA::Adopt(rdma_cm_id* connection, const Wire& wire) {
         return false;
     }
     rdma_ack_cm_event(event);
-    return true;
+    return FinalizeConnection();
 }
 
 bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
@@ -226,7 +229,10 @@ bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
         return false;
     }
 
-    Wire mine{reinterpret_cast<uint64_t>(buffer), mr->rkey};
+    Wire mine{};
+    mine.base_addr = reinterpret_cast<uint64_t>(buffer);
+    mine.rkey = mr->rkey;
+    PrepareWire(mine);
     rdma_conn_param parameter{};
     parameter.retry_count = 7;
     parameter.rnr_retry_count = 7;
@@ -245,7 +251,19 @@ bool TransportRDMA::Connect(const std::string& addr, uint16_t port) {
     // The active side learns the peer memory region only from the ESTABLISHED private data.
     std::memcpy(&peer, event->param.conn.private_data, sizeof(Wire));
     rdma_ack_cm_event(event);
+    return FinalizeConnection();
+}
+
+void TransportRDMA::PrepareWire(Wire& wire) const {
+    std::memset(wire.tail, 0, sizeof(wire.tail));
+}
+
+bool TransportRDMA::FinalizeConnection() {
     return true;
+}
+
+std::shared_ptr<TransportRDMA> TransportRDMA::MakePeer() {
+    return std::make_shared<TransportRDMA>();
 }
 
 bool TransportRDMA::OpenChannel() {
@@ -656,7 +674,7 @@ uint32_t TransportRDMA::GetPollEvents() const {
     return EPOLLIN;
 }
 
-void TransportRDMA::Close() {
+void TransportRDMA::CloseResources() {
     if (cm_id != nullptr && cm_id->qp != nullptr) {
         rdma_destroy_qp(cm_id);
     }
@@ -685,6 +703,10 @@ void TransportRDMA::Close() {
         free(buffer);
         buffer = nullptr;
     }
+}
+
+void TransportRDMA::Close() {
+    CloseResources();
     connected = false;
     control_received = false;
     control_sent = false;

@@ -58,13 +58,14 @@ By default the build is configured with -DOCCL_SMALL_TESTS=ON: the library's chu
 granularity and the collective counts shrink by the same 256x factor, so a small VM runs
 the identical planner path with 256x less memory. --full-data drops the macro and uses
 the production sizes. The transport suites are never scaled: their boundaries and stall
-sizes must exceed the transport ring capacities to still cover backpressure.
+sizes must exceed the transport ring capacities to still cover backpressure. The transport
+suite runs four two-process binaries: tcp, shm, rdma and rdma_zc (the zero-copy variant).
 
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
---oversubscribe. RDMA without a device with an active port is reported as SKIP, never
-as a pass. The executor is picked at runtime: polling when the cores cover the local
-ranks, epoll when they do not.
+--oversubscribe. RDMA and the zero-copy RDMA variant without a device with an active
+port are reported as SKIP, never as a pass. The executor is picked at runtime: polling
+when the cores cover the local ranks, epoll when they do not.
 
 Exit codes:
   0  the requested scope passed
@@ -375,7 +376,7 @@ if [ "${total_fail}" -eq 0 ]; then
         single) run_one "single" "${SINGLE_RANKS}" "test_single_machine" ;;
         multi) run_one "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
         transport)
-            for transport in tcp shm rdma; do
+            for transport in tcp shm rdma rdma_zc; do
                 run_one "transport-${transport}" 2 "test_transport_${transport}"
             done
             ;;

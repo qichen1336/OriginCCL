@@ -52,24 +52,45 @@ public:
         return connected;
     }
 
-private:
+protected:
+    // The tail lets subclasses advertise their own connection parameters in the same exchange.
+    static constexpr size_t kWireTailSize = 24;
+
     struct Wire {
         uint64_t base_addr;
         uint32_t rkey;
+        char tail[kWireTailSize];
     };
 
+    static bool IsIpv4MappedGid(const ibv_gid& gid);
+
+    virtual bool SetupResources();
+    virtual void PrepareWire(Wire& wire) const;
+    virtual bool FinalizeConnection();
+    virtual bool HandleCompletion(const ibv_wc& completion);
+    virtual std::shared_ptr<TransportRDMA> MakePeer();
+    virtual void CloseResources();
+
+    bool ProcessCompletions();
+    bool IsProducer() const {
+        return direction_ == TransportDirection::Send;
+    }
+
+    rdma_cm_id* cm_id = nullptr;
+    ibv_pd* pd = nullptr;
+    ibv_cq* cq = nullptr;
+    Wire peer{};
+    bool connected = false;
+
+private:
     char* SlotData(size_t slot) const {
         return buffer + kRdmaRingOffset + slot * kRdmaSlotSize;
     }
     char* ScratchData(size_t index) const {
         return buffer + kRdmaScratchOffset + index * kRdmaControlSize;
     }
-    bool IsProducer() const {
-        return direction_ == TransportDirection::Send;
-    }
 
     bool OpenChannel();
-    bool SetupResources();
     bool Adopt(rdma_cm_id* connection, const Wire& wire);
     rdma_cm_event* AwaitEvent(rdma_cm_event_type type);
 
@@ -78,21 +99,14 @@ private:
     bool PostWrite(size_t slot, size_t length);
     bool PostCredit(size_t slots);
 
-    bool ProcessCompletions();
-    bool HandleCompletion(const ibv_wc& completion);
     bool WaitFlag(bool& flag);
     void CloseCm();
 
     rdma_event_channel* cm_channel = nullptr;
-    rdma_cm_id* cm_id = nullptr;
-    ibv_pd* pd = nullptr;
-    ibv_cq* cq = nullptr;
     ibv_comp_channel* comp_channel = nullptr;
     ibv_mr* mr = nullptr;
     char* buffer = nullptr;
-    Wire peer{};
     uint16_t listen_port = 0;
-    bool connected = false;
     bool control_received = false;
     bool control_sent = false;
     size_t control_index = 0;

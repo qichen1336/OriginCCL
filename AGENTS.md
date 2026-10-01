@@ -28,15 +28,15 @@ include/executor/          executor 头（限定路径引用：#include "executo
 include/transport/         transport 头（限定路径引用：#include "transport/transport.h"）
 src/                       实现（平铺）
 src/executor/              四种 executor 实现
-src/transport/             TCP、共享内存与 RDMA 传输实现
-tests/                     五个测试入口 + test_common / transport_check 共享支持
+src/transport/             TCP、共享内存与 RDMA（含零拷贝变体）传输实现
+tests/                     六个测试入口 + test_common / transport_check 共享支持
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
 scripts/                   run_tests.sh（唯一入口）
 ```
 
 | 层 | 头文件 | 职责 | 铁律 |
 | --- | --- | --- | --- |
-| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态） |
+| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` / `transport/transport_rdma_zc.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态）；`transport_rdma_zc.h` 是 RDMA 的零拷贝子类，阈值 (16 MiB) 以上用独立 QP 直发用户 MR，以下完全走基类环形缓冲 |
 | **topology** | `topology.h` / `topology_ring.h` | 拥有集合算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan` | 纯规划，无回调、无 `std::function` |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | `Init` 按核数与 local rank 数在 polling 与 epoll 间**运行时**选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
@@ -66,14 +66,14 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
 - **executor 由库在 `Init` 时运行时选取**：`sysconf(_SC_NPROCESSORS_ONLN)` 全机在线核数 ≥ 本机 rank 数（每 rank 已绑核独占一核）用 `polling`，否则用 `epoll`。一次构建覆盖全部运行，脚本无 executor 维度（`--executor` 已删除）。`reactor` / `multi_thread` 的实现仍全量编译在库里，但已无选取路径。
 - **多机是单机模拟**：`CommConfig::get_hostname` 注入逻辑 hostname，`rank / ranks_per_machine` 推导机器号；它验证分组与传输选择，**不等于真实跨主机**。
 - **OCCL_DISABLE_SHM / OCCL_DISABLE_RDMA 不是矩阵维度**：测试子进程不设置它们，集合用例按自动选择走 SHM / RDMA / TCP。
-- **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 无设备时 `test_transport_rdma` 返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
+- **mpirun 缺失或无可用 RDMA 设备 → SKIP 而非通过**（RDMA 与零拷贝 RDMA 无设备时对应测试返回 2）；等级 1/2 在核数不足时需 `--oversubscribe`。
 - 退出码约定（`run_tests.sh`）：`0` 全过 / `1` 有用例失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
 - 默认跑缩小数据量的测试。
-- 五个测试入口：
+- 六个测试入口：
   - `test_single_machine`：真实单机，断言 `is_single_machine` / `local_size` / `local_rank`，再跑集合用例矩阵。
   - `test_multi_machine`：注入逻辑 hostname 的模拟多机，断言 `is_single_machine` / `local_size` / `local_rank` / `local_ranks`，再跑集合用例矩阵。两个集合套件都只比对接口输入输出，不检查每条环边的具体传输类型。
-  - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma`：三种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 需设备。
-  - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；三种传输共用 `tests/transport_check.*`。
+  - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma` / `test_transport_rdma_zc`：四种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 与零拷贝 RDMA 需设备。零拷贝档位额外覆盖阈值前后、多 chunk 与两条路径交替，并断言 `progress` 全有或全无。
+  - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；传输套件共用 `tests/transport_check.*`。
 - **回归只看摘要，不读 `.out`**：`run_tests.sh` 已把结果既打到 stdout 又写进 `test-reports/summary.txt`。摘要非 PASS 时才用 `grep -n` 在对应 `.out` 里定位。`single.out` / `multi.out` 每个约 29k token、等级 2 更大，一旦读进上下文会随每轮重发，是主要的 token 开销来源。
 - **PASS 的 run 里本来就带 `[ERROR]` 行**，全部来自 contract 的 6 个负向用例（`ExpectFailure`）× rank 数：`AllReduce/AllGather/ReduceScatter` 缺 buffer 走 tree、`Broadcast` 两个越界 root、`Reduce` 一个越界 root 走 ring，每条各产生一次 topology 的 `LOG_ERROR` 与一次 executor 的 `failed to init task on channel 0`。这是「库正确拒绝非法 task」的直接证据，不是失败信号。
 - 想要 sanitizer（asan-ubsan）或覆盖率，需要自己配 CMake 构建。sanitizer 无法覆盖 RDMA DMA 与跨进程共享内存竞态，完整数据比对与就绪测试是必要补充。

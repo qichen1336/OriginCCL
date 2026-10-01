@@ -20,7 +20,7 @@ cmake --build build -j"$(nproc)"
 
 ```bash
 scripts/run_tests.sh -h
-# 本机可跑的最小档（单机 4 rank、模拟多机 4×1、三种传输、集合用例）：
+# 本机可跑的最小档（单机 4 rank、模拟多机 4×1、四种传输、集合用例）：
 scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 ```
 
@@ -44,11 +44,11 @@ scripts/run_tests.sh --level 2 -j 2 --oversubscribe
 scripts/run_tests.sh --level 0 -j 2 --oversubscribe --full-data
 ```
 
-- 传输套件（`test_transport_*`）**不缩放**：其 5 MiB 边界与 8 MiB stall 必须超过 SHM 2 MiB / RDMA 1 MiB 环容量才能验证背压。
+- 传输套件（`test_transport_*`）**不缩放**：其 5 MiB 边界与 8 MiB stall 必须超过 SHM 2 MiB / RDMA 1 MiB 环容量才能验证背压。除 TCP / SHM / RDMA 外还有零拷贝 RDMA 档位（`test_transport_rdma_zc`）：阈值 16 MiB 以上注册用户缓冲为 MR、用独立 RC QP 直接 SEND/RECV，以下完全走基类环形缓冲。
 - 只覆盖 **polling** 与 **epoll** 两个 executor，且不再由构建选择：库在 `Init` 时比较全机在线核数与本地 rank 数——每 rank 已绑核独占一核，核数 ≥ local rank 数用 `polling`（低延迟忙等），否则用 `epoll`（不忙等抢 CPU）。`multi_thread` / `reactor` 仍编译在库里，但已无选取路径，因此一次构建就覆盖全矩阵。
 - **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
 - `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。
-- 无可用 RDMA 设备时 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
+- 无可用 RDMA 设备时 RDMA 与零拷贝 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
 
 查看某一等级的完整用例矩阵（需先构建一次）：
 
@@ -56,6 +56,6 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe --full-data
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-五个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`。用例生成与结果校验在 `tests/test_common.*`，三种传输共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
+六个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
 
 集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。

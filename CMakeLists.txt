@@ -31,6 +31,7 @@ set(ORIGIN_CCL_SOURCES
     src/transport/transport_tcp.cpp
     src/transport/transport_shm.cpp
     src/transport/transport_rdma.cpp
+    src/transport/transport_rdma_zc.cpp
     src/topology_ring.cpp
     src/topology_tree.cpp
     src/bootstrap.cpp

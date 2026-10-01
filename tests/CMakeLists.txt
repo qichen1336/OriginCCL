@@ -38,3 +38,6 @@ target_link_libraries(test_transport_shm occl_transport_support)
 
 add_executable(test_transport_rdma test_transport_rdma.cpp)
 target_link_libraries(test_transport_rdma occl_transport_support)
+
+add_executable(test_transport_rdma_zc test_transport_rdma_zc.cpp)
+target_link_libraries(test_transport_rdma_zc occl_transport_support)
