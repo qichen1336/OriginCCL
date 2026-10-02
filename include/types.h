@@ -32,7 +32,9 @@ enum class CollFunc {
     Broadcast,
     Reduce,
     AllGather,
-    ReduceScatter
+    ReduceScatter,
+    Send,
+    Recv
 };
 
 struct UniqueId {
@@ -55,6 +57,8 @@ struct NodeInfo {
     std::string hostname;
     std::string rdma_addr;
     uint16_t rdma_port = 0;
+    uint16_t p2p_port = 0;
+    uint16_t p2p_rdma_port = 0;
 
     NodeInfo() = default;
 
@@ -70,6 +74,7 @@ struct CollTask {
     DataType dtype = DataType::FLOAT32;
     ReduceOp op = ReduceOp::SUM;
     int root = 0;
+    int peer = -1;
 };
 
 enum class CollEvent {
@@ -107,6 +112,7 @@ struct PlanTask {
     int rank = 0;
     int world_size = 1;
     int root = 0;
+    int peer = -1;
     std::shared_ptr<Topology> topology;
     std::vector<std::shared_ptr<Transport>> send_transports;
     std::vector<std::shared_ptr<Transport>> recv_transports;

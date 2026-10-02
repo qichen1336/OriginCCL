@@ -469,8 +469,9 @@ void TopologyTree::FillPeers(const Channel& channel, std::vector<TopoEdge>& edge
     }
 }
 
-void TopologyTree::FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
-                                  std::vector<std::shared_ptr<Transport>>& recv_out) const {
+void TopologyTree::FillTransports(Channel& channel, PlanTask& task) const {
+    auto& send_out = task.send_transports;
+    auto& recv_out = task.recv_transports;
     send_out.clear();
     recv_out.clear();
     auto add_peer = [&](int peer) {

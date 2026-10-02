@@ -34,7 +34,7 @@ build/ and each run gets its own report file.
 Options:
   -h, --help              Show this help and exit.
   -l, --level N           0, 1 or 2 (default 0). See "Levels" below.
-  -s, --suite LIST        all | single | multi | transport (default all).
+    -s, --suite LIST        all | single | multi | transport | p2p (default all).
   -d, --build-dir DIR     Build root (default <repo>/build).
   -r, --report-dir DIR    Report root (default <repo>/test-reports).
   -t, --timeout SEC       Per-run timeout (default 600).
@@ -60,6 +60,9 @@ the identical planner path with 256x less memory. --full-data drops the macro an
 the production sizes. The transport suites are never scaled: their boundaries and stall
 sizes must exceed the transport ring capacities to still cover backpressure. The transport
 suite runs four two-process binaries: tcp, shm, rdma and rdma_zc (the zero-copy variant).
+The p2p suite uses four ranks at every level, tests local and simulated cross-machine
+Send/Recv, and exercises polling and epoll with unscaled payloads through 48 MiB.
+Without RDMA, cross-machine rejection is checked and RDMA_ZC transfers are SKIP.
 
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
@@ -206,8 +209,8 @@ case "${JOBS}" in
 '' | *[!0-9]*) die_usage "invalid --jobs '${JOBS}'" ;;
 esac
 
-validate_list "${SUITE}" "single,multi,transport" "--suite"
-SUITES="$(expand_list "${SUITE}" "single,multi,transport")"
+validate_list "${SUITE}" "single,multi,transport,p2p" "--suite"
+SUITES="$(expand_list "${SUITE}" "single,multi,transport,p2p")"
 
 BUILD_DIR="${BUILD_DIR:-${ROOT_DIR}/build}"
 REPORT_DIR="${REPORT_DIR:-${ROOT_DIR}/test-reports}"
@@ -315,6 +318,9 @@ run_one() {
     local out="${REPORT_DIR}/${suite}.out"
     local level_flag="--level ${LEVEL}"
     local -a extra_args=()
+    if [[ "${suite}" == "p2p-rdma" ]]; then
+        extra_args+=("--cross-machine")
+    fi
     if [ "${suite}" = "single" ] || [ "${suite}" = "multi" ]; then
         extra_args+=("--report" "${report}")
         # Each rank appends its result, so a leftover file would be counted into this run.
@@ -375,6 +381,10 @@ if [ "${total_fail}" -eq 0 ]; then
         case "${suite}" in
         single) run_one "single" "${SINGLE_RANKS}" "test_single_machine" ;;
         multi) run_one "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
+        p2p)
+            run_one "p2p-local" 4 "test_p2p"
+            run_one "p2p-rdma" 4 "test_p2p"
+            ;;
         transport)
             for transport in tcp shm rdma rdma_zc; do
                 run_one "transport-${transport}" 2 "test_transport_${transport}"

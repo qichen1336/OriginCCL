@@ -46,7 +46,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 
 - 建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`：`Listen(addr, port)` 用 `rdma_listen`（`port=0` 时内核选端口，用 `rdma_get_local_addr` 读回真实端口）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端 `rdma_accept`，QP 都是 `IBV_QPT_RC`。
 - 对端内存信息走 CM private data（`Wire{base_addr, rkey}`），两端在事件里直接得到；被动端在 `CONNECT_REQUEST`、主动端在 `ESTABLISHED` 事件里。
-- 握手与数据方向解耦：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关——谁主动连接只看 rank 大小（`rank < peer` 的一端 `Connect`）。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`。
+- 握手与数据方向解耦：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关。集合由 `rank < peer` 的一端 Connect，P2P 由发送方 Connect。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`。
 - 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后 post write；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
 - 槽位复用只由 credit 一个门控：可发窗口是 `credits_received + kRdmaSlotCount`；credit 蕴含「本地读已完成」，故 `IBV_WC_RDMA_WRITE` 完成事件被忽略。credit 反向归还：consumer 交还整个槽后用一次 `WRITE_WITH_IMM` 写对端控制区（payload 1 B，不受方向限制）。immediate 的位布局是两种用途共用：bit 31 为 credit 标志，bit 16–30 是槽号，bit 0–15 是 `length - 1`（长度减 1 才能双射进 16 bit）。`kCreditBatch = 8` 批量归还，队列排空时立刻归还余数。
 - 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
@@ -65,7 +65,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - 对外 `progress` 为全有或全无：`kRdmaZcChunk` 覆盖（普通尺寸一个 WR）时 `{0, size}`；超单 WR 限制分块时可按完成字节推进，但绝不报告只 post 未完成的字节。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：首次推进时 `ibv_reg_mr`，本次操作 `done` 后 `ibv_dereg_mr`，不缓存；发送/接收各一个在飞的 MR。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，因此就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
-- 目前 `communicator` 仍只选 `TransportRDMA`，零拷贝子类是独立可选项，尚未接入选择路径；`tests/test_transport_rdma_zc.cpp` 直接实例化它。
+- 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 16 MiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
 
 # 隐含约定
@@ -73,7 +73,7 @@ transport 与 executor 一样单独成目录；头文件从 include 根限定引
 - **数据面传输只走 `TrySend`/`TryRecv`**（由 topology 状态机驱动）；executor 不直接调 `Send`/`Recv`。历史曾有人把数据面改成阻塞 `Send`/`Recv` 导致死锁。
 - **共享内存环光标「谁创建谁初始化」**：`MapRing` 的 `initialize` 参数只对建环方（`CreateRing`）为真；`Adopt` 采用已有环时传假。给采用方也跑一次 placement-new 会清掉共享光标（见实现原理）。
 - **对端关闭不是三种传输共有的保证**：TCP 能在对端有序关闭后从 `TryRecv` 得到零长度读；共享内存没有对端死亡信号，RDMA 对端销毁 QP 也不保证 flush 本端接收队列。因此对端关闭后的"失败/空读"断言只对 TCP 成立，另两种只断言本端 `Close()` 释放资源且之后不可再用。
-- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；communicator 的 channel 握手（`ConnHandshake`）走 Transport 的阻塞 `Send`/`Recv`——这是阻塞接口存在的唯一理由（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`，三种语义一致，调用点不区分传输类型）。
+- **两类控制流量走两条路**：bootstrap 的 `NodeInfo` 交换走裸 TCP socket（`Utils::SendAll`/`RecvAll`），不碰 Transport；集合的 `ConnHandshake` 与 P2P 的来源 rank 握手走 Transport 阻塞 `Send`/`Recv`（SHM 走 control socket、RDMA 走一次 RC `IBV_WR_SEND`）。用户数据始终通过拓扑的非阻塞 `Try*` 推进。
 - **非阻塞语义是硬约束**：`TrySend`/`TryRecv` 绝不阻塞。
 - **方向对 TCP 只是元数据、不是操作许可**：TCP 任何方向都能收发，方向只决定 `GetPollEvents()`。channel 握手恒由主动连接方先 `Send`、被动方先 `Recv`，所以一条标成 `Receive` 的连接的主动端仍要在它上面 `Send`——不要给 TCP 加反向拒绝的防御。**共享内存与 RDMA 的数据面都把方向当硬约束**：`TrySend`/`TryRecv` 在 `!IsProducer()`/`IsProducer()` 时 `LOG_ERROR` + `false`（RDMA 的例外只在控制握手，它不看方向）。传输测试据此分支：只有 TCP 校验“反向仍可收发”。
 - **就绪位含义由 transport 决定**：socket 是「可写=发送推进、可读=接收推进」，共享内存发送端等的是可读的 eventfd。executor 一律用 `GetPollEvents()`，用「就绪来自 send 还是 recv transport」决定推进哪个逻辑操作，不得自行把位解释成方向。

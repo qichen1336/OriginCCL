@@ -28,6 +28,9 @@ target_link_libraries(test_single_machine occl_test_support)
 add_executable(test_multi_machine test_multi_machine.cpp)
 target_link_libraries(test_multi_machine occl_test_support)
 
+add_executable(test_p2p test_p2p.cpp)
+target_link_libraries(test_p2p occl_test_support)
+
 # Transport suites. TCP and shared memory need two processes and no device; RDMA needs a device
 # with an active port and exits with 2 when there is none.
 add_executable(test_transport_tcp test_transport_tcp.cpp)

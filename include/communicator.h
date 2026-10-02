@@ -68,8 +68,12 @@ public:
     bool AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype);
     bool Reduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int root);
     bool ReduceScatter(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op);
+    bool Send(const void* buffer, size_t count, DataType dtype, int peer);
+    bool Recv(void* buffer, size_t count, DataType dtype, int peer);
 
 private:
+    friend class Planner;
+
     struct ConnHandshake {
         int rank = -1;
         int channel_id = -1;
@@ -94,6 +98,11 @@ private:
     CommConfig config;
     std::shared_ptr<Topology> ring_topology_;
     std::shared_ptr<Topology> tree_topology_;
+    std::shared_ptr<Topology> p2p_topology_;
+    std::vector<NodeInfo> all_nodes_;
+    std::vector<std::shared_ptr<Transport>> p2p_listeners_;
+    bool use_shm_ = false;
+    bool rdma_ready_ = false;
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;

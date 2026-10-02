@@ -16,8 +16,10 @@
 #include "transport/transport_tcp.h"
 #include "transport/transport_shm.h"
 #include "transport/transport_rdma.h"
+#include "transport/transport_rdma_zc.h"
 #include "topology_ring.h"
 #include "topology_tree.h"
+#include "topology_p2p.h"
 #include "executor/epoll_executor.h"
 #include "executor/polling_executor.h"
 
@@ -87,9 +89,11 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     ring_topology_ = std::make_shared<TopologyRing>();
     tree_topology_ = std::make_shared<TopologyTree>();
+    p2p_topology_ = std::make_shared<TopologyP2p>();
     int n_channels = config.n_channels > 0 ? config.n_channels : kDefaultChannelCount;
     if (!ring_topology_->Init(config.rank, config.world_size, n_channels) ||
-        !tree_topology_->Init(config.rank, config.world_size, n_channels)) {
+        !tree_topology_->Init(config.rank, config.world_size, n_channels) ||
+        !p2p_topology_->Init(config.rank, config.world_size, n_channels)) {
         LOG_ERROR("Rank {}: Failed to init Topology", config.rank);
         return false;
     }
@@ -112,7 +116,9 @@ bool Communicator::Init(const CommConfig& cfg) {
         }
     }
 
+    p2p_topology_->FillChannels(*this, channels);
     const bool use_shm = SharedMemoryEnabled();
+    use_shm_ = use_shm;
     LOG_INFO("Rank {}: Init Communicator world_size = {}, n_channels = {}, topology = {} + {}", config.rank,
              config.world_size, n_channels, ring_topology_->GetName(), tree_topology_->GetName());
 
@@ -174,8 +180,33 @@ bool Communicator::Init(const CommConfig& cfg) {
         LOG_INFO("Rank {}: Shared-memory rendezvous listener on {}", config.rank, rendezvous);
     }
 
+    auto p2p_tcp_listener = std::make_shared<TransportTCP>();
+    if (!p2p_tcp_listener->Listen("", 0)) {
+        LOG_ERROR("Rank {}: Failed to create P2P TCP listener", config.rank);
+        return false;
+    }
+    local_node.p2p_port = p2p_tcp_listener->GetListenPort();
+    p2p_listeners_.push_back(p2p_tcp_listener);
+    if (use_shm) {
+        auto p2p_shm_listener = std::make_shared<TransportShm>();
+        if (!p2p_shm_listener->Listen(RendezvousPath(config.unique_id.port, config.rank) + ".p2p", 0)) {
+            LOG_ERROR("Rank {}: Failed to create P2P shared-memory listener", config.rank);
+            return false;
+        }
+        p2p_listeners_.push_back(p2p_shm_listener);
+    }
+    if (rdma_listener) {
+        auto p2p_rdma_listener = std::make_shared<TransportRDMAZc>();
+        if (p2p_rdma_listener->Listen(local_node.rdma_addr, 0)) {
+            local_node.p2p_rdma_port = p2p_rdma_listener->GetListenPort();
+            p2p_listeners_.push_back(p2p_rdma_listener);
+        } else {
+            LOG_WARN("Rank {}: P2P RDMA listener unavailable", config.rank);
+        }
+    }
+
     Bootstrap bootstrap;
-    std::vector<NodeInfo> all_nodes;
+    auto& all_nodes = all_nodes_;
     if (!bootstrap.Run(config, local_node, bootstrap_listen_fd, all_nodes)) {
         LOG_ERROR("Rank {}: Failed to run bootstrap", config.rank);
         return false;
@@ -185,6 +216,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     const bool rdma_ready =
         rdma_listener != nullptr &&
         std::all_of(all_nodes.begin(), all_nodes.end(), [](const NodeInfo& node) { return node.rdma_port != 0; });
+    rdma_ready_ = rdma_ready;
     std::vector<std::shared_ptr<Transport>> listeners;
     if (use_shm) {
         listeners.push_back(shm_listener);
@@ -272,8 +304,21 @@ void Communicator::Finalize() {
                 conn.transport.reset();
             }
         }
+        for (auto* connectors : {&channel.send_p2p, &channel.recv_p2p}) {
+            for (auto& conn : *connectors) {
+                if (conn.transport) {
+                    conn.transport->Close();
+                    conn.transport.reset();
+                }
+            }
+        }
     }
     channels.clear();
+    for (const auto& listener : p2p_listeners_) {
+        listener->Close();
+    }
+    p2p_listeners_.clear();
+    all_nodes_.clear();
     LOG_INFO("Rank {}: Communicator finalized", config.rank);
 }
 
@@ -296,32 +341,46 @@ bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count,
     task.dtype = dtype;
     task.op = op;
 
-    CollPlan plan = planner.Plan(*this, task);
-    return executor->Run(plan);
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
 }
 
 bool Communicator::Broadcast(void* buffer, size_t count, DataType dtype, int root) {
     CollTask task{CollFunc::Broadcast, buffer, buffer, count, dtype, ReduceOp::SUM, root};
-    CollPlan plan = planner.Plan(*this, task);
-    return executor->Run(plan);
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
 }
 
 bool Communicator::AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype) {
     CollTask task{CollFunc::AllGather, send_buf, recv_buf, count, dtype};
-    CollPlan plan = planner.Plan(*this, task);
-    return executor->Run(plan);
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
 }
 
 bool Communicator::Reduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int root) {
     CollTask task{CollFunc::Reduce, send_buf, recv_buf, count, dtype, op, root};
-    CollPlan plan = planner.Plan(*this, task);
-    return executor->Run(plan);
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
 }
 
 bool Communicator::ReduceScatter(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
     CollTask task{CollFunc::ReduceScatter, send_buf, recv_buf, count, dtype, op};
-    CollPlan plan = planner.Plan(*this, task);
-    return executor->Run(plan);
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
+}
+
+bool Communicator::Send(const void* buffer, size_t count, DataType dtype, int peer) {
+    CollTask task{CollFunc::Send, buffer, nullptr, count, dtype};
+    task.peer = peer;
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
+}
+
+bool Communicator::Recv(void* buffer, size_t count, DataType dtype, int peer) {
+    CollTask task{CollFunc::Recv, nullptr, buffer, count, dtype};
+    task.peer = peer;
+    CollPlan plan;
+    return planner.Plan(*this, task, plan) && executor->Run(plan);
 }
 
 Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {

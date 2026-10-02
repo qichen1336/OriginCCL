@@ -4,14 +4,14 @@
 
 # 核心职责边界
 
-- 拥有 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter 算法，通过非阻塞状态机接口推进。
+- 拥有 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter 算法与 P2P Send/Recv，通过非阻塞状态机接口推进。
 - 状态机接口：
   - `CollectiveInit(PlanTask&)`：按 `task.func` 分派初始化，按操作和 rank 角色检查缓冲区。合法零元素任务直接完成；单 rank 只做本地操作，无数据面。
   - `CollectiveStep(PlanTask&, CollEvent)`：非阻塞推进一次。`Writable` → 推进 send，`Readable` → 推进 recv；当前阶段完成后连续结算已完成阶段并主动尝试新阶段启用的传输。
   - `CollectiveDone`：仅表示成功完成（`phase == kPhaseDone`）；失败经 Init/Step 的 false 上报。
 - `FillChannels(comm, channels)`：bootstrap 之后、`FillPeers`/`InitChannels` 之前调用，把拓扑形状写入每个 `Channel`（ring 填 `channel.ring.prev/next`，tree 填 `channel.tree` 的 `parent`/`children`/`star_peers`）；本机视角与机器分组从 `comm` 成员读取，tree 同时把每个 channel 的运行时角色表 `channel_roles_` 与 `is_leader_` 记到自己成员。
 - `FillPeers(channel, edges)`：返回本 rank 在该拓扑下要连接的全部 peer（`TopoEdge{peer, is_send}`，每条有向边一条），形状来源是 `channel`（ring 读 `channel.ring`，tree 读 `channel.tree` 三桶）。communicator 据此建连接（见 [communicator.md](communicator.md)）。
-- `FillTransports(channel, send_out, recv_out)`：按拓扑语义挑出该 channel 上本 task 真正要用的连接；planner 不自己看 `ring`/`Connector`。tree 按 `[star_peers, children, parent]` 顺序输出，与该 channel 的角色表一一对齐。
+- `FillTransports(channel, task)`：按拓扑语义填充 task.send_transports/recv_transports；tree 按 `[star_peers, children, parent]` 顺序输出，与该 channel 的角色表一一对齐；P2P 按 task.func/peer 选择独立连接。
 - 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有的 `algo` union**（`algo.ring.step` 与 `algo.tree.step` 互斥重叠，同一时刻只有当前拓扑的一份有效）。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
 - 不负责：不监听 fd、不决定等待策略、不开线程；无可变成员状态。
 
@@ -22,6 +22,7 @@
 | `include/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillPeers` / `FillTransports`）+ `TopoEdge` |
 | `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport；`FillPeers` 返回 next/prev 两条有向边 |
 | `include/topology_tree.h` / `src/topology_tree.cpp` | Tree 实现：机器内星型 + 机器间 double binary tree（DBT），见下节 |
+| `include/topology_p2p.h` / `src/topology_p2p.cpp` | Send/Recv：channel 0 单 peer、单方向、整段传输 |
 
 # 实现原理
 
@@ -51,13 +52,20 @@
 - **连接角色**：`channel_roles_[channel_id]` 是与该 channel 连接输出顺序并行的角色向量，取值 `Star / TreeDown / TreeUp`；`PlanTask.channel_id` 决定用哪张表。`FillTransports` 按 `channel.tree` 三桶顺序（先 `star_peers`、再 `children`、再 `parent`）输出连接，`CollectiveStep` 用该表 + 当前 phase 现算每条连接活跃与否，不活跃置 `done = 1` 跳过（等价于"不同阶段用连接子集的交集"）。`TreeDown` 必须在 `TreeUp` 之前，归约接收角色的前缀顺序保证 `ScratchSlot` 按连接索引寻址正确。leader 归约多连接时，每条连接收到的数据落在独立 scratch 槽（`state.temp_buffer` 的 `TotalElems` 之后），收齐后逐条 `PerformReduce` 进累加区。
 - **单游标足以表达两阶段**：`CollOpState.algo.tree` 只有一个 `step`，上行与下行各自从头推进该游标，且两阶段不相交，故无需为两阶段或每棵树维护独立 phase。
 
+# P2P 拓扑
+
+- `FillChannels` 初始化各 channel 的 `send_p2p[peer]` / `recv_p2p[peer]` 槽位，transport 留空；`FillPeers` 返回空集，不参与集合初始化建边。
+- 参数检查和连接准备已由 planner 完成。`FillTransports` 只为非空任务选一个方向的一条连接；空任务不挂 transport。
+- `CollectiveInit` 初始化该方向的 progress/done 并主动尝试一次传输，零长度直接完成。`CollectiveStep` 将原始 buffer 和完整 `elem_count * type_size` 交给 `TrySend`/`TryRecv`，不改地址、不切 chunk；`phase == 1` 表示完成。
+- 无需 topology 层流水线不等于阻塞直发：executor 仍等待就绪并推进；transport 保留背压、RDMA_ZC 阈值和内部分块。
+
 # 隐含约定
 
-- **一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等 → 死锁。故"一步"不是原子状态：send/recv 各有独立 progress + done 标志（各自又是与连接一一对应的向量）。
+- **集合算法同一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等 → 死锁。P2P 每个任务只有一个方向，调用方负责保证两端调用顺序无循环等待。
 - **一条连接一份进度，遍历在 topology 层**：`PushBuffer` 按 `CollEvent` 选定一侧后遍历该侧全部 transport 逐条 `TrySend`/`TryRecv`；`Try*` 接口本身保持单连接语义。未就绪连接无进展不影响其他连接；一条失败即整体 false。该侧每次事件语义是「推进该侧全部连接一次」。
 - **错误只有一个通道**：`CollectiveInit`/`CollectiveStep` 及具名 Init/Step 是 `noexcept`，返回 `false` 即失败（拓扑内已 `LOG_ERROR`）；executor 见到 false 立即放弃。意外异常（如 `bad_alloc`）直接终止，不转换为可恢复失败。
 - executor 只使用 `CollectiveInit/CollectiveStep/CollectiveDone`；新增操作不修改 executor，不向 plan 添加函数指针或回调。
 - 并发交换的收发必须同时推进；依赖接收结果的转发阶段必须先收齐再发送。阶段转换经 `BeginPhase`（ring）/`Activate`（tree）主动尝试传输，遵守 EPOLLET 契约。
 - **`send_done`/`recv_done` 不可改成 `vector<bool>`**（`Try*` 的 done 是 `bool*` 出参，位压缩取不到 `bool&`）。
 - 新增拓扑只实现 `FillChannels` + `FillPeers` + `FillTransports` 即可；新增算法实现须继承 `Topology` 基类，实现三件套接口，算法步骤不得在 planner/executor 展开。
-- **`algo` union 一次只有一种拓扑有效**：ring 写 `algo.ring.step`、tree 写 `algo.tree.step`，同一 task 由 planner 二选一绑定拓扑，不会交叉读写。
+- **`algo` union 一次只有一种拓扑有效**：ring 写 `algo.ring.step`、tree 写 `algo.tree.step`，同一 task 只绑定一种拓扑，不会交叉读写；P2P 不使用 algo。

@@ -292,6 +292,8 @@ void EncodeNodeInfo(std::vector<char>& buffer, const NodeInfo& node) {
     EncodeString(buffer, node.hostname);
     EncodeString(buffer, node.rdma_addr);
     EncodeInt(buffer, node.rdma_port);
+    EncodeInt(buffer, node.p2p_port);
+    EncodeInt(buffer, node.p2p_rdma_port);
 }
 
 NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
@@ -302,6 +304,8 @@ NodeInfo DecodeNodeInfo(const char* buffer, size_t& offset) {
     node.hostname = DecodeString(buffer, offset);
     node.rdma_addr = DecodeString(buffer, offset);
     node.rdma_port = static_cast<uint16_t>(DecodeInt(buffer, offset));
+    node.p2p_port = static_cast<uint16_t>(DecodeInt(buffer, offset));
+    node.p2p_rdma_port = static_cast<uint16_t>(DecodeInt(buffer, offset));
     return node;
 }
 
@@ -432,6 +436,10 @@ const char* GetCollFuncName(CollFunc func) {
         return "Reduce";
     case CollFunc::ReduceScatter:
         return "ReduceScatter";
+    case CollFunc::Send:
+        return "Send";
+    case CollFunc::Recv:
+        return "Recv";
     default:
         return "UNKNOWN";
     }

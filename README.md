@@ -2,7 +2,7 @@
 
 C++ 集合通信库。
 
-支持 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter。
+支持 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter，以及同步点对点 Send/Recv。
 接口参数和缓冲区布局见 [Communicator 层文档](docs/layers/communicator.md)。四种 executor 均通过统一的三阶段接口驱动集合操作。
 
 ## 构建
@@ -56,6 +56,10 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe --full-data
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-六个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
+七个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
+
+P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。channel 0 独立连接按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
+
+`scripts/run_tests.sh --suite p2p --oversubscribe` 固定用四 rank，覆盖同机和模拟跨机、连接缓存与隔离、乱序接入、与集合操作交替、polling/epoll 及最大 48 MiB 数据。P2P 数据量不缩放；无 RDMA 时验证拒绝回退，再将跨机数据传输记为 SKIP。
 
 集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。

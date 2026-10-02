@@ -292,8 +292,9 @@ int TopologyRing::GetPrevRank(int r) const {
     return (r - 1 + world_size) % world_size;
 }
 
-void TopologyRing::FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
-                                  std::vector<std::shared_ptr<Transport>>& recv_out) const {
+void TopologyRing::FillTransports(Channel& channel, PlanTask& task) const {
+    auto& send_out = task.send_transports;
+    auto& recv_out = task.recv_transports;
     send_out.clear();
     recv_out.clear();
     Connector* send_conn = channel.SendConnector(channel.ring.next);

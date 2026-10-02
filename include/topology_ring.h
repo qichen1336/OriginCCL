@@ -11,8 +11,7 @@ public:
 
     void FillChannels(const Communicator& comm, std::vector<Channel>& channels) override;
     void FillPeers(const Channel& channel, std::vector<TopoEdge>& edges) const override;
-    void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
-                        std::vector<std::shared_ptr<Transport>>& recv_out) const override;
+    void FillTransports(Channel& channel, PlanTask& task) const override;
 
     bool CollectiveInit(PlanTask& task) const noexcept override;
     bool CollectiveStep(PlanTask& task, CollEvent event) const noexcept override;

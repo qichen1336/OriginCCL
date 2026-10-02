@@ -34,6 +34,7 @@ set(ORIGIN_CCL_SOURCES
     src/transport/transport_rdma_zc.cpp
     src/topology_ring.cpp
     src/topology_tree.cpp
+    src/topology_p2p.cpp
     src/bootstrap.cpp
     src/planner.cpp
     src/executor/multi_thread_executor.cpp

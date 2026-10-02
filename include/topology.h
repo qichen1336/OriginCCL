@@ -26,8 +26,7 @@ public:
 
     virtual void FillChannels(const Communicator& comm, std::vector<Channel>& channels) = 0;
     virtual void FillPeers(const Channel& channel, std::vector<TopoEdge>& edges) const = 0;
-    virtual void FillTransports(Channel& channel, std::vector<std::shared_ptr<Transport>>& send_out,
-                                std::vector<std::shared_ptr<Transport>>& recv_out) const = 0;
+    virtual void FillTransports(Channel& channel, PlanTask& task) const = 0;
 
     virtual bool CollectiveInit(PlanTask& task) const noexcept = 0;
     virtual bool CollectiveStep(PlanTask& task, CollEvent event) const noexcept = 0;

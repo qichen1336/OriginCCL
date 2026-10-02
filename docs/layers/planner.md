@@ -4,11 +4,11 @@
 
 # 核心职责边界
 
-- `CollTask` 表达五种 collective 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`。无根操作忽略 root，非归约操作忽略 op。
-- `Planner::Plan(Communicator&, const CollTask&)` → `CollPlan`：按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
+- `CollTask` 表达五种 collective 与 Send/Recv 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`、`peer`。peer 仅用于 P2P，无根操作忽略 root，非归约操作忽略 op。
+- `Planner::Plan(Communicator&, const CollTask&, CollPlan&)` 返回 bool，失败不执行计划。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
 - **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce 永远 ring；AllReduce / ReduceScatter / AllGather 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。
-- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
-- 两个 transport 向量由 `Topology::FillTransports` 填充：planner 只构造 `PlanTask`（先设 `topology`）再调它，**不自己取 `Channel::ring` / `Connector`**。哪条 `Connector` 属于本 task 是拓扑语义；`FillTransports` 过滤 null 后输出「该 task 真正要用的全部连接」。
+- `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、peer、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
+- 两个 transport 向量由 `Topology::FillTransports(Channel&, PlanTask&)` 填充。集合操作仍由拓扑按形状选连接；P2P 拓扑依据 task.func/peer 取一个方向的一条连接。planner 仅在 P2P 懒建连时写入对应 Connector。
 - 不负责：不展开算法步骤（topology）、不决定等待策略（executor）。
 
 # 文件介绍
@@ -20,10 +20,13 @@
 
 # 实现原理
 
+- **P2P 独立规划路径**：Send/Recv 检查 peer 范围且不能是自己，非空消息检查 buffer 与字节数；合法零长度不建连。`PrepareP2p` 复用 channel 0 的 `send_p2p[peer]` / `recv_p2p[peer]`，未连接才创建。成功后生成一个完整长度的任务，绑定 `TopologyP2p`，不切片、不设置流水 chunk。
+- **P2P 建连由 planner 执行**：communicator 持有节点表和独立 P2P listener，Planner 通过 friend 访问；Send 主动连接并发送本 rank 握手，Recv 轮询 listener、接入并按来源 rank 存入 `recv_p2p`，直到目标连接就绪。非目标来源只缓存连接，不预收用户消息；不引入后台线程。连接缓存到 Finalize，建连失败经 Plan 的 false 上报。
+- **P2P 传输选择**：同 hostname 且 SHM 启用时用 SHM；同机禁用 SHM 时沿用集合的全局 RDMA/TCP 网络选择（P2P 的 RDMA 使用 RDMA_ZC）。不同 hostname 必须用双方已公布端点的 RDMA_ZC，任一端不可用直接失败，不回退 TCP。无设备不妨碍集合通信初始化或零长度 P2P。
 - `PlanTask.chunk_size` 语义按拓扑解释：ring = `ceil(elem_count / world_size)`（AllReduce 块划分）；tree = `kChunkBytes / type_size`（流水粒度，逐 chunk 推进）。
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
-- `PlanTask.topology` 复用 communicator 的 `GetRingTopology()`/`GetTreeTopology()`，planner 不新建拓扑；`PlanTask.channel_id` 取 `comm_channel.id`，tree 拓扑据此为该 channel 选择树形与运行时角色（见 [topology.md](topology.md)），executor 不解释该字段。
+- `PlanTask.topology` 复用 communicator 持有的 ring/tree/p2p 拓扑，planner 不新建拓扑；集合任务的 `PlanTask.channel_id` 取 `comm_channel.id`，P2P 固定为 0。tree 据此选择树形与运行时角色（见 [topology.md](topology.md)），executor 不解释该字段。
 - 启用 channel 规则：tree 下的全部操作（AllReduce / ReduceScatter / AllGather）与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
 - 三种 tree 操作都可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 内部把各 rank 的切片紧凑打包后再搬运，因此「每 rank 一整块」的对齐不受切片影响。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`，planner 不重复赋值。
@@ -33,4 +36,4 @@
 - **chunk 颗粒度是编译期常量**：`OcclConfig::kChunkBytes`（`include/occl_config.h`）定义在 `32 KiB / kTestScale`，`kTestScale` 由 `OCCL_SMALL_TESTS` 决定（OFF→1，ON→256）。宏只等比缩放 unit 与阻塞用例的 count，`units_total`、`n_used` 与每 channel 切分完全不变，因此覆盖的 planner 路径等价，但内存降 256 倍。`kTreeThresholdChunks`（tree/ring 阈值，单位 chunk）同样不缩放，故 tree/ring 选择在两种模式下不变。
 - **plan 无行为铁律**：plan 不使用 `std::function`、`execute` 回调、`pre_execute`/`post_execute`。`CollOpState` 是纯数据游标，不是回调；游标只被 executor 推进，拓扑不越权。
 - **改 `types.h` 字段必须同步 planner 与 executor 两者**。`PlanTask::send_transports` / `recv_transports`（及 `CollOpState` 的 progress/done 向量）是与连接一一对应的向量，`Try*` 保持单连接语义，多连接遍历在 topology（推进）与 executor（就绪注册）两侧。
-- planner 只切片 + 组装任务，不得展开算法步骤；也不得直接读 `Channel` 的 `ring`/`Connector`——一律经 `Topology::FillTransports`。
+- planner 做集合切片、P2P 连接准备和任务组装，不展开数据面算法步骤；集合连接的选择仍一律经 `Topology::FillTransports`。

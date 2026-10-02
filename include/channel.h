@@ -30,6 +30,8 @@ public:
     Tree tree;
     std::vector<Connector> send;
     std::vector<Connector> recv;
+    std::vector<Connector> send_p2p;
+    std::vector<Connector> recv_p2p;
 
     Connector* SendConnector(int peer) {
         if (peer < 0 || static_cast<size_t>(peer) >= send.size()) {
