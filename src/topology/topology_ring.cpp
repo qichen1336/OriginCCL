@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <cstring>
 #include <vector>
-#include "topology_ring.h"
+#include "topology/topology_ring.h"
 #include "transport/transport.h"
 #include "utils.h"
 #include "logger.h"

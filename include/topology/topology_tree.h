@@ -1,7 +1,7 @@
 #pragma once
 
 #include <vector>
-#include "topology.h"
+#include "topology/topology.h"
 
 class TopologyTree : public Topology {
 public:

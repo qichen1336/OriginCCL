@@ -6,7 +6,7 @@
 #include <vector>
 #include "executor/multi_thread_executor.h"
 #include "transport/transport.h"
-#include "topology.h"
+#include "topology/topology.h"
 #include "logger.h"
 
 MultiThreadExecutor::~MultiThreadExecutor() {

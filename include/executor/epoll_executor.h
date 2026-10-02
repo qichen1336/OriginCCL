@@ -4,7 +4,7 @@
 #include <vector>
 #include "types.h"
 #include "executor/executor.h"
-#include "topology.h"
+#include "topology/topology.h"
 
 class EpollExecutor : public Executor {
 public:

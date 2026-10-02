@@ -2,7 +2,7 @@
 
 三种传输实现：TCP socket、同机共享内存与 RDMA（CM 建链 + RC + write）。改动本层前阅读本文件。
 
-transport 与 executor 一样单独成目录；头文件从 include 根限定引用，形如 `#include "transport/transport.h"`。其余层仍平铺。
+transport 与 executor、topology 一样单独成目录；头文件从 include 根限定引用，形如 `#include "transport/transport.h"`。其余层仍平铺。
 
 # 核心职责边界
 

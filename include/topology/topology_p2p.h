@@ -1,6 +1,6 @@
 #pragma once
 
-#include "topology.h"
+#include "topology/topology.h"
 
 class TopologyP2p : public Topology {
 public:

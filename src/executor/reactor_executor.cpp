@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <vector>
 #include "executor/reactor_executor.h"
-#include "topology.h"
+#include "topology/topology.h"
 #include "logger.h"
 
 namespace {

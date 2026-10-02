@@ -1,6 +1,6 @@
 #include <algorithm>
 #include <cstring>
-#include "topology_tree.h"
+#include "topology/topology_tree.h"
 #include "communicator.h"
 #include "transport/transport.h"
 #include "utils.h"

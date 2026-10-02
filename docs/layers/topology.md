@@ -1,6 +1,8 @@
-# Topology 层（`include/topology*.h`、`src/topology_ring.cpp`、`src/topology_tree.cpp`）
+# Topology 层（`include/topology/*.h`、`src/topology/*.cpp`）
 
 集合算法层。**只做事件处理**，把"如何等待 socket 就绪"完全交给 executor。改动算法或状态机前阅读本文件。
+
+topology 与 executor、transport 一样单独成目录；头文件从 include 根限定引用，形如 `#include "topology/topology.h"`。其余层仍平铺。
 
 # 核心职责边界
 
@@ -19,10 +21,10 @@
 
 | 文件 | 职责 |
 |------|------|
-| `include/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillPeers` / `FillTransports`）+ `TopoEdge` |
-| `include/topology_ring.h` / `src/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport；`FillPeers` 返回 next/prev 两条有向边 |
-| `include/topology_tree.h` / `src/topology_tree.cpp` | Tree 实现：机器内星型 + 机器间 double binary tree（DBT），见下节 |
-| `include/topology_p2p.h` / `src/topology_p2p.cpp` | Send/Recv：channel 0 单 peer、单方向、整段传输 |
+| `include/topology/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillPeers` / `FillTransports`）+ `TopoEdge` |
+| `include/topology/topology_ring.h` / `src/topology/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport；`FillPeers` 返回 next/prev 两条有向边 |
+| `include/topology/topology_tree.h` / `src/topology/topology_tree.cpp` | Tree 实现：机器内星型 + 机器间 double binary tree（DBT），见下节 |
+| `include/topology/topology_p2p.h` / `src/topology/topology_p2p.cpp` | Send/Recv：channel 0 单 peer、单方向、整段传输 |
 
 # 实现原理
 

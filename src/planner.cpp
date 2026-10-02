@@ -7,7 +7,7 @@
 #include "communicator.h"
 #include "channel.h"
 #include "occl_config.h"
-#include "topology.h"
+#include "topology/topology.h"
 #include "utils.h"
 #include "logger.h"
 #include "transport/transport_tcp.h"

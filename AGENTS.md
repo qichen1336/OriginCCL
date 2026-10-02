@@ -26,9 +26,11 @@ OriginCCL 是一个受 NCCL 启发的 C++ 集合通信（collective communicatio
 include/                   公开头（平铺）
 include/executor/          executor 头（限定路径引用：#include "executor/executor.h"）
 include/transport/         transport 头（限定路径引用：#include "transport/transport.h"）
+include/topology/          topology 头（限定路径引用：#include "topology/topology.h"）
 src/                       实现（平铺）
 src/executor/              四种 executor 实现
 src/transport/             TCP、共享内存与 RDMA（含零拷贝变体）传输实现
+src/topology/              ring / tree / p2p 拓扑实现
 tests/                     七个测试入口 + test_common / transport_check 共享支持
 docs/layers/               各层规则文档（改哪层读哪层，勿一次全读）
 scripts/                   run_tests.sh（唯一入口）
@@ -37,7 +39,7 @@ scripts/                   run_tests.sh（唯一入口）
 | 层 | 头文件 | 职责 | 铁律 |
 | --- | --- | --- | --- |
 | **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` / `transport/transport_rdma_zc.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态）；`transport_rdma_zc.h` 是 RDMA 的零拷贝子类，阈值 (16 MiB) 以上用独立 QP 直发用户 MR，以下完全走基类环形缓冲 |
-| **topology** | `topology.h` / `topology_ring.h` / `topology_tree.h` / `topology_p2p.h` | 拥有集合与 P2P 算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
+| **topology** | `topology/topology.h` / `topology/topology_ring.h` / `topology/topology_tree.h` / `topology/topology_p2p.h` | 拥有集合与 P2P 算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
 | **planner** | `planner.h` | 把 `CollTask` 规划为 `CollPlan`，P2P 按需建连 | 集合纯规划，P2P 准备连接；无回调、无 `std::function` |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | `Init` 按核数与 local rank 数在 polling 与 epoll 间**运行时**选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
 | **communicator** | `communicator.h` | 顶层编排：建 listener → bootstrap → 分组 → 建 channel → 选 executor | 唯一对外入口，暴露五种集合操作与同步 Send/Recv |

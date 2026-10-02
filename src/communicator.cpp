@@ -17,9 +17,9 @@
 #include "transport/transport_shm.h"
 #include "transport/transport_rdma.h"
 #include "transport/transport_rdma_zc.h"
-#include "topology_ring.h"
-#include "topology_tree.h"
-#include "topology_p2p.h"
+#include "topology/topology_ring.h"
+#include "topology/topology_tree.h"
+#include "topology/topology_p2p.h"
 #include "executor/epoll_executor.h"
 #include "executor/polling_executor.h"
 

@@ -2,7 +2,7 @@
 
 执行策略层。**只决定如何等待 socket 就绪**，算法推进交给 `Topology::CollectiveStep`。改动 executor 前阅读本文件。
 
-executor 与 transport 单独成目录，其余层仍平铺。头文件从 include 根限定引用，形如 `#include "executor/executor.h"`。
+executor、transport 与 topology 单独成目录，其余层仍平铺。头文件从 include 根限定引用，形如 `#include "executor/executor.h"`。
 
 # 核心职责边界
 
