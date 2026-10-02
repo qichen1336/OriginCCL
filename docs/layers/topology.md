@@ -24,7 +24,7 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 | `include/topology/topology.h` | `Topology` 抽象基类 + 状态机接口（含 `FillChannels` / `FillPeers` / `FillTransports`）+ `TopoEdge` |
 | `include/topology/topology_ring.h` / `src/topology/topology_ring.cpp` | Ring 实现：`ring.prev=(rank-1+ws)%ws`、`ring.next=(rank+1)%ws`；`FillTransports` 取 `send[next]` / `recv[prev]` 并过滤空 transport；`FillPeers` 返回 next/prev 两条有向边 |
 | `include/topology/topology_tree.h` / `src/topology/topology_tree.cpp` | Tree 实现：机器内星型 + 机器间 double binary tree（DBT），见下节 |
-| `include/topology/topology_p2p.h` / `src/topology/topology_p2p.cpp` | Send/Recv：channel 0 单 peer、单方向、整段传输 |
+| `include/topology/topology_p2p.h` / `src/topology/topology_p2p.cpp` | Send/Recv：单 peer、单方向、整段传输（发送在 channel 0、接收在 channel 1，由 planner 决定） |
 
 # 实现原理
 
@@ -57,13 +57,13 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 # P2P 拓扑
 
 - `FillChannels` 初始化各 channel 的 `send_p2p[peer]` / `recv_p2p[peer]` 槽位，transport 留空；`FillPeers` 返回空集，不参与集合初始化建边。
-- 参数检查和连接准备已由 planner 完成。`FillTransports` 只为非空任务选一个方向的一条连接；空任务不挂 transport。
+- 参数检查和连接准备已由 planner 完成。planner 把发送任务绑定到 channel 0、接收任务绑定到 channel 1，`FillTransports` 只为非空任务选该 channel 上对应方向的一条连接；空任务不挂 transport。
 - `CollectiveInit` 初始化该方向的 progress/done 并主动尝试一次传输，零长度直接完成。`CollectiveStep` 将原始 buffer 和完整 `elem_count * type_size` 交给 `TrySend`/`TryRecv`，不改地址、不切 chunk；`phase == 1` 表示完成。
 - 无需 topology 层流水线不等于阻塞直发：executor 仍等待就绪并推进；transport 保留背压、RDMA_ZC 阈值和内部分块。
 
 # 隐含约定
 
-- **集合算法同一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等 → 死锁。P2P 每个任务只有一个方向，调用方负责保证两端调用顺序无循环等待。
+- **集合算法同一步内 send 与 recv 必须并发推进**。2 rank 时 `prev == next`，串行（先 send 完再 recv）会双方互等 → 死锁。P2P 每个任务只有一个方向，planner 把同一轮的全部 Send 放 channel 0、全部 Recv 放 channel 1，由 executor 的两个 channel 并发推进双向；同一有向 rank 对的消息顺序由轮次与 FIFO 保证。
 - **一条连接一份进度，遍历在 topology 层**：`PushBuffer` 按 `CollEvent` 选定一侧后遍历该侧全部 transport 逐条 `TrySend`/`TryRecv`；`Try*` 接口本身保持单连接语义。未就绪连接无进展不影响其他连接；一条失败即整体 false。该侧每次事件语义是「推进该侧全部连接一次」。
 - **错误只有一个通道**：`CollectiveInit`/`CollectiveStep` 及具名 Init/Step 是 `noexcept`，返回 `false` 即失败（拓扑内已 `LOG_ERROR`）；executor 见到 false 立即放弃。意外异常（如 `bad_alloc`）直接终止，不转换为可恢复失败。
 - executor 只使用 `CollectiveInit/CollectiveStep/CollectiveDone`；新增操作不修改 executor，不向 plan 添加函数指针或回调。

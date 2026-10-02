@@ -280,7 +280,6 @@ bool Communicator::Init(const CommConfig& cfg) {
     LOG_INFO("Rank {}: Communicator init successfully", config.rank);
     return true;
 }
-
 void Communicator::Finalize() {
     if (executor) {
         executor->Shutdown();
@@ -314,6 +313,8 @@ void Communicator::Finalize() {
         }
     }
     channels.clear();
+    pending_tasks.clear();
+    group_depth = 0;
     for (const auto& listener : p2p_listeners_) {
         listener->Close();
     }
@@ -330,6 +331,55 @@ const Channel& Communicator::GetChannel(int channel_id) const {
     return channels.at(static_cast<size_t>(channel_id));
 }
 
+void Communicator::GroupStart() {
+    ++group_depth;
+}
+
+bool Communicator::GroupEnd() {
+    if (group_depth <= 0) {
+        LOG_ERROR("Rank {}: GroupEnd without GroupStart", config.rank);
+        return false;
+    }
+    if (--group_depth > 0) {
+        return true;
+    }
+    return Flush();
+}
+
+bool Communicator::Submit(const CollTask& task) {
+    pending_tasks.push_back(task);
+    if (group_depth == 0) {
+        return Flush();
+    }
+    return true;
+}
+
+bool Communicator::Flush() {
+    std::vector<CollTask> tasks;
+    tasks.swap(pending_tasks);
+    planner.SortTasks(tasks, config.rank, config.world_size);
+
+    bool ok = true;
+    CollPlan collective_plan;
+    if (planner.Plan(*this, tasks, collective_plan)) {
+        ok = executor->Run(collective_plan);
+    } else {
+        ok = false;
+    }
+    for (int round = 1; ok && round < config.world_size; ++round) {
+        CollPlan round_plan;
+        if (!planner.PlanRound(*this, tasks, round, round_plan)) {
+            ok = false;
+            break;
+        }
+        if (round_plan.channels.empty()) {
+            continue;
+        }
+        ok = executor->Run(round_plan);
+    }
+    return ok;
+}
+
 bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
     LOG_DEBUG("Rank {}: AllReduce count {}, dtype {}, op {}", config.rank, count, Utils::GetDataTypeName(dtype),
               Utils::GetReduceOpName(op));
@@ -340,47 +390,39 @@ bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count,
     task.count = count;
     task.dtype = dtype;
     task.op = op;
-
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::Broadcast(void* buffer, size_t count, DataType dtype, int root) {
     CollTask task{CollFunc::Broadcast, buffer, buffer, count, dtype, ReduceOp::SUM, root};
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype) {
     CollTask task{CollFunc::AllGather, send_buf, recv_buf, count, dtype};
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::Reduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op, int root) {
     CollTask task{CollFunc::Reduce, send_buf, recv_buf, count, dtype, op, root};
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::ReduceScatter(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
     CollTask task{CollFunc::ReduceScatter, send_buf, recv_buf, count, dtype, op};
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::Send(const void* buffer, size_t count, DataType dtype, int peer) {
     CollTask task{CollFunc::Send, buffer, nullptr, count, dtype};
     task.peer = peer;
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 bool Communicator::Recv(void* buffer, size_t count, DataType dtype, int peer) {
     CollTask task{CollFunc::Recv, nullptr, buffer, count, dtype};
     task.peer = peer;
-    CollPlan plan;
-    return planner.Plan(*this, task, plan) && executor->Run(plan);
+    return Submit(task);
 }
 
 Connector* Communicator::FindConnector(int channel_id, int peer, bool is_send) {

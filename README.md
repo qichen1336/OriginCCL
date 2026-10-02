@@ -5,6 +5,23 @@ C++ 集合通信库。
 支持 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter，以及同步点对点 Send/Recv。
 接口参数和缓冲区布局见 [Communicator 层文档](docs/layers/communicator.md)。四种 executor 均通过统一的三阶段接口驱动集合操作。
 
+## 批量下发（Group API）
+
+`GroupStart()` / `GroupEnd()` 之间的通信调用只入队，最外层 `GroupEnd()` 排序后统一规划并执行到完成，返回是否全部成功。单独调用等价于只有一个任务的组，走同一条路径：
+
+```cpp
+comm.GroupStart();
+comm.AllReduce(a, a_out, n, DataType::FLOAT32, ReduceOp::SUM);
+comm.Send(buf, n, DataType::FLOAT32, peer);
+comm.Recv(recv, n, DataType::FLOAT32, peer);
+bool ok = comm.GroupEnd();
+```
+
+- 组内集合按 `(操作类型, 字节量, dtype, 有效 op, 有效 root)` 稳定升序排列，P2P 一律排在集合之后。
+- P2P 按轮次 `i = 1..world_size-1` 执行：第 i 轮向 `(rank-i+world_size)%world_size` 发送、从 `(rank+i)%world_size` 接收；发送任务进 channel 0、接收任务进 channel 1，两方向并发推进。同有向 rank 对保持 FIFO。
+- 支持嵌套：内层 `GroupEnd` 不执行，深度归零的最外层才执行。组内操作彼此独立（可共享只读输入、允许各自原有合法 in-place），不支持前一操作的输出作为同组后一操作的输入；这类依赖用 Group 边界表达。
+- 需要至少两个 channel（发送/接收各一个）。参数错误沿用 `LOG_ERROR` + `false`，配对与跨组消息匹配由调用方保证。
+
 ## 构建
 
 ```bash
@@ -58,7 +75,7 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
 
 七个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
 
-P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。channel 0 独立连接按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
+P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。发送连接固定在 channel 0、接收连接固定在 channel 1，按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
 
 `scripts/run_tests.sh --suite p2p --oversubscribe` 固定用四 rank，覆盖同机和模拟跨机、连接缓存与隔离、乱序接入、与集合操作交替、polling/epoll 及最大 48 MiB 数据。P2P 数据量不缩放；无 RDMA 时验证拒绝回退，再将跨机数据传输记为 SKIP。
 

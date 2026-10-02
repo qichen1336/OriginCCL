@@ -70,6 +70,11 @@ int main(int argc, char** argv) {
     if (!contract.Passed()) {
         failed = 1;
     }
+    std::string group_reason;
+    if (!TestCommon::RunGroupCases(comm, group_reason)) {
+        LOG_ERROR("Rank {}: group cases failed: {}", rank, group_reason);
+        failed = 1;
+    }
     comm.Finalize();
 
     int global_failed = 0;

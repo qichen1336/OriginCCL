@@ -63,6 +63,9 @@ public:
     Channel& GetChannel(int channel_id);
     const Channel& GetChannel(int channel_id) const;
 
+    void GroupStart();
+    bool GroupEnd();
+
     bool AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op);
     bool Broadcast(void* buffer, size_t count, DataType dtype, int root);
     bool AllGather(const void* send_buf, void* recv_buf, size_t count, DataType dtype);
@@ -86,6 +89,9 @@ private:
         bool is_send = false;
     };
 
+    bool Submit(const CollTask& task);
+    bool Flush();
+
     bool InitChannels(const std::vector<NodeInfo>& all_nodes, const std::vector<std::shared_ptr<Transport>>& listeners,
                       bool use_shm, bool rdma_ready);
     bool ConnectActiveEdges(const std::vector<NodeInfo>& all_nodes, const std::vector<ChannelEdge>& edges, bool use_shm,
@@ -106,6 +112,8 @@ private:
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;
+    int group_depth = 0;
+    std::vector<CollTask> pending_tasks;
     int bootstrap_listen_fd = -1;
     int local_rank = 0;
     int local_size = 1;

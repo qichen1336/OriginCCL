@@ -5,7 +5,7 @@
 # 核心职责边界
 
 - 初始化链路：同时构造 `TopologyRing` 与 `TopologyTree` → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 机器分组（写入成员）+ 按 `local_rank` 绑核 → 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → 两个拓扑 `FillChannels(*this, channels)` → `InitChannels` 按 `FillPeers` 的边并集建 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
-- 执行链路：五个 collective 与 Send/Recv 公开方法创建 `CollTask` → `planner.Plan` 成功 → `executor->Run(plan)`，不在入口展开算法。P2P 固定由 `TopologyP2p` 执行，planner 按需建立其独立连接。
+- 执行链路：五个 collective 与 Send/Recv 公开方法构造 `CollTask` 后统一提交；非组内调用是单元素批次，直接走批量规划；`GroupStart()`/`GroupEnd()` 之间的调用只入队，最外层 `GroupEnd()` 统一执行。planner 负责排序与批量规划，入口不展开算法。P2P 固定由 `TopologyP2p` 执行，planner 按轮次建立其独立连接。
 - 暴露本机视角：`GetLocalRank()` / `GetLocalSize()` / `GetLocalRanks()` / `IsSingleMachine()`；以及两个拓扑的访问器 `GetRingTopology()` / `GetTreeTopology()`（planner 用它二选一，见 [planner.md](planner.md)）。
 - 不负责：不决定算法（topology）、不决定等待策略（executor）、不切片（planner）、不实现共享内存环（transport）。
 
@@ -42,9 +42,18 @@
 - `bool Send(const void* buffer, size_t count, DataType dtype, int peer)` 与 `bool Recv(void* buffer, size_t count, DataType dtype, int peer)` 为同步接口。成功返回后发送缓冲区可复用，接收缓冲区可读取；Send 成功不保证对端 Recv 已返回。
 - 只需收发双方参与。明确指定 peer，无 tag、任意来源或长度探测；同一有向 rank 对按调用顺序一一匹配，调用方保证 count/dtype 相同，不拆分或合并消息。禁止同一 communicator 并发调用，调用方保证收发与集合操作之间不形成等待环。
 - 不支持 peer==rank，越界 peer 同样 LOG_ERROR + false。合法 peer 的 count=0 直接成功，允许空 buffer，不建连接、不产生消息，也不提供同步语义。
-- `Channel.send_p2p` / `recv_p2p` 按 peer 索引，初始 transport 为空；仅使用 channel 0。它们与集合连接隔离，方向也各用独立 transport；planner 首次使用时建连，之后复用。
+- `Channel.send_p2p` / `recv_p2p` 按 peer 索引，初始 transport 为空；发送固定用 channel 0、接收固定用 channel 1（因此要求 `n_channels >= 2`）。它们与集合连接隔离，方向也各用独立 transport；planner 首次使用时建连，之后复用。
 - bootstrap 前创建独立 P2P TCP、SHM 和可用的 RDMA_ZC listener。`NodeInfo.p2p_port` / `p2p_rdma_port` 公布两个网络端点；SHM 路径为 `/tmp/originccl/<port>-<rank>.sock.p2p`。独立端点防止较快 rank 的首次 Send 被较慢 rank 的集合初始化误接。原有集合 listener 仍在 InitChannels 后关闭，P2P listener 和节点表保留至 Finalize。
-- P2P 没有后台接入线程，首次 Send 可以等待 Recv。发送端主动连接，接收端按握手 rank 缓存连接；该规则与集合的 rank 大小建连规则各自独立。普通 RDMA listener 不接入零拷贝连接，独立 RDMA_ZC listener 经其 MakePeer 创建正确子类。
+- P2P 没有后台接入线程，首次 Send 可以等待 Recv。发送端主动连接、接收端接受握手；planner 在每一轮建连时临时开一个发送建连线程与一个接收接受线程，两个方向的连接同时建立，返回前 join，完成即退出（无长驻线程）。接收端按握手 rank 缓存连接，保存到 channel 1。
+
+# Group 批量下发
+
+`GroupStart()` 递增组深度，`GroupEnd()` 递减；深度大于 0 时通信调用只把 `CollTask` 推入 `pending_tasks`，只有深度归零的最外层 `GroupEnd()` 触发执行，返回是否全部成功。非组内调用等价于单元素批次，走同一条排序与规划路径。
+
+- 一批任务先按集合在前、P2P 在后排序，集合按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序；各 rank 提交相同集合任务，同键重复任务保留入队对应顺序。
+- 集合任务按现有单操作切片规则轮转分配到 channel 并执行完，随后进入 P2P 阶段。
+- P2P 按轮次 `i = 1..world_size-1` 执行：`Send` 到 `(rank-i+world_size)%world_size` 的任务放 channel 0、`Recv` 自 `(rank+i)%world_size` 的任务放 channel 1（轮次由 planner 按 peer 推导，调用方不传）。每轮所有发送与接收任务放入同一 `CollPlan` 的两个 channel，由 executor 并发推进，整轮完成后进入下一轮。
+- 组内操作彼此独立，buffer 存活到最外层 `GroupEnd()` 返回；嵌套时内层 `GroupEnd()` 不执行。
 - 同机优先 SHM；禁用 SHM 后沿用全局网络选择，P2P 的 RDMA 使用零拷贝变体。跨机严格 RDMA_ZC，任一端无可用端点则在非空 P2P 操作时失败，不影响原有集合初始化，不自动降级。
 - Finalize 先停 executor，再关闭两套 channel 连接，最后关闭 P2P listener、清空节点表。细节见 [planner.md](planner.md) 和 [topology.md](topology.md)。
 

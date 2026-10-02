@@ -50,6 +50,8 @@ bool InitCommunicator(Communicator& comm, CommConfig& config, int rank, int worl
 
 bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason);
 
+bool RunGroupCases(Communicator& comm, std::string& reason);
+
 void ReportOutcome(const std::string& report_path, const std::string& suite, int rank, int world_size,
                    const std::string& status, const std::string& reason, const std::vector<std::string>& failures);
 

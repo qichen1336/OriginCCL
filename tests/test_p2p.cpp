@@ -32,6 +32,12 @@ bool Disabled(const char* name) {
     return value && std::strcmp(value, "1") == 0;
 }
 
+int P2pRound(CollFunc func, int rank, int peer, int world_size) {
+    const int forward =
+        (func == CollFunc::Send) ? (peer - rank + world_size) % world_size : (rank - peer + world_size) % world_size;
+    return world_size - forward;
+}
+
 void CheckUnusedChannels(Communicator& comm, int first_channel) {
     for (int channel_id = first_channel; channel_id < comm.GetNChannels(); ++channel_id) {
         const auto& channel = comm.GetChannel(channel_id);
@@ -64,7 +70,7 @@ void CheckOutOfOrder(Communicator& comm) {
     int value = comm.GetRank();
     if (comm.GetRank() == 0) {
         Require(comm.Recv(&value, 1, DataType::INT32, 1) && value == 1, "target source receive");
-        Require(comm.GetChannel(0).recv_p2p[2].transport != nullptr, "non-target source was not cached");
+        Require(comm.GetChannel(1).recv_p2p[2].transport != nullptr, "non-target source was not cached");
         Require(comm.Recv(&value, 1, DataType::INT32, 2) && value == 2, "cached source receive");
     } else if (comm.GetRank() == 1) {
         MPI_Recv(&value, 1, MPI_INT, 2, 7, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -80,6 +86,7 @@ void CheckOutOfOrder(Communicator& comm) {
 template<typename Value>
 void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* executor = nullptr) {
     const int rank = comm.GetRank();
+    const int world_size = comm.GetWorldSize();
     const int peer = rank ^ 1;
     const Value sentinel = static_cast<Value>(-99);
     std::vector<Value> send(count + 2, sentinel);
@@ -88,7 +95,7 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
         send[index + 1] = static_cast<Value>(rank * 1000 + index % 997);
     }
     const auto old_send = comm.GetChannel(0).send_p2p[peer].transport;
-    const auto old_recv = comm.GetChannel(0).recv_p2p[peer].transport;
+    const auto old_recv = comm.GetChannel(1).recv_p2p[peer].transport;
     auto transfer = [&](bool is_send) {
         bool success;
         if (executor) {
@@ -99,11 +106,17 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
             task.count = count;
             task.dtype = dtype;
             task.peer = peer;
+            std::vector<CollTask> tasks{task};
+            Planner planner;
+            planner.SortTasks(tasks, rank, world_size);
             CollPlan plan;
-            Require(Planner().Plan(comm, task, plan), "P2P planning");
-            Require(plan.channels.size() == 1 && plan.channels[0].channel_id == 0 && plan.channels[0].tasks.size() == 1,
-                    "P2P plan must use channel 0 only");
-            const auto& planned = plan.channels[0].tasks[0];
+            Require(planner.PlanRound(comm, tasks, P2pRound(task.func, rank, peer, world_size), plan), "P2P planning");
+            const size_t slot = is_send ? 0u : 1u;
+            Require(plan.channels.size() == 2 && plan.channels[slot].tasks.size() == 1 &&
+                        plan.channels[slot].channel_id == static_cast<int>(slot) &&
+                        plan.channels[1 - slot].tasks.empty(),
+                    "P2P plan must put the payload on the direction channel");
+            const auto& planned = plan.channels[slot].tasks[0];
             Require(planned.elem_count == count && planned.chunk_size == 0 &&
                         std::strcmp(planned.topology->GetName(), "P2P") == 0 &&
                         planned.send_transports.size() == (is_send ? 1u : 0u) &&
@@ -111,8 +124,11 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
                     "P2P plan must keep the entire payload on one direction");
             success = executor->Run(plan);
         } else {
-            success = is_send ? comm.Send(send.data() + 1, count, dtype, peer)
-                              : comm.Recv(recv.data() + 1, count, dtype, peer);
+            comm.GroupStart();
+            const bool submitted = is_send ? comm.Send(send.data() + 1, count, dtype, peer)
+                                           : comm.Recv(recv.data() + 1, count, dtype, peer);
+            Require(submitted, "P2P submit");
+            success = comm.GroupEnd();
         }
         Require(success, "P2P exchange");
         if (is_send) {
@@ -126,14 +142,16 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
     }
     Require(send.front() == sentinel && send.back() == sentinel && recv.front() == sentinel && recv.back() == sentinel,
             "P2P buffer boundary overwritten");
-    const auto& channel = comm.GetChannel(0);
-    Require(!old_send || old_send == channel.send_p2p[peer].transport, "send connection not reused");
-    Require(!old_recv || old_recv == channel.recv_p2p[peer].transport, "recv connection not reused");
-    Require(channel.send_p2p[peer].transport != channel.recv_p2p[peer].transport, "directions share a connection");
-    Require(channel.send_p2p[peer].transport != channel.send[peer].transport &&
-                channel.recv_p2p[peer].transport != channel.recv[peer].transport,
+    const Channel& send_channel = comm.GetChannel(0);
+    const Channel& recv_channel = comm.GetChannel(1);
+    Require(!old_send || old_send == send_channel.send_p2p[peer].transport, "send connection not reused");
+    Require(!old_recv || old_recv == recv_channel.recv_p2p[peer].transport, "recv connection not reused");
+    Require(send_channel.send_p2p[peer].transport != recv_channel.recv_p2p[peer].transport,
+            "directions share a connection");
+    Require(send_channel.send_p2p[peer].transport != send_channel.send[peer].transport &&
+                recv_channel.recv_p2p[peer].transport != recv_channel.recv[peer].transport,
             "P2P shares a collective connection");
-    CheckUnusedChannels(comm, 1);
+    CheckUnusedChannels(comm, 2);
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
@@ -142,6 +160,78 @@ void CheckCollective(Communicator& comm) {
     int recv = 0;
     Require(comm.AllReduce(&send, &recv, 1, DataType::INT32, ReduceOp::SUM), "interleaved AllReduce");
     Require(recv == comm.GetWorldSize() * (comm.GetWorldSize() + 1) / 2, "interleaved AllReduce result");
+}
+
+void CheckGroupCollective(Communicator& comm) {
+    const int rank = comm.GetRank();
+    const int world_size = comm.GetWorldSize();
+    int small_send = rank + 1;
+    int small_recv = 0;
+    int big_send[2] = {rank + 2, rank + 2};
+    int big_recv[2] = {0, 0};
+    comm.GroupStart();
+    comm.GroupStart();
+    Require(comm.AllReduce(big_send, big_recv, 2, DataType::INT32, ReduceOp::SUM), "nested group submit");
+    Require(comm.AllReduce(&small_send, &small_recv, 1, DataType::INT32, ReduceOp::SUM), "nested group submit");
+    Require(comm.GroupEnd(), "inner GroupEnd");
+    Require(small_recv == 0 && big_recv[0] == 0 && big_recv[1] == 0, "inner GroupEnd must not execute the batch");
+    Require(comm.GroupEnd(), "outer GroupEnd");
+    const int small_expected = world_size * (world_size + 1) / 2;
+    const int big_expected = small_expected + world_size;
+    Require(small_recv == small_expected, "group AllReduce count 1");
+    Require(big_recv[0] == big_expected && big_recv[1] == big_expected, "group AllReduce count 2");
+}
+
+void CheckGroupP2pMesh(Communicator& comm, size_t count) {
+    const int rank = comm.GetRank();
+    const int world_size = comm.GetWorldSize();
+    std::vector<int32_t> send(static_cast<size_t>(world_size) * count, 0);
+    std::vector<int32_t> recv(static_cast<size_t>(world_size) * count, 0);
+    for (int peer = 0; peer < world_size; ++peer) {
+        for (size_t index = 0; index < count; ++index) {
+            send[static_cast<size_t>(peer) * count + index] = static_cast<int32_t>(rank * 1000 + index % 997);
+        }
+    }
+    comm.GroupStart();
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) {
+            continue;
+        }
+        Require(comm.Send(send.data() + static_cast<size_t>(peer) * count, count, DataType::INT32, peer), "mesh send");
+        Require(comm.Recv(recv.data() + static_cast<size_t>(peer) * count, count, DataType::INT32, peer), "mesh recv");
+    }
+    Require(comm.GroupEnd(), "mesh GroupEnd");
+    for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) {
+            continue;
+        }
+        for (size_t index = 0; index < count; ++index) {
+            Require(recv[static_cast<size_t>(peer) * count + index] == static_cast<int32_t>(peer * 1000 + index % 997),
+                    "mesh payload mismatch");
+        }
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+void CheckGroupRepeatedPeer(Communicator& comm) {
+    const int rank = comm.GetRank();
+    const int peer = rank ^ 1;
+    int32_t first = static_cast<int32_t>(rank * 10 + 1);
+    int32_t second = static_cast<int32_t>(rank * 10 + 2);
+    int32_t recv_first = -1;
+    int32_t recv_second = -1;
+    MPI_Barrier(MPI_COMM_WORLD);
+    comm.GroupStart();
+    Require(comm.Send(&first, 1, DataType::INT32, peer), "repeated send submit");
+    Require(comm.Send(&second, 1, DataType::INT32, peer), "repeated send submit");
+    Require(comm.GroupEnd(), "repeated send group");
+    comm.GroupStart();
+    Require(comm.Recv(&recv_first, 1, DataType::INT32, peer), "repeated recv submit");
+    Require(comm.Recv(&recv_second, 1, DataType::INT32, peer), "repeated recv submit");
+    Require(comm.GroupEnd(), "repeated recv group");
+    Require(recv_first == static_cast<int32_t>(peer * 10 + 1) && recv_second == static_cast<int32_t>(peer * 10 + 2),
+            "repeated peer must keep FIFO order");
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 }
 
@@ -183,6 +273,7 @@ int main(int argc, char** argv) {
     }
 
     CheckOutOfOrder(comm);
+    CheckGroupP2pMesh(comm, 1);
     Exchange<float>(comm, 257, DataType::FLOAT32);
     Exchange<double>(comm, 513, DataType::FLOAT64);
     Exchange<int64_t>(comm, 129, DataType::INT64);
@@ -196,8 +287,13 @@ int main(int argc, char** argv) {
         CheckCollective(comm);
         Exchange<int32_t>(comm, 257, DataType::INT32);
     }
-    const auto& channel = comm.GetChannel(0);
-    for (const auto& transport : {channel.send_p2p[rank ^ 1].transport, channel.recv_p2p[rank ^ 1].transport}) {
+    CheckGroupCollective(comm);
+    CheckGroupP2pMesh(comm, 256 * 1024);
+    CheckGroupRepeatedPeer(comm);
+    const Channel& send_channel = comm.GetChannel(0);
+    const Channel& recv_channel = comm.GetChannel(1);
+    for (const auto& transport :
+         {send_channel.send_p2p[rank ^ 1].transport, recv_channel.recv_p2p[rank ^ 1].transport}) {
         if (cross_machine || (Disabled("OCCL_DISABLE_SHM") && rdma_available)) {
             Require(dynamic_cast<TransportRDMAZc*>(transport.get()) != nullptr, "expected RDMA_ZC");
         } else if (!Disabled("OCCL_DISABLE_SHM")) {
@@ -206,7 +302,7 @@ int main(int argc, char** argv) {
             Require(dynamic_cast<TransportTCP*>(transport.get()) != nullptr, "expected TCP");
         }
     }
-    const auto connection = channel.send_p2p[rank ^ 1].transport;
+    const auto connection = send_channel.send_p2p[rank ^ 1].transport;
     MPI_Barrier(MPI_COMM_WORLD);
     comm.Finalize();
     Require(!connection->IsConnected(), "Finalize did not close cached P2P connection");

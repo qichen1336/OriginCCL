@@ -11,6 +11,7 @@
 #include "communicator.h"
 #include "logger.h"
 #include "occl_config.h"
+#include "planner.h"
 #include "utils.h"
 
 namespace TestCommon {
@@ -605,6 +606,139 @@ bool RunOneCase(Communicator& comm, const CaseSpec& spec, std::string& reason) {
     }
     reason = "unknown data type";
     return false;
+}
+
+bool RunGroupCases(Communicator& comm, std::string& reason) {
+    const int rank = comm.GetRank();
+    const int world_size = comm.GetWorldSize();
+
+    {
+        std::vector<CollTask> tasks;
+        CollTask send;
+        send.func = CollFunc::Send;
+        send.peer = (rank + 1) % world_size;
+        send.count = 1;
+        CollTask big;
+        big.func = CollFunc::AllReduce;
+        big.count = 4096;
+        big.dtype = DataType::INT32;
+        CollTask broadcast;
+        broadcast.func = CollFunc::Broadcast;
+        broadcast.count = 32;
+        broadcast.dtype = DataType::INT32;
+        CollTask small;
+        small.func = CollFunc::AllReduce;
+        small.count = 32;
+        small.dtype = DataType::INT32;
+        tasks = {send, big, broadcast, small};
+        Planner planner;
+        planner.SortTasks(tasks, rank, world_size);
+        if (tasks.size() != 4 || tasks[0].func != CollFunc::AllReduce || tasks[0].count != 32 ||
+            tasks[1].func != CollFunc::AllReduce || tasks[1].count != 4096 || tasks[2].func != CollFunc::Broadcast ||
+            tasks[3].func != CollFunc::Send) {
+            reason = "the collective sort order or the P2P-last rule is wrong";
+            return false;
+        }
+    }
+
+    {
+        auto round_of = [rank, world_size](const CollTask& task) {
+            if (task.func == CollFunc::Send) {
+                return (rank - task.peer + world_size) % world_size;
+            }
+            return (task.peer - rank + world_size) % world_size;
+        };
+        CollTask first;
+        first.func = CollFunc::Send;
+        first.peer = (rank + 3) % world_size;
+        CollTask second;
+        second.func = CollFunc::Send;
+        second.peer = (rank + 1) % world_size;
+        CollTask third;
+        third.func = CollFunc::Recv;
+        third.peer = (rank + 1) % world_size;
+        std::vector<CollTask> tasks = {first, second, third};
+        Planner planner;
+        planner.SortTasks(tasks, rank, world_size);
+        for (size_t i = 1; i < tasks.size(); ++i) {
+            const int previous = round_of(tasks[i - 1]);
+            const int current = round_of(tasks[i]);
+            if (previous > current) {
+                reason = "the P2P round order is not ascending";
+                return false;
+            }
+        }
+    }
+
+    comm.GroupStart();
+    if (!comm.GroupEnd()) {
+        reason = "an empty group must succeed";
+        return false;
+    }
+
+    const size_t count = 256;
+    const int32_t sum_expected = static_cast<int32_t>(world_size * (world_size + 1) / 2);
+    const int32_t second_expected = static_cast<int32_t>(world_size * (world_size + 5) / 2);
+    std::vector<int32_t> first(count);
+    std::vector<int32_t> second(count);
+    std::vector<int32_t> first_out(count, 0);
+    std::vector<int32_t> second_out(count, 0);
+    for (size_t i = 0; i < count; ++i) {
+        first[i] = static_cast<int32_t>(rank + 1);
+        second[i] = static_cast<int32_t>(rank + 3);
+    }
+
+    comm.GroupStart();
+    comm.GroupStart();
+    if (!comm.AllReduce(second.data(), second_out.data(), count, DataType::INT32, ReduceOp::SUM) ||
+        !comm.AllReduce(first.data(), first_out.data(), count, DataType::INT32, ReduceOp::SUM)) {
+        reason = "a grouped collective submission failed";
+        return false;
+    }
+    if (!comm.GroupEnd()) {
+        reason = "the inner GroupEnd failed";
+        return false;
+    }
+    if (second_out[0] != 0 || first_out[0] != 0) {
+        reason = "an inner GroupEnd must not execute the batch";
+        return false;
+    }
+    if (!comm.GroupEnd()) {
+        reason = "the outer GroupEnd failed";
+        return false;
+    }
+    if (first_out[0] != sum_expected || first_out[count - 1] != sum_expected || second_out[0] != second_expected ||
+        second_out[count - 1] != second_expected) {
+        reason = "the grouped AllReduce results are wrong";
+        return false;
+    }
+
+    std::vector<int32_t> gathered(count * static_cast<size_t>(world_size), 0);
+    std::vector<int32_t> reduced(count, 0);
+    comm.GroupStart();
+    if (!comm.AllGather(first.data(), gathered.data(), count, DataType::INT32) ||
+        !comm.Reduce(first.data(), rank == 0 ? reduced.data() : nullptr, count, DataType::INT32, ReduceOp::SUM, 0)) {
+        reason = "a mixed grouped submission failed";
+        return false;
+    }
+    if (!comm.GroupEnd()) {
+        reason = "the mixed GroupEnd failed";
+        return false;
+    }
+    for (int source = 0; source < world_size; ++source) {
+        for (size_t i = 0; i < count; ++i) {
+            if (gathered[static_cast<size_t>(source) * count + i] != static_cast<int32_t>(source + 1)) {
+                reason = "the grouped AllGather result is wrong";
+                return false;
+            }
+        }
+    }
+    if (rank == 0 && (reduced[0] != sum_expected || reduced[count - 1] != sum_expected)) {
+        reason = "the grouped Reduce result is wrong";
+        return false;
+    }
+
+    return true;
 }
 
 void Runner::Finish() {
