@@ -89,12 +89,13 @@ struct CollOpState {
     std::vector<char> send_done;
     std::vector<char> recv_done;
     std::vector<char> temp_buffer;
-    union {
+    struct {
         struct {
             int step;
         } ring;
         struct {
-            int step;
+            std::vector<int> recv_chunk;
+            std::vector<int> send_chunk;
         } tree;
     } algo;
 };

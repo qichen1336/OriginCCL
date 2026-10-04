@@ -9,351 +9,256 @@
 namespace {
 
 constexpr int kPhaseUnstarted = 0;
-constexpr int kPhaseUpStar = 1;
-constexpr int kPhaseUpTreeRecv = 2;
-constexpr int kPhaseUpTreeSend = 3;
-constexpr int kPhaseDownTreeRecv = 4;
-constexpr int kPhaseDownTreeSend = 5;
-constexpr int kPhaseDownStar = 6;
-constexpr int kPhaseDone = 7;
+constexpr int kPhaseUp = 1;
+constexpr int kPhaseDown = 2;
+constexpr int kPhaseDone = 3;
 
 constexpr int kRoleStar = 0;
 constexpr int kRoleTreeDown = 1;
 constexpr int kRoleTreeUp = 2;
 
-constexpr uint32_t kStarMask = 1u << kRoleStar;
-constexpr uint32_t kDownMask = 1u << kRoleTreeDown;
-constexpr uint32_t kUpMask = 1u << kRoleTreeUp;
-
 size_t TypeSize(const PlanTask& task) {
     return Utils::GetDataTypeSize(task.dtype);
-}
-
-size_t TotalElems(const PlanTask& task) {
-    if (task.func == CollFunc::AllReduce) {
-        return task.elem_count;
-    }
-    return static_cast<size_t>(task.world_size) * task.elem_count;
 }
 
 size_t ChunkCount(const PlanTask& task) {
     if (task.chunk_size == 0) {
         return 0;
     }
-    return (TotalElems(task) + task.chunk_size - 1) / task.chunk_size;
+    return (task.elem_count + task.chunk_size - 1) / task.chunk_size;
 }
 
 size_t ChunkElems(const PlanTask& task, size_t chunk) {
-    size_t total = TotalElems(task);
     size_t start = chunk * task.chunk_size;
-    return start >= total ? 0 : std::min(task.chunk_size, total - start);
+    return start >= task.elem_count ? 0 : std::min(task.chunk_size, task.elem_count - start);
 }
 
-bool SideDone(const std::vector<char>& done) {
-    return std::all_of(done.begin(), done.end(), [](char d) { return d != 0; });
+size_t ChunkBytes(const PlanTask& task, size_t chunk) {
+    return ChunkElems(task, chunk) * TypeSize(task);
 }
 
-uint32_t Bit(int role) {
-    return 1u << role;
+size_t ChunkOffset(const PlanTask& task, size_t chunk) {
+    return chunk * task.chunk_size * TypeSize(task);
 }
 
-char* Accumulator(PlanTask& task) {
-    return task.state.temp_buffer.data();
+bool IsInputRole(int role) {
+    return role == kRoleStar || role == kRoleTreeDown;
 }
 
-char* ScratchSlot(PlanTask& task, size_t i) {
-    return task.state.temp_buffer.data() + TotalElems(task) * TypeSize(task) + i * task.chunk_size * TypeSize(task);
-}
-
-ReduceOp CombineOp(const PlanTask& task) {
-    if (task.func == CollFunc::AllGather) {
-        return ReduceOp::SUM;
-    }
-    return task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op;
-}
-
-size_t CountReduceRecv(const std::vector<int>& roles) {
-    size_t n = 0;
-    for (int role : roles) {
-        if (role == kRoleStar || role == kRoleTreeDown) {
-            ++n;
+int ParentEdge(const std::vector<int>& roles) {
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (roles[i] == kRoleTreeUp) {
+            return static_cast<int>(i);
         }
     }
-    return n;
+    return -1;
 }
 
-void SeedAccumulator(PlanTask& task) {
-    size_t type_size = TypeSize(task);
-    size_t stride = task.elem_count;
-    char* acc = Accumulator(task);
-    if (task.func == CollFunc::AllReduce) {
-        std::memcpy(acc, task.send_buf, stride * type_size);
-        return;
-    }
-    if (task.func == CollFunc::ReduceScatter) {
-        for (int block = 0; block < task.world_size; ++block) {
-            std::memcpy(acc + static_cast<size_t>(block) * stride * type_size,
-                        static_cast<const char*>(task.send_buf) +
-                            static_cast<size_t>(block) * task.rank_stride * type_size,
-                        stride * type_size);
-        }
-        return;
-    }
-    std::memset(acc, 0, TotalElems(task) * type_size);
-    std::memcpy(acc + static_cast<size_t>(task.rank) * stride * type_size, task.send_buf, stride * type_size);
+const char* SendSource(const PlanTask& task, bool is_leader, size_t chunk) {
+    const char* base = is_leader ? static_cast<const char*>(task.recv_buf) : static_cast<const char*>(task.send_buf);
+    return base + ChunkOffset(task, chunk);
 }
 
-void ExtractResult(PlanTask& task) {
-    size_t type_size = TypeSize(task);
-    size_t stride = task.elem_count;
-    const char* acc = Accumulator(task);
-    if (task.func == CollFunc::AllReduce) {
-        std::memcpy(task.recv_buf, acc, stride * type_size);
-        if (task.reduce_op == ReduceOp::AVG) {
-            Utils::ApplyAverage(task.recv_buf, stride, task.dtype, task.world_size);
-        }
-        return;
+char* RecvTarget(PlanTask& task, bool is_leader, const std::vector<int>& roles, size_t edge, size_t chunk) {
+    if (is_leader && IsInputRole(roles[edge])) {
+        return task.state.temp_buffer.data() + edge * task.chunk_size * TypeSize(task);
     }
-    if (task.func == CollFunc::ReduceScatter) {
-        std::memcpy(task.recv_buf, acc + static_cast<size_t>(task.rank) * stride * type_size, stride * type_size);
-        if (task.reduce_op == ReduceOp::AVG) {
-            Utils::ApplyAverage(task.recv_buf, stride, task.dtype, task.world_size);
-        }
-        return;
-    }
-    for (int block = 0; block < task.world_size; ++block) {
-        std::memcpy(static_cast<char*>(task.recv_buf) + static_cast<size_t>(block) * task.rank_stride * type_size,
-                    acc + static_cast<size_t>(block) * stride * type_size, stride * type_size);
-    }
+    return static_cast<char*>(task.recv_buf) + ChunkOffset(task, chunk);
 }
 
-void CombineChunk(PlanTask& task, const std::vector<int>& roles, size_t chunk, int role) {
-    size_t type_size = TypeSize(task);
-    size_t nelems = ChunkElems(task, chunk);
-    char* acc = Accumulator(task) + chunk * task.chunk_size * type_size;
-    ReduceOp op = CombineOp(task);
-    for (size_t i = 0; i < task.recv_transports.size(); ++i) {
-        if (roles[i] != role) {
-            continue;
-        }
-        Utils::PerformReduce(ScratchSlot(task, i), acc, nelems, task.dtype, op);
-    }
+void ReduceChunk(PlanTask& task, size_t edge, size_t chunk) {
+    const char* src = task.state.temp_buffer.data() + edge * task.chunk_size * TypeSize(task);
+    char* acc = static_cast<char*>(task.recv_buf) + ChunkOffset(task, chunk);
+    Utils::PerformReduce(src, acc, ChunkElems(task, chunk), task.dtype,
+                         task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
 }
 
-bool PushSend(PlanTask& task, const char* send_data, size_t send_bytes) {
-    CollOpState& s = task.state;
-    for (size_t i = 0; i < task.send_transports.size(); ++i) {
-        if (s.send_done[i]) {
-            continue;
-        }
-        bool done = false;
-        if (!task.send_transports[i]->TrySend(send_data, send_bytes, &s.send_progress[i], &done)) {
-            LOG_ERROR("Tree send failed on rank {} (phase {})", task.rank, s.phase);
-            return false;
-        }
-        s.send_done[i] = done ? 1 : 0;
-    }
-    return true;
-}
-
-bool PushRecv(PlanTask& task, char* shared_recv, size_t recv_bytes, bool per_conn) {
-    CollOpState& s = task.state;
-    for (size_t i = 0; i < task.recv_transports.size(); ++i) {
-        if (s.recv_done[i]) {
-            continue;
-        }
-        char* dst = per_conn ? ScratchSlot(task, i) : shared_recv;
-        bool done = false;
-        if (!task.recv_transports[i]->TryRecv(dst, recv_bytes, &s.recv_progress[i], &done)) {
-            LOG_ERROR("Tree recv failed on rank {} (phase {})", task.rank, s.phase);
-            return false;
-        }
-        s.recv_done[i] = done ? 1 : 0;
-    }
-    return true;
-}
-
-bool RecvPerConn(int phase) {
-    return phase == kPhaseUpStar || phase == kPhaseUpTreeRecv;
-}
-
-bool Activate(PlanTask& task, const std::vector<int>& roles, uint32_t send_mask, uint32_t recv_mask, size_t chunk) {
-    CollOpState& s = task.state;
-    for (size_t i = 0; i < task.send_transports.size(); ++i) {
-        if ((send_mask & Bit(roles[i])) != 0) {
-            if (s.send_done[i]) {
-                s.send_done[i] = 0;
-                s.send_progress[i] = 0;
-            }
-        } else {
-            s.send_done[i] = 1;
+size_t MinInputPrefix(const PlanTask& task, const std::vector<int>& roles) {
+    const CollOpState& s = task.state;
+    size_t best = ChunkCount(task);
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (IsInputRole(roles[i])) {
+            best = std::min(best, static_cast<size_t>(s.algo.tree.recv_chunk[i]));
         }
     }
-    for (size_t i = 0; i < task.recv_transports.size(); ++i) {
-        if ((recv_mask & Bit(roles[i])) != 0) {
-            if (s.recv_done[i]) {
-                s.recv_done[i] = 0;
-                s.recv_progress[i] = 0;
-            }
-        } else {
-            s.recv_done[i] = 1;
-        }
-    }
-    size_t nbytes = ChunkElems(task, chunk) * TypeSize(task);
-    char* acc_chunk = Accumulator(task) + chunk * task.chunk_size * TypeSize(task);
-    return PushSend(task, acc_chunk, nbytes) && PushRecv(task, acc_chunk, nbytes, RecvPerConn(s.phase));
+    return best;
 }
 
-bool StartUpStar(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    task.state.phase = kPhaseUpStar;
-    return Activate(task, roles, is_leader ? 0 : kStarMask, is_leader ? kStarMask : 0, task.state.algo.tree.step);
-}
-
-bool StartUpTreeRecv(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseUpTreeRecv;
-    return Activate(task, roles, 0, kDownMask, task.state.algo.tree.step);
-}
-
-bool StartUpTreeSend(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseUpTreeSend;
-    return Activate(task, roles, kUpMask, 0, task.state.algo.tree.step);
-}
-
-bool StartDownTreeRecv(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDownTreeRecv;
-    return Activate(task, roles, 0, kUpMask, task.state.algo.tree.step);
-}
-
-bool StartDownTreeSend(PlanTask& task, const std::vector<int>& roles) {
-    task.state.phase = kPhaseDownTreeSend;
-    return Activate(task, roles, kDownMask, 0, task.state.algo.tree.step);
-}
-
-bool StartDownStar(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    task.state.phase = kPhaseDownStar;
-    return Activate(task, roles, is_leader ? kStarMask : 0, is_leader ? 0 : kStarMask, task.state.algo.tree.step);
-}
-
-bool StartDown(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+bool UpComplete(const PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    const CollOpState& s = task.state;
+    size_t n_chunks = ChunkCount(task);
     if (is_leader) {
-        return StartDownTreeRecv(task, roles);
-    }
-    return StartDownStar(task, roles, is_leader);
-}
-
-bool NextUpChunk(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    CollOpState& s = task.state;
-    if (static_cast<size_t>(s.algo.tree.step + 1) >= ChunkCount(task)) {
-        s.algo.tree.step = 0;
-        return StartDown(task, roles, is_leader);
-    }
-    ++s.algo.tree.step;
-    return StartUpStar(task, roles, is_leader);
-}
-
-bool NextDownChunk(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    CollOpState& s = task.state;
-    if (static_cast<size_t>(s.algo.tree.step + 1) >= ChunkCount(task)) {
-        s.phase = kPhaseDone;
-        ExtractResult(task);
+        for (size_t i = 0; i < roles.size(); ++i) {
+            if (IsInputRole(roles[i]) && static_cast<size_t>(s.algo.tree.recv_chunk[i]) < n_chunks) {
+                return false;
+            }
+        }
+        for (size_t j = 0; j < roles.size(); ++j) {
+            if (roles[j] == kRoleTreeUp && static_cast<size_t>(s.algo.tree.send_chunk[j]) < n_chunks) {
+                return false;
+            }
+        }
         return true;
     }
-    ++s.algo.tree.step;
-    return StartDown(task, roles, is_leader);
-}
-
-bool Complete(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
-    CollOpState& s = task.state;
-    while (s.phase != kPhaseDone) {
-        switch (s.phase) {
-        case kPhaseUpStar:
-            if (is_leader) {
-                if (!SideDone(s.recv_done)) {
-                    return true;
-                }
-                CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleStar);
-                if (!StartUpTreeRecv(task, roles)) {
-                    return false;
-                }
-            } else {
-                if (!SideDone(s.send_done)) {
-                    return true;
-                }
-                if (!NextUpChunk(task, roles, is_leader)) {
-                    return false;
-                }
-            }
-            continue;
-        case kPhaseUpTreeRecv:
-            if (!SideDone(s.recv_done)) {
-                return true;
-            }
-            CombineChunk(task, roles, static_cast<size_t>(s.algo.tree.step), kRoleTreeDown);
-            if (!StartUpTreeSend(task, roles)) {
-                return false;
-            }
-            continue;
-        case kPhaseUpTreeSend:
-            if (!SideDone(s.send_done)) {
-                return true;
-            }
-            if (!NextUpChunk(task, roles, is_leader)) {
-                return false;
-            }
-            continue;
-        case kPhaseDownTreeRecv:
-            if (!SideDone(s.recv_done)) {
-                return true;
-            }
-            if (!StartDownTreeSend(task, roles)) {
-                return false;
-            }
-            continue;
-        case kPhaseDownTreeSend:
-            if (!SideDone(s.send_done)) {
-                return true;
-            }
-            if (!StartDownStar(task, roles, is_leader)) {
-                return false;
-            }
-            continue;
-        case kPhaseDownStar:
-            if (is_leader) {
-                if (!SideDone(s.send_done)) {
-                    return true;
-                }
-            } else {
-                if (!SideDone(s.recv_done)) {
-                    return true;
-                }
-            }
-            if (!NextDownChunk(task, roles, is_leader)) {
-                return false;
-            }
-            continue;
-        default:
-            return true;
+    for (size_t j = 0; j < roles.size(); ++j) {
+        if (static_cast<size_t>(s.algo.tree.send_chunk[j]) < n_chunks) {
+            return false;
         }
     }
     return true;
 }
 
-bool PushStep(PlanTask& task, CollEvent event) {
-    CollOpState& s = task.state;
-    size_t chunk = static_cast<size_t>(s.algo.tree.step);
-    size_t nbytes = ChunkElems(task, chunk) * TypeSize(task);
-    char* acc_chunk = Accumulator(task) + chunk * task.chunk_size * TypeSize(task);
-    if (event == CollEvent::Writable) {
-        return PushSend(task, acc_chunk, nbytes);
+bool DownComplete(const PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    const CollOpState& s = task.state;
+    size_t n_chunks = ChunkCount(task);
+    if (is_leader) {
+        for (size_t i = 0; i < roles.size(); ++i) {
+            if (roles[i] == kRoleTreeUp && static_cast<size_t>(s.algo.tree.recv_chunk[i]) < n_chunks) {
+                return false;
+            }
+        }
+        for (size_t j = 0; j < roles.size(); ++j) {
+            if (IsInputRole(roles[j]) && static_cast<size_t>(s.algo.tree.send_chunk[j]) < n_chunks) {
+                return false;
+            }
+        }
+        return true;
     }
-    return PushRecv(task, acc_chunk, nbytes, RecvPerConn(s.phase));
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (static_cast<size_t>(s.algo.tree.recv_chunk[i]) < n_chunks) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PushRecvs(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    CollOpState& s = task.state;
+    size_t n_chunks = ChunkCount(task);
+    for (size_t i = 0; i < task.recv_transports.size(); ++i) {
+        bool eligible = is_leader ? (s.phase == kPhaseUp ? IsInputRole(roles[i]) : roles[i] == kRoleTreeUp)
+                                  : s.phase == kPhaseDown;
+        if (!eligible) {
+            continue;
+        }
+        while (static_cast<size_t>(s.algo.tree.recv_chunk[i]) < n_chunks) {
+            size_t chunk = static_cast<size_t>(s.algo.tree.recv_chunk[i]);
+            if (s.recv_done[i]) {
+                s.recv_progress[i] = 0;
+                s.recv_done[i] = 0;
+            }
+            bool done = false;
+            if (!task.recv_transports[i]->TryRecv(RecvTarget(task, is_leader, roles, i, chunk),
+                                                  ChunkBytes(task, chunk), &s.recv_progress[i], &done)) {
+                LOG_ERROR("Tree recv failed on rank {} (phase {})", task.rank, s.phase);
+                return false;
+            }
+            s.recv_done[i] = done ? 1 : 0;
+            if (!done) {
+                break;
+            }
+            if (is_leader && IsInputRole(roles[i])) {
+                ReduceChunk(task, i, chunk);
+            }
+            ++s.algo.tree.recv_chunk[i];
+        }
+    }
+    return true;
+}
+
+bool PushSends(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    CollOpState& s = task.state;
+    size_t n_chunks = ChunkCount(task);
+    size_t gate = n_chunks;
+    if (is_leader) {
+        if (s.phase == kPhaseUp) {
+            gate = MinInputPrefix(task, roles);
+        } else {
+            int parent = ParentEdge(roles);
+            gate = parent < 0 ? n_chunks : static_cast<size_t>(s.algo.tree.recv_chunk[static_cast<size_t>(parent)]);
+        }
+    }
+    for (size_t j = 0; j < task.send_transports.size(); ++j) {
+        bool eligible = is_leader ? (s.phase == kPhaseUp ? roles[j] == kRoleTreeUp : IsInputRole(roles[j]))
+                                  : s.phase == kPhaseUp;
+        if (!eligible) {
+            continue;
+        }
+        while (static_cast<size_t>(s.algo.tree.send_chunk[j]) < gate) {
+            size_t chunk = static_cast<size_t>(s.algo.tree.send_chunk[j]);
+            if (s.send_done[j]) {
+                s.send_progress[j] = 0;
+                s.send_done[j] = 0;
+            }
+            bool done = false;
+            if (!task.send_transports[j]->TrySend(SendSource(task, is_leader, chunk), ChunkBytes(task, chunk),
+                                                  &s.send_progress[j], &done)) {
+                LOG_ERROR("Tree send failed on rank {} (phase {})", task.rank, s.phase);
+                return false;
+            }
+            s.send_done[j] = done ? 1 : 0;
+            if (!done) {
+                break;
+            }
+            ++s.algo.tree.send_chunk[j];
+        }
+    }
+    return true;
+}
+
+bool EnterDown(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    CollOpState& s = task.state;
+    s.phase = kPhaseDown;
+    s.algo.tree.recv_chunk.assign(task.recv_transports.size(), 0);
+    s.algo.tree.send_chunk.assign(task.send_transports.size(), 0);
+    s.recv_progress.assign(task.recv_transports.size(), 0);
+    s.send_progress.assign(task.send_transports.size(), 0);
+    s.recv_done.assign(task.recv_transports.size(), 1);
+    s.send_done.assign(task.send_transports.size(), 1);
+    if (is_leader && ParentEdge(roles) < 0 && task.reduce_op == ReduceOp::AVG) {
+        Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
+    }
+    return true;
+}
+
+bool Advance(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
+    CollOpState& s = task.state;
+    while (s.phase == kPhaseUp || s.phase == kPhaseDown) {
+        if (s.phase == kPhaseUp && !UpComplete(task, roles, is_leader)) {
+            return true;
+        }
+        if (s.phase == kPhaseDown && !DownComplete(task, roles, is_leader)) {
+            return true;
+        }
+        if (s.phase == kPhaseUp) {
+            if (!EnterDown(task, roles, is_leader)) {
+                return false;
+            }
+        } else {
+            s.phase = kPhaseDone;
+            return true;
+        }
+        if (!PushRecvs(task, roles, is_leader) || !PushSends(task, roles, is_leader)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool TreeInit(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
     CollOpState& s = task.state;
     s = CollOpState{};
-    s.algo.tree.step = 0;
+    s.send_progress.assign(task.send_transports.size(), 0);
+    s.recv_progress.assign(task.recv_transports.size(), 0);
+    s.send_done.assign(task.send_transports.size(), 1);
+    s.recv_done.assign(task.recv_transports.size(), 1);
+    s.algo.tree.send_chunk.assign(task.send_transports.size(), 0);
+    s.algo.tree.recv_chunk.assign(task.recv_transports.size(), 0);
 
+    if (task.func != CollFunc::AllReduce) {
+        LOG_ERROR("Tree received unsupported collective {}", Utils::GetCollFuncName(task.func));
+        return false;
+    }
     if (task.world_size <= 0) {
         LOG_ERROR("Tree received invalid world size");
         return false;
@@ -367,20 +272,14 @@ bool TreeInit(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
         return false;
     }
 
-    size_t total = TotalElems(task);
-    size_t total_bytes = total * TypeSize(task);
-    size_t n_reduce_recv = is_leader ? CountReduceRecv(roles) : 0;
-    s.temp_buffer.resize(total_bytes + n_reduce_recv * task.chunk_size * TypeSize(task));
-
-    s.send_progress.assign(task.send_transports.size(), 0);
-    s.recv_progress.assign(task.recv_transports.size(), 0);
-    s.send_done.assign(task.send_transports.size(), 1);
-    s.recv_done.assign(task.recv_transports.size(), 1);
-
-    SeedAccumulator(task);
-
+    size_t type_size = TypeSize(task);
     if (task.world_size == 1) {
-        ExtractResult(task);
+        if (task.send_buf != task.recv_buf) {
+            std::memcpy(task.recv_buf, task.send_buf, task.elem_count * type_size);
+        }
+        if (task.reduce_op == ReduceOp::AVG) {
+            Utils::ApplyAverage(task.recv_buf, task.elem_count, task.dtype, task.world_size);
+        }
         s.phase = kPhaseDone;
         return true;
     }
@@ -389,7 +288,21 @@ bool TreeInit(PlanTask& task, const std::vector<int>& roles, bool is_leader) {
         return false;
     }
 
-    return StartUpStar(task, roles, is_leader) && Complete(task, roles, is_leader);
+    if (is_leader) {
+        size_t n_scratch = 0;
+        for (int role : roles) {
+            if (IsInputRole(role)) {
+                ++n_scratch;
+            }
+        }
+        s.temp_buffer.resize(n_scratch * task.chunk_size * type_size);
+        if (task.send_buf != task.recv_buf) {
+            std::memcpy(task.recv_buf, task.send_buf, task.elem_count * type_size);
+        }
+    }
+
+    s.phase = kPhaseUp;
+    return PushRecvs(task, roles, is_leader) && PushSends(task, roles, is_leader) && Advance(task, roles, is_leader);
 }
 
 } // namespace
@@ -496,18 +409,14 @@ void TopologyTree::FillTransports(Channel& channel, PlanTask& task) const {
 }
 
 bool TopologyTree::CollectiveInit(PlanTask& task) const noexcept {
-    switch (task.func) {
-    case CollFunc::AllReduce:
-    case CollFunc::ReduceScatter:
-    case CollFunc::AllGather:
-        return TreeInit(task, channel_roles_[static_cast<size_t>(task.channel_id)], IsLeader());
-    default:
-        LOG_ERROR("Tree received unsupported collective");
+    if (task.func != CollFunc::AllReduce) {
+        LOG_ERROR("Tree received unsupported collective {}", Utils::GetCollFuncName(task.func));
         return false;
     }
+    return TreeInit(task, channel_roles_[static_cast<size_t>(task.channel_id)], IsLeader());
 }
 
-bool TopologyTree::CollectiveStep(PlanTask& task, CollEvent event) const noexcept {
+bool TopologyTree::CollectiveStep(PlanTask& task, CollEvent) const noexcept {
     CollOpState& s = task.state;
     const std::vector<int>& roles = channel_roles_[static_cast<size_t>(task.channel_id)];
     if (s.phase == kPhaseUnstarted && !TreeInit(task, roles, IsLeader())) {
@@ -516,10 +425,10 @@ bool TopologyTree::CollectiveStep(PlanTask& task, CollEvent event) const noexcep
     if (s.phase == kPhaseDone) {
         return true;
     }
-    if (!PushStep(task, event)) {
+    if (!PushRecvs(task, roles, IsLeader()) || !PushSends(task, roles, IsLeader())) {
         return false;
     }
-    return Complete(task, roles, IsLeader());
+    return Advance(task, roles, IsLeader());
 }
 
 bool TopologyTree::CollectiveDone(const PlanTask& task) const {

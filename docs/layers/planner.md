@@ -8,7 +8,7 @@
 - `Planner::SortTasks`、`Planner::Plan(comm, tasks, plan)`、`Planner::PlanRound(comm, tasks, round, plan)` 是独立函数：前者对一个任务批次做稳定排序，`Plan` 把批次中全部集合任务切片组装成一个 `CollPlan`，`PlanRound` 取出某一 P2P 轮次的收发任务组装成一个 `CollPlan`。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
 - **排序规则**：集合在前，按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序（无效维度取 0）；P2P 在后，按轮次升序。轮次由 planner 推导：`Send` 到 `p` 的轮次是 `world_size - (p-rank+world_size)%world_size`，`Recv` 自 `p` 的轮次是 `world_size - (rank-p+world_size)%world_size`，两端对同一消息得到同一轮次编号。同轮内 `Send` 先于 `Recv`、同方向按 peer 稳定排序。
 - **channel 分配**：批次维护一个轮转起点 `first_channel`，每个集合任务用 `n_used` 个连续环绕物理 channel，完成后起点前移 `n_used`；单任务批次仍从 channel 0 开始。P2P 固定 `Send`→channel 0、`Recv`→channel 1。
-- **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce 永远 ring；AllReduce / ReduceScatter / AllGather 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。
+- **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce / ReduceScatter / AllGather 永远 ring；只有 AllReduce 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。tree 仅实现 AllReduce（见 [topology.md](topology.md)）。
 - `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、peer、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
 - 两个 transport 向量由 `Topology::FillTransports(Channel&, PlanTask&)` 填充。集合操作仍由拓扑按形状选连接；P2P 拓扑依据 task.func/peer 取一个方向的一条连接。planner 仅在 P2P 懒建连时写入对应 Connector。
 - 不负责：不展开算法步骤（topology）、不决定等待策略（executor）。
@@ -29,8 +29,8 @@
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
 - `PlanTask.topology` 复用 communicator 持有的 ring/tree/p2p 拓扑，planner 不新建拓扑；集合任务的 `PlanTask.channel_id` 取 `comm_channel.id`，P2P 固定为 0。tree 据此选择树形与运行时角色（见 [topology.md](topology.md)），executor 不解释该字段。
-- 启用 channel 规则：tree 下的全部操作（AllReduce / ReduceScatter / AllGather）与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
-- 三种 tree 操作都可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 内部把各 rank 的切片紧凑打包后再搬运，因此「每 rank 一整块」的对齐不受切片影响。
+- 启用 channel 规则：tree 下的 AllReduce 与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作（含 ReduceScatter / AllGather）是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
+- tree AllReduce 可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 直接用 `elem_count` 定位切片，不做打包区。
 - `CollPlan(n_channels)` 构造时创建 `ChannelPlan[0..N-1]` 并初始化 `channel_id`，planner 不重复赋值。
 
 # 隐含约定

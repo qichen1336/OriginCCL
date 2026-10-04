@@ -148,9 +148,8 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
 
-    const bool use_tree = (task.func == CollFunc::AllReduce || task.func == CollFunc::ReduceScatter ||
-                           task.func == CollFunc::AllGather) &&
-                          total_bytes / OcclConfig::kChunkBytes < OcclConfig::kTreeThresholdChunks;
+    const bool use_tree =
+        task.func == CollFunc::AllReduce && total_bytes / OcclConfig::kChunkBytes < OcclConfig::kTreeThresholdChunks;
     std::shared_ptr<Topology> topology = use_tree ? comm.GetTreeTopology() : comm.GetRingTopology();
     const char* func_name = Utils::GetCollFuncName(task.func);
     LOG_DEBUG("Rank {}: {} uses the {} topology for {} bytes", comm.GetRank(), func_name, use_tree ? "tree" : "ring",
