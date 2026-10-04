@@ -32,12 +32,6 @@ bool Disabled(const char* name) {
     return value && std::strcmp(value, "1") == 0;
 }
 
-int P2pRound(CollFunc func, int rank, int peer, int world_size) {
-    const int forward =
-        (func == CollFunc::Send) ? (peer - rank + world_size) % world_size : (rank - peer + world_size) % world_size;
-    return world_size - forward;
-}
-
 void CheckUnusedChannels(Communicator& comm, int first_channel) {
     for (int channel_id = first_channel; channel_id < comm.GetNChannels(); ++channel_id) {
         const auto& channel = comm.GetChannel(channel_id);
@@ -110,9 +104,10 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
             Planner planner;
             planner.SortTasks(tasks, rank, world_size);
             CollPlan plan;
-            Require(planner.PlanRound(comm, tasks, P2pRound(task.func, rank, peer, world_size), plan), "P2P planning");
+            Require(planner.Plan(comm, tasks, plan), "P2P planning");
             const size_t slot = is_send ? 0u : 1u;
-            Require(plan.channels.size() == 2 && plan.channels[slot].tasks.size() == 1 &&
+            Require(plan.channels.size() == static_cast<size_t>(comm.GetNChannels()) &&
+                        plan.channels[slot].tasks.size() == 1 &&
                         plan.channels[slot].channel_id == static_cast<int>(slot) &&
                         plan.channels[1 - slot].tasks.empty(),
                     "P2P plan must put the payload on the direction channel");
@@ -180,6 +175,29 @@ void CheckGroupCollective(Communicator& comm) {
     const int big_expected = small_expected + world_size;
     Require(small_recv == small_expected, "group AllReduce count 1");
     Require(big_recv[0] == big_expected && big_recv[1] == big_expected, "group AllReduce count 2");
+}
+
+void CheckGroupMixed(Communicator& comm) {
+    const int rank = comm.GetRank();
+    const int world_size = comm.GetWorldSize();
+    const int next = (rank + 1) % world_size;
+    const int previous = (rank + world_size - 1) % world_size;
+    int collective_send = rank + 1;
+    int collective_recv = 0;
+    int p2p_send = rank * 10 + 3;
+    int p2p_recv = -1;
+
+    comm.GroupStart();
+    Require(comm.AllReduce(&collective_send, &collective_recv, 1, DataType::INT32, ReduceOp::SUM),
+            "mixed group AllReduce submit");
+    Require(comm.Send(&p2p_send, 1, DataType::INT32, next), "mixed group Send submit");
+    Require(comm.Recv(&p2p_recv, 1, DataType::INT32, previous), "mixed group Recv submit");
+    Require(comm.GroupEnd(), "mixed group execution");
+
+    const int expected_sum = world_size * (world_size + 1) / 2;
+    Require(collective_recv == expected_sum, "mixed group AllReduce result");
+    Require(p2p_recv == previous * 10 + 3, "mixed group P2P result");
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 void CheckGroupP2pMesh(Communicator& comm, size_t count) {
@@ -288,6 +306,7 @@ int main(int argc, char** argv) {
         Exchange<int32_t>(comm, 257, DataType::INT32);
     }
     CheckGroupCollective(comm);
+    CheckGroupMixed(comm);
     CheckGroupP2pMesh(comm, 256 * 1024);
     CheckGroupRepeatedPeer(comm);
     const Channel& send_channel = comm.GetChannel(0);

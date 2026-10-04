@@ -359,25 +359,8 @@ bool Communicator::Flush() {
     tasks.swap(pending_tasks);
     planner.SortTasks(tasks, config.rank, config.world_size);
 
-    bool ok = true;
-    CollPlan collective_plan;
-    if (planner.Plan(*this, tasks, collective_plan)) {
-        ok = executor->Run(collective_plan);
-    } else {
-        ok = false;
-    }
-    for (int round = 1; ok && round < config.world_size; ++round) {
-        CollPlan round_plan;
-        if (!planner.PlanRound(*this, tasks, round, round_plan)) {
-            ok = false;
-            break;
-        }
-        if (round_plan.channels.empty()) {
-            continue;
-        }
-        ok = executor->Run(round_plan);
-    }
-    return ok;
+    CollPlan plan;
+    return planner.Plan(*this, tasks, plan) && executor->Run(plan);
 }
 
 bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {

@@ -78,12 +78,7 @@ void Planner::SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) 
 }
 
 bool Planner::Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const {
-    return PlanCollectives(comm, tasks, plan);
-}
-
-bool Planner::PlanCollectives(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const {
     plan = CollPlan(comm.GetNChannels());
-    int first_channel = 0;
     for (const CollTask& task : tasks) {
         if (IsP2p(task.func)) {
             if (!ValidateP2p(comm, task)) {
@@ -91,16 +86,19 @@ bool Planner::PlanCollectives(Communicator& comm, const std::vector<CollTask>& t
             }
             continue;
         }
-        int n_used = 0;
-        if (!PlanCollective(comm, task, plan, first_channel, n_used)) {
+        if (!PlanCollective(comm, task, plan)) {
             return false;
         }
-        first_channel = (first_channel + n_used) % comm.GetNChannels();
+    }
+    for (int round = 1; round < comm.GetWorldSize(); ++round) {
+        if (!PlanP2pRound(comm, tasks, round, plan)) {
+            return false;
+        }
     }
     return true;
 }
 
-bool Planner::PlanRound(Communicator& comm, const std::vector<CollTask>& tasks, int round, CollPlan& plan) const {
+bool Planner::PlanP2pRound(Communicator& comm, const std::vector<CollTask>& tasks, int round, CollPlan& plan) const {
     const int rank = comm.GetRank();
     const int world_size = comm.GetWorldSize();
     std::vector<CollTask> sends;
@@ -117,7 +115,6 @@ bool Planner::PlanRound(Communicator& comm, const std::vector<CollTask>& tasks, 
     if (!PrepareRound(comm, tasks, round)) {
         return false;
     }
-    plan = CollPlan(kP2pChannelCount);
     auto append = [&](const CollTask& task, int channel_id) {
         PlanTask plantask;
         plantask.func = task.func;
@@ -142,8 +139,7 @@ bool Planner::PlanRound(Communicator& comm, const std::vector<CollTask>& tasks, 
     return true;
 }
 
-bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan& plan, int first_channel,
-                             int& n_used_out) const {
+bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan& plan) const {
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
@@ -177,7 +173,7 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
             channel_bytes += rem_bytes;
         }
         size_t elem_count = channel_bytes / type_size;
-        const int channel_id = (first_channel + c) % max_channels;
+        const int channel_id = c % max_channels;
         ChannelPlan& channel = plan.channels[static_cast<size_t>(channel_id)];
         Channel& comm_channel = comm.GetChannel(channel_id);
         PlanTask plantask;
@@ -200,7 +196,6 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
         channel.tasks.push_back(std::move(plantask));
         offset += elem_count;
     }
-    n_used_out = n_used;
     return true;
 }
 

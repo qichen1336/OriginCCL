@@ -5,9 +5,9 @@
 # 核心职责边界
 
 - `CollTask` 表达五种 collective 与 Send/Recv 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`、`peer`。peer 仅用于 P2P，无根操作忽略 root，非归约操作忽略 op。
-- `Planner::SortTasks`、`Planner::Plan(comm, tasks, plan)`、`Planner::PlanRound(comm, tasks, round, plan)` 是独立函数：前者对一个任务批次做稳定排序，`Plan` 把批次中全部集合任务切片组装成一个 `CollPlan`，`PlanRound` 取出某一 P2P 轮次的收发任务组装成一个 `CollPlan`。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
+- `Planner::SortTasks` 与 `Planner::Plan(comm, tasks, plan)` 分别对一个任务批次稳定排序、将批次中全部集合与 P2P 任务组装到一个 `CollPlan`。Plan 先切片集合任务，再按轮次准备 P2P 连接并把任务追加到固定方向 channel。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
 - **排序规则**：集合在前，按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序（无效维度取 0）；P2P 在后，按轮次升序。轮次由 planner 推导：`Send` 到 `p` 的轮次是 `world_size - (p-rank+world_size)%world_size`，`Recv` 自 `p` 的轮次是 `world_size - (rank-p+world_size)%world_size`，两端对同一消息得到同一轮次编号。同轮内 `Send` 先于 `Recv`、同方向按 peer 稳定排序。
-- **channel 分配**：批次维护一个轮转起点 `first_channel`，每个集合任务用 `n_used` 个连续环绕物理 channel，完成后起点前移 `n_used`；单任务批次仍从 channel 0 开始。P2P 固定 `Send`→channel 0、`Recv`→channel 1。
+- **channel 分配**：每个集合任务都从 channel 0 开始，用 `n_used` 个连续环绕物理 channel；多个任务可排入同一 channel 的 FIFO 队列。P2P 固定 `Send`→channel 0、`Recv`→channel 1。
 - **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce / ReduceScatter / AllGather 永远 ring；只有 AllReduce 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。tree 仅实现 AllReduce（见 [topology.md](topology.md)）。
 - `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、peer、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
 - 两个 transport 向量由 `Topology::FillTransports(Channel&, PlanTask&)` 填充。集合操作仍由拓扑按形状选连接；P2P 拓扑依据 task.func/peer 取一个方向的一条连接。planner 仅在 P2P 懒建连时写入对应 Connector。
@@ -22,8 +22,8 @@
 
 # 实现原理
 
-- **P2P 独立规划路径**：Plan 开头的 `ValidateP2p` 检查 peer 范围且不能是自己，非空消息检查 buffer 与字节数；合法零长度不建连。`PlanRound` 用 `PrepareRound` 取该轮去重后的收发 peer：双向都需建连时并行开一个 `ConnectP2p` 线程与一个 `AcceptP2p` 线程同时连接，join 后再组装任务；只缺一个方向时在该线程内联完成。发送连接写 `channel 0` 的 `send_p2p[peer]`，接收连接写 `channel 1` 的 `recv_p2p[peer]`（非目标来源只缓存连接）。成功后每个非空任务生成一个完整长度的单向 `PlanTask`，绑定 `TopologyP2p`，不切片、不设置流水 chunk。
-- **P2P 建连由 planner 执行**：communicator 持有节点表和独立 P2P listener，Planner 通过 friend 访问；Send 主动连接并发送本 rank 握手，Recv 轮询 listener、接入并按来源 rank 存入 channel 1 的 `recv_p2p`，直到目标连接就绪。连接缓存到 Finalize，建连失败经 PlanRound 的 false 上报。
+- **P2P 规划**：`Plan` 开头的 `ValidateP2p` 检查 peer 范围且不能是自己，非空消息检查 buffer 与字节数；合法零长度不建连。每个轮次用 `PrepareRound` 取该轮去重后的收发 peer：双向都需建连时并行开一个 `ConnectP2p` 线程与一个 `AcceptP2p` 线程同时连接，join 后再组装任务；只缺一个方向时在该线程内联完成。发送连接写 `channel 0` 的 `send_p2p[peer]`，接收连接写 `channel 1` 的 `recv_p2p[peer]`（非目标来源只缓存连接）。成功后每个任务生成一个完整长度的单向 `PlanTask`，绑定 `TopologyP2p`，不切片、不设置流水 chunk，并追加至统一 plan 的对应 channel。
+- **P2P 建连由 planner 执行**：communicator 持有节点表和独立 P2P listener，Planner 通过 friend 访问；Send 主动连接并发送本 rank 握手，Recv 轮询 listener、接入并按来源 rank 存入 channel 1 的 `recv_p2p`，直到目标连接就绪。Plan 在 executor 启动前按轮次准备全部连接，失败经 Plan 的 false 上报。
 - **P2P 传输选择**：同 hostname 且 SHM 启用时用 SHM；同机禁用 SHM 时沿用集合的全局 RDMA/TCP 网络选择（P2P 的 RDMA 使用 RDMA_ZC）。不同 hostname 必须用双方已公布端点的 RDMA_ZC，任一端不可用直接失败，不回退 TCP。无设备不妨碍集合通信初始化或零长度 P2P。
 - `PlanTask.chunk_size` 语义按拓扑解释：ring = `ceil(elem_count / world_size)`（AllReduce 块划分）；tree = `kChunkBytes / type_size`（流水粒度，逐 chunk 推进）。
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
