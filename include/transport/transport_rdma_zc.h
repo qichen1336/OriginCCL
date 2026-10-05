@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
 #include "transport/transport_rdma.h"
 
 constexpr size_t kRdmaZcThreshold = 16 * 1024 * 1024;
@@ -19,7 +21,7 @@ public:
 
 protected:
     struct ZcWire {
-        uint32_t qp_num;
+        uint32_t port;
         uint32_t chunk;
     };
 
@@ -31,6 +33,10 @@ protected:
     void CloseResources() override;
 
 private:
+    bool AwaitZcEvent(rdma_cm_event_type type);
+    bool CreateZcQueuePair();
+    void CloseZc();
+
     size_t ZcChunkLength(size_t index) const;
     bool BeginZcSend(const void* data, size_t size);
     bool BeginZcRecv(void* data, size_t size);
@@ -39,6 +45,10 @@ private:
     void ReleaseZc();
 
     size_t threshold_;
+    rdma_event_channel* zc_channel = nullptr;
+    rdma_cm_id* zc_listener = nullptr;
+    rdma_cm_id* zc_id = nullptr;
+    uint16_t zc_port = 0;
     ibv_qp* zc_qp = nullptr;
     ibv_mr* zc_mr = nullptr;
     const char* zc_send_data = nullptr;

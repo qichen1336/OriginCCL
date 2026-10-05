@@ -58,14 +58,13 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 ### RDMA 零拷贝子类（`TransportRDMAZc`）
 
 - `TransportRDMAZc` 继承 `TransportRDMA`，只为大消息换数据面：`size >= kRdmaZcThreshold`（16 MiB）时注册用户缓冲为 MR，走独立 RC QP 直接 `SEND/RECV`；`size <` 阈值时逐字转调基类的环形缓冲路径。阈值按**单次逻辑传输的完整 `size`** 判断，不按集合总量或剩余 `size - progress`。
-- 基类为此开放最小扩展点：`Wire` 增加 `kWireTailSize` 尾部（子类在 CM private data 里捎带自己的连接参数）、`SetupResources`/`PrepareWire`/`FinalizeConnection`/`HandleCompletion`/`MakePeer`/`CloseResources` 虚化。子类用 `PrepareWire` 写 `ZcWire{qp_num, chunk}`、`FinalizeConnection` 读对端并自己把独立 QP 迁到 RTR/RTS。
+- 基类为此开放最小扩展点：`Wire` 增加 `kWireTailSize` 尾部（子类在 CM private data 里捎带自己的连接参数）、`SetupResources`/`PrepareWire`/`FinalizeConnection`/`HandleCompletion`/`MakePeer`/`CloseResources` 虚化。子类用 `PrepareWire` 写 `ZcWire{port, chunk}`、`FinalizeConnection` 读对端端口并建立第二条 CM 连接。
 - 独立 QP 不是为收发大小不一致准备的（调用方保证两次操作配对且大小相同），而是为隔离接收队列：基类 QP 的 RQ 预投了 64 个 256 B 的 credit 池，大块 `SEND` 会匹配队首的小缓冲。独立 QP 只投递用户缓冲，两者互不干扰。
-- 独立 QP 是普通 `ibv_create_qp`，CM 只驱动它自己创建的 QP，因此对端 QPN 走 private data，路径属性由 `rdma_init_qp_attr` 提供。注意 `rdma_init_qp_attr` 会整段覆盖传入的 `ibv_qp_attr`（含目的 QPN），所以它返回后必须重新覆盖 `dest_qp_num`/`rq_psn`/PSN/重试等字段再 `ibv_modify_qp`。
-- 独立 QP 要求设备支持 IB/RoCE 语义：iWARP 上 `rdma_init_qp_attr` 为 RTR 只返回 `STATE|ACCESS_FLAGS|PORT`、为 RTS 返回空掩码（QP 状态由 CM/provider 驱动），手工迁移必然失败，零拷贝档位在 iWARP 上不可用。
+- 独立 QP 由 CM 托管：主连接建立后，接受方在同一地址上再 `rdma_listen` 一个临时端口，用主连接 private data 的尾部把端口告诉主动方，双方再各建一条 CM 连接并 `rdma_create_qp`。这样 QP 的路径与状态迁移都是 CM 的事，在 iWARP 上也成立——手工 `ibv_modify_qp` 迁 INIT/RTR/RTS 在 iWARP 上必失败（`iwcm_init_qp_rts_attr` 返回空掩码，QP 状态由 provider 驱动）。
 - 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单 chunk 一次 WR，超过则多 WR；发送窗口 `kRdmaZcWindow` = 8，post 与补投在同一调用内完成。
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：首次推进时 `ibv_reg_mr`，本次操作 `done` 后 `ibv_dereg_mr`，不缓存；发送/接收各一个在飞的 MR。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝。
-- 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，因此就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
+- 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，所以完成事件由一个 CQ 收集、以 `qp_num` 区分，就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
 - 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 16 MiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
 

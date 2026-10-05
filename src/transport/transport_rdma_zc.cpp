@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <cstring>
 #include <cerrno>
+#include <arpa/inet.h>
 #include "transport/transport_rdma_zc.h"
 #include "logger.h"
 
 namespace {
 constexpr size_t kZcRecvBase = kRdmaRecvPool;
+constexpr int kZcResolveTimeoutMs = 5000;
 }
 
 TransportRDMAZc::TransportRDMAZc(size_t threshold) : threshold_(threshold) {}
@@ -14,11 +16,74 @@ TransportRDMAZc::~TransportRDMAZc() {
     Close();
 }
 
+// The zero-copy data path needs its own queue pair so large SEND/RECV never match the base
+// credit pool. A hand-built queue pair cannot be driven on iWARP (the CM owns the QP state
+// machine), so the pair comes from a second CM connection that shares the base PD and CQ.
 bool TransportRDMAZc::SetupResources() {
     if (!TransportRDMA::SetupResources()) {
         return false;
     }
 
+    zc_channel = rdma_create_event_channel();
+    if (zc_channel == nullptr) {
+        LOG_ERROR("Failed to create the zero-copy event channel: {}", strerror(errno));
+        return false;
+    }
+    // Only the accepting side listens; connected is already true on the Adopt path.
+    if (!connected) {
+        return true;
+    }
+
+    if (rdma_create_id(zc_channel, &zc_listener, nullptr, RDMA_PS_TCP) != 0) {
+        LOG_ERROR("Failed to create the zero-copy listener: {}", strerror(errno));
+        return false;
+    }
+    sockaddr local{};
+    std::memcpy(&local, rdma_get_local_addr(cm_id), sizeof(sockaddr));
+    reinterpret_cast<sockaddr_in*>(&local)->sin_port = 0;
+    if (rdma_bind_addr(zc_listener, &local) != 0) {
+        LOG_ERROR("Failed to bind the zero-copy listener: {}", strerror(errno));
+        return false;
+    }
+    if (rdma_listen(zc_listener, 1) != 0) {
+        LOG_ERROR("Failed to listen for the zero-copy connection: {}", strerror(errno));
+        return false;
+    }
+    zc_port = ntohs(reinterpret_cast<const sockaddr_in*>(rdma_get_local_addr(zc_listener))->sin_port);
+    return true;
+}
+
+void TransportRDMAZc::PrepareWire(Wire& wire) const {
+    ZcWire extra{};
+    extra.port = zc_port;
+    extra.chunk = static_cast<uint32_t>(kRdmaZcChunk);
+    std::memcpy(wire.tail, &extra, sizeof(extra));
+}
+
+bool TransportRDMAZc::AwaitZcEvent(rdma_cm_event_type type) {
+    for (;;) {
+        rdma_cm_event* event = nullptr;
+        if (rdma_get_cm_event(zc_channel, &event) != 0) {
+            LOG_ERROR("Failed to read a zero-copy RDMA event: {}", strerror(errno));
+            return false;
+        }
+        const bool matched = event->event == type;
+        const bool fatal = event->event == RDMA_CM_EVENT_REJECTED || event->event == RDMA_CM_EVENT_DEVICE_REMOVAL;
+        if (!matched) {
+            LOG_ERROR("The zero-copy RDMA connection ended with event {} (status {})", rdma_event_str(event->event),
+                      event->status);
+        }
+        rdma_ack_cm_event(event);
+        if (matched) {
+            return true;
+        }
+        if (fatal) {
+            return false;
+        }
+    }
+}
+
+bool TransportRDMAZc::CreateZcQueuePair() {
     ibv_qp_init_attr attributes{};
     attributes.send_cq = cq;
     attributes.recv_cq = cq;
@@ -27,83 +92,75 @@ bool TransportRDMAZc::SetupResources() {
     attributes.cap.max_recv_wr = kRdmaZcWindow;
     attributes.cap.max_send_sge = 1;
     attributes.cap.max_recv_sge = 1;
-    zc_qp = ibv_create_qp(pd, &attributes);
-    if (zc_qp == nullptr) {
+    if (rdma_create_qp(zc_id, pd, &attributes) != 0) {
         LOG_ERROR("Failed to create the zero-copy queue pair: {}", strerror(errno));
         return false;
     }
-
-    ibv_qp_attr state{};
-    state.qp_state = IBV_QPS_INIT;
-    state.pkey_index = 0;
-    state.port_num = cm_id->port_num;
-    state.qp_access_flags = IBV_ACCESS_LOCAL_WRITE;
-    if (ibv_modify_qp(zc_qp, &state, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-        LOG_ERROR("Failed to move the zero-copy queue pair to INIT: {}", strerror(errno));
-        return false;
-    }
+    zc_qp = zc_id->qp;
     return true;
 }
 
-void TransportRDMAZc::PrepareWire(Wire& wire) const {
-    ZcWire extra{};
-    extra.qp_num = zc_qp == nullptr ? 0 : zc_qp->qp_num;
-    extra.chunk = static_cast<uint32_t>(kRdmaZcChunk);
-    std::memcpy(wire.tail, &extra, sizeof(extra));
-}
-
-// The zero-copy queue pair is a plain ibv queue pair: the CM only drives the queue pair it
-// created itself, so the peer's queue pair number travels in the private data tail and the
-// path comes from rdma_init_qp_attr once the CM connection is established.
+// The zero-copy queue pair belongs to a second CM connection, so the CM drives its path and
+// state transitions on every transport, iWARP included; only the port travels in the tail.
 bool TransportRDMAZc::FinalizeConnection() {
     ZcWire extra{};
     std::memcpy(&extra, peer.tail, sizeof(extra));
-    if (extra.qp_num == 0 || extra.chunk == 0) {
-        LOG_ERROR("The RDMA peer did not advertise a zero-copy queue pair");
+    if (extra.chunk == 0) {
+        LOG_ERROR("The RDMA peer did not advertise a zero-copy chunk");
         return false;
     }
     zc_chunk = std::min(kRdmaZcChunk, static_cast<size_t>(extra.chunk));
 
-    ibv_qp_attr state{};
-    state.qp_state = IBV_QPS_RTR;
-    int mask = 0;
-    if (rdma_init_qp_attr(cm_id, &state, &mask) != 0) {
-        LOG_ERROR("Failed to build the zero-copy path attributes: {}", strerror(errno));
-        return false;
-    }
-    // rdma_init_qp_attr overwrites the whole block, so our fields are re-applied afterwards.
-    state.qp_state = IBV_QPS_RTR;
-    state.dest_qp_num = extra.qp_num;
-    state.rq_psn = 0;
-    state.max_dest_rd_atomic = 1;
-    state.min_rnr_timer = 12;
-    if ((mask & IBV_QP_PATH_MTU) == 0) {
-        state.path_mtu = IBV_MTU_1024;
-    }
-    mask |= IBV_QP_STATE | IBV_QP_AV | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
-            IBV_QP_MIN_RNR_TIMER | IBV_QP_PATH_MTU;
-    if (ibv_modify_qp(zc_qp, &state, mask) != 0) {
-        LOG_ERROR("Failed to move the zero-copy queue pair to RTR: {}", strerror(errno));
-        return false;
+    if (zc_listener != nullptr) {
+        rdma_cm_event* request = nullptr;
+        if (rdma_get_cm_event(zc_channel, &request) != 0 || request->event != RDMA_CM_EVENT_CONNECT_REQUEST) {
+            LOG_ERROR("The zero-copy listener did not report a connect request");
+            if (request != nullptr) {
+                rdma_ack_cm_event(request);
+            }
+            return false;
+        }
+        zc_id = request->id;
+        rdma_ack_cm_event(request);
+        if (!CreateZcQueuePair()) {
+            return false;
+        }
+        rdma_conn_param parameter{};
+        if (rdma_accept(zc_id, &parameter) != 0) {
+            LOG_ERROR("Failed to accept the zero-copy connection: {}", strerror(errno));
+            return false;
+        }
+        return AwaitZcEvent(RDMA_CM_EVENT_ESTABLISHED);
     }
 
-    state = {};
-    mask = 0;
-    state.qp_state = IBV_QPS_RTS;
-    if (rdma_init_qp_attr(cm_id, &state, &mask) != 0) {
-        LOG_ERROR("Failed to build the zero-copy send attributes: {}", strerror(errno));
+    if (extra.port == 0) {
+        LOG_ERROR("The RDMA peer did not advertise a zero-copy port");
         return false;
     }
-    state.qp_state = IBV_QPS_RTS;
-    state.sq_psn = 0;
-    state.timeout = 14;
-    state.retry_cnt = 7;
-    state.rnr_retry = 7;
-    state.max_rd_atomic = 1;
-    mask |=
-        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
-    if (ibv_modify_qp(zc_qp, &state, mask) != 0) {
-        LOG_ERROR("Failed to move the zero-copy queue pair to RTS: {}", strerror(errno));
+    if (rdma_create_id(zc_channel, &zc_id, nullptr, RDMA_PS_TCP) != 0) {
+        LOG_ERROR("Failed to create the zero-copy connection: {}", strerror(errno));
+        return false;
+    }
+    sockaddr remote{};
+    std::memcpy(&remote, rdma_get_peer_addr(cm_id), sizeof(sockaddr));
+    reinterpret_cast<sockaddr_in*>(&remote)->sin_port = htons(static_cast<uint16_t>(extra.port));
+    if (rdma_resolve_addr(zc_id, nullptr, &remote, kZcResolveTimeoutMs) != 0 ||
+        !AwaitZcEvent(RDMA_CM_EVENT_ADDR_RESOLVED)) {
+        LOG_ERROR("Failed to resolve the zero-copy peer address: {}", strerror(errno));
+        return false;
+    }
+    if (rdma_resolve_route(zc_id, kZcResolveTimeoutMs) != 0 || !AwaitZcEvent(RDMA_CM_EVENT_ROUTE_RESOLVED)) {
+        LOG_ERROR("Failed to resolve the zero-copy route: {}", strerror(errno));
+        return false;
+    }
+    if (!CreateZcQueuePair()) {
+        return false;
+    }
+    rdma_conn_param parameter{};
+    parameter.retry_count = 7;
+    parameter.rnr_retry_count = 7;
+    if (rdma_connect(zc_id, &parameter) != 0 || !AwaitZcEvent(RDMA_CM_EVENT_ESTABLISHED)) {
+        LOG_ERROR("Failed to connect the zero-copy peer: {}", strerror(errno));
         return false;
     }
     return true;
@@ -114,12 +171,13 @@ std::shared_ptr<TransportRDMA> TransportRDMAZc::MakePeer() {
 }
 
 bool TransportRDMAZc::HandleCompletion(const ibv_wc& completion) {
-    if (completion.status == IBV_WC_SUCCESS) {
-        if (completion.opcode == IBV_WC_SEND && completion.wr_id >= 1 && completion.wr_id <= kRdmaZcWindow) {
+    // The two queue pairs share one CQ, so the queue pair number is what separates them.
+    if (completion.status == IBV_WC_SUCCESS && zc_qp != nullptr && completion.qp_num == zc_qp->qp_num) {
+        if (completion.opcode == IBV_WC_SEND) {
             ++zc_send_completed;
             return true;
         }
-        if (completion.opcode == IBV_WC_RECV && completion.wr_id >= kZcRecvBase) {
+        if (completion.opcode == IBV_WC_RECV) {
             ++zc_recv_completed;
             return true;
         }
@@ -278,11 +336,24 @@ bool TransportRDMAZc::TryRecv(void* data, size_t size, size_t* progress, bool* d
     return true;
 }
 
-void TransportRDMAZc::CloseResources() {
-    if (zc_qp != nullptr) {
-        ibv_destroy_qp(zc_qp);
+void TransportRDMAZc::CloseZc() {
+    if (zc_id != nullptr) {
+        rdma_destroy_id(zc_id);
+        zc_id = nullptr;
         zc_qp = nullptr;
     }
+    if (zc_listener != nullptr) {
+        rdma_destroy_id(zc_listener);
+        zc_listener = nullptr;
+    }
+    if (zc_channel != nullptr) {
+        rdma_destroy_event_channel(zc_channel);
+        zc_channel = nullptr;
+    }
+}
+
+void TransportRDMAZc::CloseResources() {
     ReleaseZc();
+    CloseZc();
     TransportRDMA::CloseResources();
 }
