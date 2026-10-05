@@ -47,8 +47,8 @@ private:
     void DropZcMr();
     bool BeginZcSend(const void* data, size_t size);
     bool BeginZcRecv(void* data, size_t size);
-    bool PostZcSend(size_t index);
-    bool PostZcRecv(size_t index);
+    bool PostZcSends(size_t count);
+    bool PostZcRecvs(size_t count);
     void ReleaseZc();
 
     size_t threshold_;

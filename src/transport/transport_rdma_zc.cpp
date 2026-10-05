@@ -173,8 +173,9 @@ std::shared_ptr<TransportRDMA> TransportRDMAZc::MakePeer() {
 bool TransportRDMAZc::HandleCompletion(const ibv_wc& completion) {
     // The two queue pairs share one CQ, so the queue pair number is what separates them.
     if (completion.status == IBV_WC_SUCCESS && zc_qp != nullptr && completion.qp_num == zc_qp->qp_num) {
-        if (completion.opcode == IBV_WC_SEND) {
-            ++zc_send_completed;
+        if (completion.opcode == IBV_WC_SEND && zc_send_active && completion.wr_id >= 1 &&
+            completion.wr_id <= zc_send_posted) {
+            zc_send_completed = std::max(zc_send_completed, static_cast<size_t>(completion.wr_id));
             return true;
         }
         if (completion.opcode == IBV_WC_RECV) {
@@ -240,33 +241,43 @@ bool TransportRDMAZc::BeginZcRecv(void* data, size_t size) {
     return true;
 }
 
-bool TransportRDMAZc::PostZcSend(size_t index) {
-    ibv_sge element{reinterpret_cast<uintptr_t>(zc_send_data + index * zc_chunk),
-                    static_cast<uint32_t>(ZcChunkLength(index)), zc_mr->lkey};
-    ibv_send_wr request{};
-    request.wr_id = index + 1;
-    request.opcode = IBV_WR_SEND;
-    request.send_flags = IBV_SEND_SIGNALED;
-    request.sg_list = &element;
-    request.num_sge = 1;
+bool TransportRDMAZc::PostZcSends(size_t count) {
+    ibv_sge elements[kRdmaZcWindow]{};
+    ibv_send_wr requests[kRdmaZcWindow]{};
+    for (size_t i = 0; i < count; ++i) {
+        const size_t index = zc_send_posted + i;
+        elements[i] = ibv_sge{reinterpret_cast<uintptr_t>(zc_send_data + index * zc_chunk),
+                              static_cast<uint32_t>(ZcChunkLength(index)), zc_mr->lkey};
+        requests[i].wr_id = index + 1;
+        requests[i].opcode = IBV_WR_SEND;
+        requests[i].sg_list = &elements[i];
+        requests[i].num_sge = 1;
+        requests[i].next = i + 1 < count ? &requests[i + 1] : nullptr;
+    }
+    requests[count - 1].send_flags = IBV_SEND_SIGNALED;
     ibv_send_wr* failed = nullptr;
-    if (ibv_post_send(zc_qp, &request, &failed) != 0) {
-        LOG_ERROR("Failed to post the zero-copy send {}: {}", index, strerror(errno));
+    if (ibv_post_send(zc_qp, requests, &failed) != 0) {
+        LOG_ERROR("Failed to post {} chained zero-copy sends: {}", count, strerror(errno));
         return false;
     }
     return true;
 }
 
-bool TransportRDMAZc::PostZcRecv(size_t index) {
-    ibv_sge element{reinterpret_cast<uintptr_t>(zc_recv_data + index * zc_chunk),
-                    static_cast<uint32_t>(ZcChunkLength(index)), zc_mr->lkey};
-    ibv_recv_wr request{};
-    request.wr_id = kZcRecvBase + index;
-    request.sg_list = &element;
-    request.num_sge = 1;
+bool TransportRDMAZc::PostZcRecvs(size_t count) {
+    ibv_sge elements[kRdmaZcWindow]{};
+    ibv_recv_wr requests[kRdmaZcWindow]{};
+    for (size_t i = 0; i < count; ++i) {
+        const size_t index = zc_recv_posted + i;
+        elements[i] = ibv_sge{reinterpret_cast<uintptr_t>(zc_recv_data + index * zc_chunk),
+                              static_cast<uint32_t>(ZcChunkLength(index)), zc_mr->lkey};
+        requests[i].wr_id = kZcRecvBase + index;
+        requests[i].sg_list = &elements[i];
+        requests[i].num_sge = 1;
+        requests[i].next = i + 1 < count ? &requests[i + 1] : nullptr;
+    }
     ibv_recv_wr* failed = nullptr;
-    if (ibv_post_recv(zc_qp, &request, &failed) != 0) {
-        LOG_ERROR("Failed to post the zero-copy receive {}: {}", index, strerror(errno));
+    if (ibv_post_recv(zc_qp, requests, &failed) != 0) {
+        LOG_ERROR("Failed to post {} chained zero-copy receives: {}", count, strerror(errno));
         return false;
     }
     return true;
@@ -310,11 +321,13 @@ bool TransportRDMAZc::TrySend(const void* data, size_t size, size_t* progress, b
         return false;
     }
 
-    while (zc_send_posted < zc_total && zc_send_posted - zc_send_completed < kRdmaZcWindow) {
-        if (!PostZcSend(zc_send_posted)) {
+    const size_t send_window = kRdmaZcWindow - (zc_send_posted - zc_send_completed);
+    const size_t send_count = std::min(send_window, zc_total - zc_send_posted);
+    if (send_count > 0) {
+        if (!PostZcSends(send_count)) {
             return false;
         }
-        ++zc_send_posted;
+        zc_send_posted += send_count;
     }
 
     *done = zc_send_completed == zc_total;
@@ -350,11 +363,13 @@ bool TransportRDMAZc::TryRecv(void* data, size_t size, size_t* progress, bool* d
         return false;
     }
 
-    while (zc_recv_posted < zc_total && zc_recv_posted - zc_recv_completed < kRdmaZcWindow) {
-        if (!PostZcRecv(zc_recv_posted)) {
+    const size_t recv_window = kRdmaZcWindow - (zc_recv_posted - zc_recv_completed);
+    const size_t recv_count = std::min(recv_window, zc_total - zc_recv_posted);
+    if (recv_count > 0) {
+        if (!PostZcRecvs(recv_count)) {
             return false;
         }
-        ++zc_recv_posted;
+        zc_recv_posted += recv_count;
     }
 
     *done = zc_recv_completed == zc_total;

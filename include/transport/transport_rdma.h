@@ -101,7 +101,7 @@ private:
 
     bool PostPoolRecv(size_t index);
     bool PostControlSend(size_t length);
-    bool PostWrite(size_t slot, size_t length);
+    bool PostWrites(const char* source, size_t size, size_t progress, size_t count, size_t* bytes);
     bool PostCredit(size_t slots);
     bool ProcessCompletionEvents();
     bool DrainCompletionEvents(bool rearm);

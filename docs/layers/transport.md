@@ -48,7 +48,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`：`Listen(addr, port)` 用 `rdma_listen`（`port=0` 时内核选端口，用 `rdma_get_local_addr` 读回真实端口）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端 `rdma_accept`，QP 都是 `IBV_QPT_RC`。
 - 对端内存信息走 CM private data（`Wire{base_addr, rkey}`），两端在事件里直接得到；被动端在 `CONNECT_REQUEST`、主动端在 `ESTABLISHED` 事件里。
 - 握手与数据方向解耦：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关。集合由 `rank < peer` 的一端 Connect，P2P 由发送方 Connect。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`。
-- 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后 post write；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
+- 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后按可用 credit 将多个 write 链式提交，整批只对链尾请求 signaled CQE；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
 - 槽位复用只由 credit 一个门控：可发窗口是 `credits_received + kRdmaSlotCount`；credit 蕴含「本地读已完成」，故 `IBV_WC_RDMA_WRITE` 完成事件被忽略。credit 反向归还：consumer 交还整个槽后用一次 `WRITE_WITH_IMM` 写对端控制区（payload 1 B，不受方向限制）。immediate 的位布局是两种用途共用：bit 31 为 credit 标志，bit 16–30 是槽号，bit 0–15 是 `length - 1`（长度减 1 才能双射进 16 bit）。`kCreditBatch = 8` 批量归还，队列排空时立刻归还余数。
 - 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
 - `WRITE_WITH_IMM` 消耗接收方 RQ 的 WQE，接收队列是纯 credit 池（预投 `kRdmaRecvPool` 个空 WQE，每收到一个 write-imm 立即补投），不预投会 RNR。
@@ -62,7 +62,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 基类为此开放最小扩展点：`Wire` 增加 `kWireTailSize` 尾部（子类在 CM private data 里捎带自己的连接参数）、`SetupResources`/`PrepareWire`/`FinalizeConnection`/`HandleCompletion`/`MakePeer`/`CloseResources` 虚化。子类用 `PrepareWire` 写 `ZcWire{port, chunk}`、`FinalizeConnection` 读对端端口并建立第二条 CM 连接。
 - 独立 QP 不是为收发大小不一致准备的（调用方保证两次操作配对且大小相同），而是为隔离接收队列：基类 QP 的 RQ 预投了 64 个 256 B 的 credit 池，大块 `SEND` 会匹配队首的小缓冲。独立 QP 只投递用户缓冲，两者互不干扰。
 - 独立 QP 由 CM 托管：主连接建立后，接受方在同一地址上再 `rdma_listen` 一个临时端口，用主连接 private data 的尾部把端口告诉主动方，双方再各建一条 CM 连接并 `rdma_create_qp`。这样 QP 的路径与状态迁移都是 CM 的事，在 iWARP 上也成立——手工 `ibv_modify_qp` 迁 INIT/RTR/RTS 在 iWARP 上必失败（`iwcm_init_qp_rts_attr` 返回空掩码，QP 状态由 provider 驱动）。
-- 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单次零拷贝传输最大为 1 GiB（64 个默认 chunk）；单 chunk 一次 WR，超过则多 WR；发送窗口 `kRdmaZcWindow` = 8，post 与补投在同一调用内完成。
+- 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单次零拷贝传输最大为 1 GiB（64 个默认 chunk）；每次按发送/接收窗口链式批量 post，发送链尾请求 signaled CQE，完成的 `wr_id` 表示此前有序 WR 均已完成；发送窗口 `kRdmaZcWindow` = 8。
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销（实测：逐消息注册会让 32 KiB 传输慢 400 倍）。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，所以完成事件由一个 CQ 收集、以 `qp_num` 区分，就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。

@@ -429,20 +429,30 @@ bool TransportRDMA::PostControlSend(size_t length) {
     return true;
 }
 
-bool TransportRDMA::PostWrite(size_t slot, size_t length) {
-    ibv_sge element{reinterpret_cast<uintptr_t>(SlotData(slot)), static_cast<uint32_t>(length), mr->lkey};
-    ibv_send_wr request{};
-    request.wr_id = slot + 1;
-    request.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    request.send_flags = IBV_SEND_SIGNALED;
-    request.imm_data = htonl(EncodeDataImmediate(slot, length));
-    request.wr.rdma.remote_addr = peer.base_addr + kRdmaRingOffset + slot * kRdmaSlotSize;
-    request.wr.rdma.rkey = peer.rkey;
-    request.sg_list = &element;
-    request.num_sge = 1;
+bool TransportRDMA::PostWrites(const char* source, size_t size, size_t progress, size_t count, size_t* bytes) {
+    ibv_sge elements[kRdmaSlotCount]{};
+    ibv_send_wr requests[kRdmaSlotCount]{};
+    *bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t slot = (send_seq + i) % kRdmaSlotCount;
+        const size_t write_length = std::min(kRdmaSlotSize, size - progress - *bytes);
+        std::memcpy(SlotData(slot), source + progress + *bytes, write_length);
+        elements[i] =
+            ibv_sge{reinterpret_cast<uintptr_t>(SlotData(slot)), static_cast<uint32_t>(write_length), mr->lkey};
+        requests[i].wr_id = slot + 1;
+        requests[i].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        requests[i].imm_data = htonl(EncodeDataImmediate(slot, write_length));
+        requests[i].wr.rdma.remote_addr = peer.base_addr + kRdmaRingOffset + slot * kRdmaSlotSize;
+        requests[i].wr.rdma.rkey = peer.rkey;
+        requests[i].sg_list = &elements[i];
+        requests[i].num_sge = 1;
+        requests[i].next = i + 1 < count ? &requests[i + 1] : nullptr;
+        *bytes += write_length;
+    }
+    requests[count - 1].send_flags = IBV_SEND_SIGNALED;
     ibv_send_wr* failed = nullptr;
-    if (ibv_post_send(cm_id->qp, &request, &failed) != 0) {
-        LOG_ERROR("Failed to post the RDMA write for ring slot {}: {}", slot, ErrnoText());
+    if (ibv_post_send(cm_id->qp, requests, &failed) != 0) {
+        LOG_ERROR("Failed to post {} chained RDMA writes: {}", count, ErrnoText());
         return false;
     }
     return true;
@@ -661,15 +671,17 @@ bool TransportRDMA::TrySend(const void* data, size_t size, size_t* progress, boo
 
     const char* source = static_cast<const char*>(data);
     const size_t limit = credits_received + kRdmaSlotCount;
-    while (*progress < size && send_seq < limit) {
-        const size_t slot = send_seq % kRdmaSlotCount;
-        const size_t length = std::min(kRdmaSlotSize, size - *progress);
-        std::memcpy(SlotData(slot), source + *progress, length);
-        if (!PostWrite(slot, length)) {
+    const size_t available = send_seq < limit ? limit - send_seq : 0;
+    const size_t remaining = size - *progress;
+    const size_t chunks = remaining == 0 ? 0 : 1 + (remaining - 1) / kRdmaSlotSize;
+    const size_t count = std::min(available, chunks);
+    if (count > 0) {
+        size_t bytes = 0;
+        if (!PostWrites(source, size, *progress, count, &bytes)) {
             return false;
         }
-        ++send_seq;
-        *progress += length;
+        send_seq += count;
+        *progress += bytes;
     }
 
     *done = (*progress == size);
