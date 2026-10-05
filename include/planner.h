@@ -10,7 +10,8 @@ public:
     static constexpr int kP2pSendChannel = 0;
     static constexpr int kP2pRecvChannel = 1;
 
-    void SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) const;
+    bool ValidateCollectiveTask(const CollTask& task, int rank, int world_size) const;
+    bool SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) const;
     bool Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const;
 
     bool ConnectP2p(Communicator& comm, int peer) const;

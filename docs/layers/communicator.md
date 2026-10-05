@@ -6,6 +6,7 @@
 
 - 初始化链路：同时构造 `TopologyRing` 与 `TopologyTree` → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 机器分组（写入成员）+ 按 `local_rank` 绑核 → 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → 两个拓扑 `FillChannels(*this, channels)` → `InitChannels` 按 `FillPeers` 的边并集建 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
 - 执行链路：五个 collective 与 Send/Recv 公开方法构造 `CollTask` 后统一提交；非组内调用是单元素批次，直接走批量规划；`GroupStart()`/`GroupEnd()` 之间的调用只入队，最外层 `GroupEnd()` 统一规划并调用 executor 一次。planner 负责排序与批量规划，入口不展开算法。P2P 固定由 `TopologyP2p` 执行，planner 在 executor 启动前按轮次建立连接并把任务加入统一 plan。
+- collective task 在 `Submit` 入队前统一验证参数；无效任务立即返回 `false`，不会进入 Group 队列。Planner 的排序与规划入口也复用同一校验，以覆盖直接调用路径。
 - 暴露本机视角：`GetLocalRank()` / `GetLocalSize()` / `GetLocalRanks()` / `IsSingleMachine()`；以及两个拓扑的访问器 `GetRingTopology()` / `GetTreeTopology()`（planner 用它二选一，见 [planner.md](planner.md)）。
 - 不负责：不决定算法（topology）、不决定等待策略（executor）、不切片（planner）、不实现共享内存环（transport）。
 

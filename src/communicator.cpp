@@ -347,6 +347,10 @@ bool Communicator::GroupEnd() {
 }
 
 bool Communicator::Submit(const CollTask& task) {
+    const bool is_p2p = task.func == CollFunc::Send || task.func == CollFunc::Recv;
+    if (!is_p2p && !planner.ValidateCollectiveTask(task, config.rank, config.world_size)) {
+        return false;
+    }
     pending_tasks.push_back(task);
     if (group_depth == 0) {
         return Flush();
@@ -357,7 +361,9 @@ bool Communicator::Submit(const CollTask& task) {
 bool Communicator::Flush() {
     std::vector<CollTask> tasks;
     tasks.swap(pending_tasks);
-    planner.SortTasks(tasks, config.rank, config.world_size);
+    if (!planner.SortTasks(tasks, config.rank, config.world_size)) {
+        return false;
+    }
 
     CollPlan plan;
     return planner.Plan(*this, tasks, plan) && executor->Run(plan);

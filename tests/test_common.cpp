@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -618,21 +619,31 @@ bool RunGroupCases(Communicator& comm, std::string& reason) {
         send.func = CollFunc::Send;
         send.peer = (rank + 1) % world_size;
         send.count = 1;
+        int value = 0;
         CollTask big;
         big.func = CollFunc::AllReduce;
+        big.send_buf = &value;
+        big.recv_buf = &value;
         big.count = 4096;
         big.dtype = DataType::INT32;
         CollTask broadcast;
         broadcast.func = CollFunc::Broadcast;
+        broadcast.send_buf = &value;
+        broadcast.recv_buf = &value;
         broadcast.count = 32;
         broadcast.dtype = DataType::INT32;
         CollTask small;
         small.func = CollFunc::AllReduce;
+        small.send_buf = &value;
+        small.recv_buf = &value;
         small.count = 32;
         small.dtype = DataType::INT32;
         tasks = {send, big, broadcast, small};
         Planner planner;
-        planner.SortTasks(tasks, rank, world_size);
+        if (!planner.SortTasks(tasks, rank, world_size)) {
+            reason = "the planner rejected a valid collective task batch";
+            return false;
+        }
         if (tasks.size() != 4 || tasks[0].func != CollFunc::AllReduce || tasks[0].count != 32 ||
             tasks[1].func != CollFunc::AllReduce || tasks[1].count != 4096 || tasks[2].func != CollFunc::Broadcast ||
             tasks[3].func != CollFunc::Send) {
@@ -659,7 +670,10 @@ bool RunGroupCases(Communicator& comm, std::string& reason) {
         third.peer = (rank + 1) % world_size;
         std::vector<CollTask> tasks = {first, second, third};
         Planner planner;
-        planner.SortTasks(tasks, rank, world_size);
+        if (!planner.SortTasks(tasks, rank, world_size)) {
+            reason = "the planner rejected a valid P2P task batch";
+            return false;
+        }
         for (size_t i = 1; i < tasks.size(); ++i) {
             const int previous = round_of(tasks[i - 1]);
             const int current = round_of(tasks[i]);
@@ -667,6 +681,24 @@ bool RunGroupCases(Communicator& comm, std::string& reason) {
                 reason = "the P2P round order is not ascending";
                 return false;
             }
+        }
+    }
+
+    {
+        CollTask invalid;
+        invalid.func = CollFunc::AllReduce;
+        invalid.send_buf = reinterpret_cast<const void*>(1);
+        invalid.recv_buf = reinterpret_cast<void*>(1);
+        invalid.count = std::numeric_limits<size_t>::max();
+        invalid.dtype = DataType::FLOAT64;
+        std::vector<CollTask> tasks{invalid};
+        Planner planner;
+        CollPlan plan;
+        const bool sorted = planner.SortTasks(tasks, rank, world_size);
+        const bool planned = planner.Plan(comm, tasks, plan);
+        if (sorted || planned) {
+            reason = "planner entry points must reject an overflowing collective before planning";
+            return false;
         }
     }
 

@@ -102,7 +102,7 @@ void Exchange(Communicator& comm, size_t count, DataType dtype, Executor* execut
             task.peer = peer;
             std::vector<CollTask> tasks{task};
             Planner planner;
-            planner.SortTasks(tasks, rank, world_size);
+            Require(planner.SortTasks(tasks, rank, world_size), "P2P task sorting");
             CollPlan plan;
             Require(planner.Plan(comm, tasks, plan), "P2P planning");
             const size_t slot = is_send ? 0u : 1u;

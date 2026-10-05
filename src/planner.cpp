@@ -22,6 +22,31 @@ bool IsP2p(CollFunc func) {
     return func == CollFunc::Send || func == CollFunc::Recv;
 }
 
+bool IsCollective(CollFunc func) {
+    switch (func) {
+    case CollFunc::AllReduce:
+    case CollFunc::Broadcast:
+    case CollFunc::Reduce:
+    case CollFunc::AllGather:
+    case CollFunc::ReduceScatter:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool IsReduceOp(ReduceOp op) {
+    switch (op) {
+    case ReduceOp::SUM:
+    case ReduceOp::MAX:
+    case ReduceOp::MIN:
+    case ReduceOp::AVG:
+        return true;
+    default:
+        return false;
+    }
+}
+
 int P2pRoundOf(CollFunc func, int rank, int peer, int world_size) {
     const int forward =
         (func == CollFunc::Send) ? (peer - rank + world_size) % world_size : (rank - peer + world_size) % world_size;
@@ -40,11 +65,70 @@ int EffectiveRoot(const CollTask& task) {
 
 } // namespace
 
-void Planner::SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) const {
+bool Planner::ValidateCollectiveTask(const CollTask& task, int rank, int world_size) const {
+    if (!IsCollective(task.func) || world_size <= 0 || rank < 0 || rank >= world_size) {
+        LOG_ERROR("Rank {}: Invalid collective function or communicator size", rank);
+        return false;
+    }
+
+    const size_t type_size = Utils::GetDataTypeSize(task.dtype);
+    if (type_size == 0 || task.count > std::numeric_limits<size_t>::max() / type_size) {
+        LOG_ERROR("Rank {}: Invalid collective data type or count", rank);
+        return false;
+    }
+
+    const bool is_reduce =
+        task.func == CollFunc::AllReduce || task.func == CollFunc::Reduce || task.func == CollFunc::ReduceScatter;
+    if (is_reduce && !IsReduceOp(task.op)) {
+        LOG_ERROR("Rank {}: Invalid collective reduce operation", rank);
+        return false;
+    }
+
+    const bool has_root = task.func == CollFunc::Broadcast || task.func == CollFunc::Reduce;
+    if (has_root && (task.root < 0 || task.root >= world_size)) {
+        LOG_ERROR("Rank {}: Invalid collective root {}", rank, task.root);
+        return false;
+    }
+
+    if ((task.func == CollFunc::AllGather || task.func == CollFunc::ReduceScatter) && task.count != 0 &&
+        task.count > std::numeric_limits<size_t>::max() / static_cast<size_t>(world_size) / type_size) {
+        LOG_ERROR("Rank {}: Collective total buffer size overflows", rank);
+        return false;
+    }
+
+    if (task.count == 0) {
+        return true;
+    }
+
+    const bool needs_send = task.func != CollFunc::Broadcast;
+    const bool needs_recv = task.func != CollFunc::Reduce || rank == task.root;
+    if ((needs_send && task.send_buf == nullptr) || (needs_recv && task.recv_buf == nullptr)) {
+        LOG_ERROR("Rank {}: Collective is missing a required buffer", rank);
+        return false;
+    }
+    return true;
+}
+
+bool Planner::SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) const {
+    if (world_size <= 0 || rank < 0 || rank >= world_size) {
+        LOG_ERROR("Rank {}: Invalid communicator size for task sorting", rank);
+        return false;
+    }
     std::vector<CollTask> collectives;
     std::vector<CollTask> p2p;
     for (const CollTask& task : tasks) {
-        (IsP2p(task.func) ? p2p : collectives).push_back(task);
+        if (IsP2p(task.func)) {
+            if (task.peer < 0 || task.peer >= world_size || task.peer == rank) {
+                LOG_ERROR("Rank {}: Invalid P2P peer {}", rank, task.peer);
+                return false;
+            }
+            p2p.push_back(task);
+        } else {
+            if (!ValidateCollectiveTask(task, rank, world_size)) {
+                return false;
+            }
+            collectives.push_back(task);
+        }
     }
     auto less = [](const CollTask& a, const CollTask& b) {
         if (a.func != b.func) {
@@ -75,15 +159,23 @@ void Planner::SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) 
     tasks.clear();
     tasks.insert(tasks.end(), collectives.begin(), collectives.end());
     tasks.insert(tasks.end(), p2p.begin(), p2p.end());
+    return true;
 }
 
 bool Planner::Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const {
-    plan = CollPlan(comm.GetNChannels());
     for (const CollTask& task : tasks) {
         if (IsP2p(task.func)) {
             if (!ValidateP2p(comm, task)) {
                 return false;
             }
+        } else if (!ValidateCollectiveTask(task, comm.GetRank(), comm.GetWorldSize())) {
+            return false;
+        }
+    }
+
+    plan = CollPlan(comm.GetNChannels());
+    for (const CollTask& task : tasks) {
+        if (IsP2p(task.func)) {
             continue;
         }
         if (!PlanCollective(comm, task, plan)) {

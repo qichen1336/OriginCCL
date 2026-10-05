@@ -28,6 +28,7 @@
 - `PlanTask.chunk_size` 语义按拓扑解释：ring = `ceil(elem_count / world_size)`（AllReduce 块划分）；tree = `kChunkBytes / type_size`（流水粒度，逐 chunk 推进）。
 - `rank_stride` 保存原始 `CollTask.count`（元素数）；非空 send/recv 基址偏移 `offset*type_size`，null 原样保留。topology 用 `block_rank*rank_stride` 找下一 rank 块，不能用 channel 的 elem_count 代替跨度。
 - `PlanTask.state`（`CollOpState`）见 [topology.md](topology.md)——planner 只值初始化，不展开算法阶段。
+- collective 参数由 `ValidateCollectiveTask` 统一检查：函数、dtype、有效 reduce op/root、必需 buffer，以及单块字节量与 AllGather/ReduceScatter 总跨度的 `size_t` 溢出。提交入口、`SortTasks` 和 `Plan` 都在排序或地址/字节计算前执行该校验；`SortTasks` 和 `Plan` 返回 `false` 表示拒绝无效任务。
 - `PlanTask.topology` 复用 communicator 持有的 ring/tree/p2p 拓扑，planner 不新建拓扑；集合任务的 `PlanTask.channel_id` 取 `comm_channel.id`，P2P 固定为 0。tree 据此选择树形与运行时角色（见 [topology.md](topology.md)），executor 不解释该字段。
 - 启用 channel 规则：tree 下的 AllReduce 与 ring 下的 AllReduce，每 channel 最小颗粒度是 `OcclConfig::kChunkBytes × world_size`；ring 下其余操作（含 ReduceScatter / AllGather）是 `kChunkBytes`（合称 `unit`）。使用数 `n_used = max(1, min(total_bytes / unit, GetNChannels()))`，小消息只触发单 channel。`total_bytes = count*type_size`（AG/RS 也用单块大小，不是 `count*world_size`），多块操作按单块大小选通道。切分按 unit 对齐：每 channel 分 `⌊units_total/n_used⌋` 或 `⌈` 个 unit，`total_bytes % unit` 的余数并入最后一个 channel。count=0 仍生成一个立即完成的任务。
 - tree AllReduce 可多 channel：每 channel 只处理每 rank 块的同一子区间，`elem_count` 是切片长度、`rank_stride` 仍是原始块跨度 `count`；tree 直接用 `elem_count` 定位切片，不做打包区。

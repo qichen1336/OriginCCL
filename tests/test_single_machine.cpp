@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 #include <mpi.h>
@@ -7,6 +8,41 @@
 #include "logger.h"
 #include "test_common.h"
 #include "utils.h"
+
+namespace {
+bool CheckCollectiveValidation(Communicator& comm) {
+    int value = 1;
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    const size_t total_count = max_size / static_cast<size_t>(comm.GetWorldSize()) / sizeof(int32_t) + 1;
+    bool passed = true;
+    auto expect_rejected = [&passed](bool success, const char* name) {
+        if (success) {
+            LOG_ERROR("Collective validation accepted {}", name);
+            passed = false;
+        }
+    };
+
+    expect_rejected(comm.AllReduce(&value, &value, max_size / sizeof(double) + 1, DataType::FLOAT64, ReduceOp::SUM),
+                    "an overflowing byte count");
+    expect_rejected(comm.AllGather(&value, &value, total_count, DataType::INT32), "an overflowing AllGather extent");
+    expect_rejected(comm.ReduceScatter(&value, &value, total_count, DataType::INT32, ReduceOp::SUM),
+                    "an overflowing ReduceScatter extent");
+    expect_rejected(comm.AllReduce(&value, &value, 1, static_cast<DataType>(99), ReduceOp::SUM), "an invalid dtype");
+    expect_rejected(comm.AllReduce(&value, &value, 1, DataType::INT32, static_cast<ReduceOp>(99)),
+                    "an invalid reduce operation");
+    expect_rejected(comm.Broadcast(&value, 1, DataType::INT32, comm.GetWorldSize()), "an invalid root");
+    expect_rejected(comm.AllReduce(nullptr, &value, 1, DataType::INT32, ReduceOp::SUM), "a missing input buffer");
+
+    comm.GroupStart();
+    expect_rejected(comm.AllReduce(nullptr, &value, 1, DataType::INT32, ReduceOp::SUM),
+                    "a grouped task with a missing input buffer");
+    if (!comm.GroupEnd()) {
+        LOG_ERROR("A group must remain empty when submission validation rejects its task");
+        passed = false;
+    }
+    return passed;
+}
+} // namespace
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
@@ -53,6 +89,9 @@ int main(int argc, char** argv) {
     if (!comm.IsSingleMachine() || comm.GetLocalSize() != world_size || comm.GetLocalRank() != rank) {
         LOG_ERROR("Rank {}: the single-machine view is wrong: single={} local_size={} local_rank={}", rank,
                   comm.IsSingleMachine(), comm.GetLocalSize(), comm.GetLocalRank());
+        failed = 1;
+    }
+    if (!CheckCollectiveValidation(comm)) {
         failed = 1;
     }
 
