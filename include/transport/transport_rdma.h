@@ -63,6 +63,7 @@ protected:
     };
 
     static bool IsIpv4MappedGid(const ibv_gid& gid);
+    static bool ResolvePortAddress(ibv_context* context, uint8_t port, int gid_count, std::string& addr);
 
     virtual bool SetupResources();
     virtual void PrepareWire(Wire& wire) const;

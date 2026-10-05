@@ -52,7 +52,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
 - `WRITE_WITH_IMM` 消耗接收方 RQ 的 WQE，接收队列是纯 credit 池（预投 `kRdmaRecvPool` 个空 WQE，每收到一个 write-imm 立即补投），不预投会 RNR。
 - 就绪与 EPOLLET：`GetFd()` 连接后返回 completion channel fd，监听态返回 CM channel fd；`GetPollEvents()` 恒 `EPOLLIN`。就绪 fd 只表达数据到来，对端消失经被 flush 的接收 WQE 产生 CQE、`HandleCompletion` 判为 `Try*` 的 `false`。`Try*` 非阻塞 drain 后必须 `ibv_get_cq_event` → `ibv_ack_cq_events` → `ibv_req_notify_cq` 重新 arm 再 poll CQ，否则漏下一次边沿。
-- 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，再扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
+- 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，先扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址；设备不发布这种 GID 时（RoCE v1、iWARP）退到该 GID 绑定的网卡（`ibv_query_gid_ex` 的 `ndev_ifindex`），取该网卡上的首个 AF_INET 地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
 - 限制：Linux + `libibverbs`/`librdmacm` 是硬依赖。首版接受一次用户缓冲 ↔ 注册缓冲的拷贝，不做零拷贝/RDMA Read/多 rail。
 
 ### RDMA 零拷贝子类（`TransportRDMAZc`）
@@ -61,6 +61,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 基类为此开放最小扩展点：`Wire` 增加 `kWireTailSize` 尾部（子类在 CM private data 里捎带自己的连接参数）、`SetupResources`/`PrepareWire`/`FinalizeConnection`/`HandleCompletion`/`MakePeer`/`CloseResources` 虚化。子类用 `PrepareWire` 写 `ZcWire{qp_num, chunk}`、`FinalizeConnection` 读对端并自己把独立 QP 迁到 RTR/RTS。
 - 独立 QP 不是为收发大小不一致准备的（调用方保证两次操作配对且大小相同），而是为隔离接收队列：基类 QP 的 RQ 预投了 64 个 256 B 的 credit 池，大块 `SEND` 会匹配队首的小缓冲。独立 QP 只投递用户缓冲，两者互不干扰。
 - 独立 QP 是普通 `ibv_create_qp`，CM 只驱动它自己创建的 QP，因此对端 QPN 走 private data，路径属性由 `rdma_init_qp_attr` 提供。注意 `rdma_init_qp_attr` 会整段覆盖传入的 `ibv_qp_attr`（含目的 QPN），所以它返回后必须重新覆盖 `dest_qp_num`/`rq_psn`/PSN/重试等字段再 `ibv_modify_qp`。
+- 独立 QP 要求设备支持 IB/RoCE 语义：iWARP 上 `rdma_init_qp_attr` 为 RTR 只返回 `STATE|ACCESS_FLAGS|PORT`、为 RTS 返回空掩码（QP 状态由 CM/provider 驱动），手工迁移必然失败，零拷贝档位在 iWARP 上不可用。
 - 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单 chunk 一次 WR，超过则多 WR；发送窗口 `kRdmaZcWindow` = 8，post 与补投在同一调用内完成。
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：首次推进时 `ibv_reg_mr`，本次操作 `done` 后 `ibv_dereg_mr`，不缓存；发送/接收各一个在飞的 MR。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝。
@@ -91,6 +92,6 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - **RDMA 槽位复用只保留 credit 一道门控**：credit 已蕴含「本地已读完该槽」，补一道本地 send CQE（`local_completed`）只会收紧窗口、不会更安全。
 - **RDMA `private_data` 保持裸 `Wire{base_addr, rkey}`**：连接合法性由 CM 保证，无 magic 校验。
 - **`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ**：直接 poll CQ 不重新 arm 会在 EPOLLET 下漏边沿。
-- **RDMA 地址必须由 `Probe` 从设备的 IPv4-mapped GID 得出**，不能复用 `Utils::GetLocalIPAddress()` 结果。
+- **RDMA 地址必须由 `Probe` 从设备得出**：优先设备发布的 IPv4-mapped GID，设备不发布时取 GID 绑定网卡的 IPv4；不能复用 `Utils::GetLocalIPAddress()` 结果。
 - 环容量固定 1 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
 - 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`/`test_transport_rdma_zc`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 与零拷贝档位无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度），但只做黑盒接口断言，不检查具体传输类型。

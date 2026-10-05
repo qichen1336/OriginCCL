@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include "transport/transport_rdma.h"
@@ -81,21 +83,54 @@ bool TransportRDMA::Probe(std::string& addr) {
                 if (ibv_query_port(context, port, &attributes) != 0 || attributes.state != IBV_PORT_ACTIVE) {
                     continue;
                 }
-                for (int index = 0; index < attributes.gid_tbl_len && !found; ++index) {
-                    ibv_gid gid{};
-                    char text[INET_ADDRSTRLEN] = {};
-                    if (ibv_query_gid(context, port, index, &gid) == 0 && TransportRDMA::IsIpv4MappedGid(gid) &&
-                        inet_ntop(AF_INET, &gid.raw[12], text, sizeof(text)) != nullptr) {
-                        addr = text;
-                        found = true;
-                    }
-                }
+                found = TransportRDMA::ResolvePortAddress(context, port, attributes.gid_tbl_len, addr);
             }
         }
         ibv_close_device(context);
     }
 
     ibv_free_device_list(devices);
+    return found;
+}
+
+// RoCE v1 and iWARP publish no IPv4-mapped GID, so the address comes from the net device the GID names.
+bool TransportRDMA::ResolvePortAddress(ibv_context* context, uint8_t port, int gid_count, std::string& addr) {
+    for (int index = 0; index < gid_count; ++index) {
+        ibv_gid gid{};
+        char text[INET_ADDRSTRLEN] = {};
+        if (ibv_query_gid(context, port, index, &gid) == 0 && TransportRDMA::IsIpv4MappedGid(gid) &&
+            inet_ntop(AF_INET, &gid.raw[12], text, sizeof(text)) != nullptr) {
+            addr = text;
+            return true;
+        }
+    }
+
+    struct ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) != 0) {
+        return false;
+    }
+
+    bool found = false;
+    for (int index = 0; index < gid_count && !found; ++index) {
+        ibv_gid_entry gid_entry{};
+        if (ibv_query_gid_ex(context, port, index, &gid_entry, 0) != 0 || gid_entry.ndev_ifindex == 0) {
+            continue;
+        }
+        for (struct ifaddrs* ifa = interfaces; ifa != nullptr && !found; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET ||
+                if_nametoindex(ifa->ifa_name) != gid_entry.ndev_ifindex) {
+                continue;
+            }
+            const auto* address = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+            char text[INET_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET, &address->sin_addr, text, sizeof(text)) != nullptr) {
+                addr = text;
+                found = true;
+            }
+        }
+    }
+
+    freeifaddrs(interfaces);
     return found;
 }
 
