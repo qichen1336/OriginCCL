@@ -11,6 +11,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
   - 阻塞接口（控制面）：`Listen(addr, port)` / `Accept` / `Connect` 建连（成功后 socket 置 `O_NONBLOCK`）；`Send` / `Recv` 供 communicator 的 channel 握手等偶发控制面使用（bootstrap 的 `NodeInfo` 交换走裸 TCP socket + `Utils::SendAll`/`RecvAll`，不经过 Transport）。三种传输共用同一 `Listen` 签名，`addr` 语义按传输不同：TCP 忽略它（仍绑 `INADDR_ANY`）、共享内存把它当 rendezvous 路径、RDMA 把它当绑定设备地址。
   - 非阻塞接口（数据面）：`TrySend(data, size, *progress, *done)` / `TryRecv(...)` 单次推进到 EAGAIN 为止；返回 false 表对端关闭或真错误。
   - 就绪契约：`GetFd()` 给出要等待的描述符（listening 时为 listen fd，连上后为数据面 fd）；`GetPollEvents()` 给出该描述符的原生就绪掩码（Linux epoll 掩码）；`SetDirection()`/`GetDirection()` 维护方向元数据（`Bidirectional`（默认）/ `Send` / `Receive`）。
+  - 等待模式：executor 在 plan 开始时设置 `Polling` 或 `EventDriven`；SHM polling 模式只读共享游标，不触碰 eventfd，事件模式保留 eventfd 通知与排空。
   - `Close()` / `IsConnected()`。
 - 不负责：不决定等待策略（executor）、不推进算法（topology）、不监听 fd（executor）。
 

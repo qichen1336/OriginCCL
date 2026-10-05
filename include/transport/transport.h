@@ -11,6 +11,11 @@ enum class TransportDirection {
     Receive
 };
 
+enum class TransportWaitMode {
+    EventDriven,
+    Polling
+};
+
 class Transport {
 public:
     virtual ~Transport() = default;
@@ -29,6 +34,10 @@ public:
 
     virtual int GetFd() const = 0;
     virtual uint32_t GetPollEvents() const = 0;
+
+    virtual void SetWaitMode(TransportWaitMode mode) {
+        (void)mode;
+    }
 
     // Edge-triggered contract: Try* must drain until EAGAIN / no progress, since
     // executors register with EPOLLET and a partial drain loses the next edge.

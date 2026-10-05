@@ -41,6 +41,9 @@ public:
 
     int GetFd() const override;
     uint32_t GetPollEvents() const override;
+    void SetWaitMode(TransportWaitMode mode) override {
+        wait_mode = mode;
+    }
 
     void Close() override;
     bool IsConnected() const override {
@@ -98,4 +101,5 @@ private:
     RingResources resources;
     char* map = nullptr;
     bool connected = false;
+    TransportWaitMode wait_mode = TransportWaitMode::EventDriven;
 };

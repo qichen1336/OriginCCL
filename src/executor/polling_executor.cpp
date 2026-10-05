@@ -4,6 +4,25 @@
 #include "executor/polling_executor.h"
 #include "logger.h"
 
+namespace {
+void SetPlanWaitMode(const CollPlan& plan) {
+    for (const ChannelPlan& channel : plan.channels) {
+        for (const PlanTask& task : channel.tasks) {
+            for (const auto& transport : task.send_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::Polling);
+                }
+            }
+            for (const auto& transport : task.recv_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::Polling);
+                }
+            }
+        }
+    }
+}
+} // namespace
+
 bool PollingExecutor::StartFrontTask(size_t slot, const CollPlan& plan, std::vector<PlanTask*>& current,
                                      std::vector<size_t>& task_index, size_t& active) {
     const ChannelPlan& channel = plan.channels[slot];
@@ -22,6 +41,7 @@ bool PollingExecutor::StartFrontTask(size_t slot, const CollPlan& plan, std::vec
 }
 
 bool PollingExecutor::Run(const CollPlan& plan) {
+    SetPlanWaitMode(plan);
     if (plan.channels.empty()) {
         return true;
     }

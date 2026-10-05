@@ -351,13 +351,15 @@ bool TransportShm::TrySend(const void* data, size_t size, size_t* progress, bool
         if (chunk > 0) {
             continue;
         }
-        Drain(resources.space_ready);
+        if (wait_mode == TransportWaitMode::EventDriven) {
+            Drain(resources.space_ready);
+        }
         if (SpaceAvailable() == 0) {
             break;
         }
     }
     *done = (*progress == size);
-    if (moved > 0) {
+    if (moved > 0 && wait_mode == TransportWaitMode::EventDriven) {
         Notify(resources.data_ready);
     }
     return true;
@@ -377,13 +379,15 @@ bool TransportShm::TryRecv(void* data, size_t size, size_t* progress, bool* done
         if (chunk > 0) {
             continue;
         }
-        Drain(resources.data_ready);
+        if (wait_mode == TransportWaitMode::EventDriven) {
+            Drain(resources.data_ready);
+        }
         if (DataAvailable() == 0) {
             break;
         }
     }
     *done = (*progress == size);
-    if (moved > 0) {
+    if (moved > 0 && wait_mode == TransportWaitMode::EventDriven) {
         Notify(resources.space_ready);
     }
     return true;

@@ -6,6 +6,25 @@
 #include "executor/epoll_executor.h"
 #include "logger.h"
 
+namespace {
+void SetPlanWaitMode(const CollPlan& plan) {
+    for (const ChannelPlan& channel : plan.channels) {
+        for (const PlanTask& task : channel.tasks) {
+            for (const auto& transport : task.send_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::EventDriven);
+                }
+            }
+            for (const auto& transport : task.recv_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::EventDriven);
+                }
+            }
+        }
+    }
+}
+} // namespace
+
 EpollExecutor::~EpollExecutor() {
     Shutdown();
 }
@@ -88,6 +107,7 @@ void EpollExecutor::UnregisterTask(const PlanTask& task) {
 }
 
 bool EpollExecutor::Run(const CollPlan& plan) {
+    SetPlanWaitMode(plan);
     if (plan.channels.empty()) {
         return true;
     }
