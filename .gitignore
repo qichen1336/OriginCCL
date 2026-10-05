@@ -9,3 +9,4 @@ graphify-out/
 .scratch/
 CMakeFiles/
 CMakeCache.txt
+*.pem
