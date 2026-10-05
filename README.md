@@ -66,6 +66,15 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe --full-data
 - **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
 - `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。
 - 无可用 RDMA 设备时 RDMA 与零拷贝 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
+- **没有 RDMA 硬件时**，可用软件 RoCE 让 RDMA 与零拷贝档位真正跑起来——而不再只是 SKIP：
+
+```bash
+sudo scripts/setup_softroce.sh          # 交互式，逐阶段确认
+scripts/setup_softroce.sh --status      # 查看当前状态，不需要 root
+sudo scripts/setup_softroce.sh --down   # 拆除
+```
+
+  它加载 `ib_uverbs` / `rdma_cm` / `rdma_ucm` / `rdma_rxe`，建一个私有 dummy 网卡（`occl-rxe0`，`10.99.0.1/24`）并把 `rxe0` 挂上去，然后用 `ibv_rc_pingpong` 预检同机回环。**只建一个 rxe 设备**是刻意的：内核按 `skb->dev` 找设备，两个本地地址互发时 `skb->dev` 是 `lo`、报文会被丢掉；单设备时 `rxe_prepare()` 因目的 MAC 等于本机 MAC 而走 `rxe_loopback()` 直投，两个 rank 共用同一设备即可互通，这也正是库「取第一个 active 设备」的 `Probe()` 所期望的。装好后集合用例会自动选 RDMA，覆盖面比 SKIP 时更大。
 
 查看某一等级的完整用例矩阵（需先构建一次）：
 
