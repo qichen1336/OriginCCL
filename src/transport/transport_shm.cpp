@@ -353,8 +353,10 @@ bool TransportShm::TrySend(const void* data, size_t size, size_t* progress, bool
         }
         if (wait_mode == TransportWaitMode::EventDriven) {
             Drain(resources.space_ready);
-        }
-        if (SpaceAvailable() == 0) {
+            if (SpaceAvailable() == 0) {
+                break;
+            }
+        } else {
             break;
         }
     }
@@ -381,8 +383,10 @@ bool TransportShm::TryRecv(void* data, size_t size, size_t* progress, bool* done
         }
         if (wait_mode == TransportWaitMode::EventDriven) {
             Drain(resources.data_ready);
-        }
-        if (DataAvailable() == 0) {
+            if (DataAvailable() == 0) {
+                break;
+            }
+        } else {
             break;
         }
     }
@@ -395,10 +399,13 @@ bool TransportShm::TryRecv(void* data, size_t size, size_t* progress, bool* done
 
 size_t TransportShm::Produce(const char* data, size_t size, size_t progress) {
     const uint64_t head = Cursors()->head.load(std::memory_order_relaxed);
-    const uint64_t tail = Cursors()->tail.load(std::memory_order_acquire);
-    const size_t room = kShmRingCapacity - static_cast<size_t>(head - tail);
+    size_t room = kShmRingCapacity - static_cast<size_t>(head - cached_tail);
     if (room == 0) {
-        return 0;
+        cached_tail = Cursors()->tail.load(std::memory_order_acquire);
+        room = kShmRingCapacity - static_cast<size_t>(head - cached_tail);
+        if (room == 0) {
+            return 0;
+        }
     }
     const size_t offset = static_cast<size_t>(head % kShmRingCapacity);
     const size_t chunk = std::min({room, size - progress, kShmRingCapacity - offset});
@@ -409,10 +416,13 @@ size_t TransportShm::Produce(const char* data, size_t size, size_t progress) {
 
 size_t TransportShm::Consume(char* data, size_t size, size_t progress) {
     const uint64_t tail = Cursors()->tail.load(std::memory_order_relaxed);
-    const uint64_t head = Cursors()->head.load(std::memory_order_acquire);
-    const size_t available = static_cast<size_t>(head - tail);
+    size_t available = static_cast<size_t>(cached_head - tail);
     if (available == 0) {
-        return 0;
+        cached_head = Cursors()->head.load(std::memory_order_acquire);
+        available = static_cast<size_t>(cached_head - tail);
+        if (available == 0) {
+            return 0;
+        }
     }
     const size_t offset = static_cast<size_t>(tail % kShmRingCapacity);
     const size_t chunk = std::min({available, size - progress, kShmRingCapacity - offset});
@@ -423,14 +433,22 @@ size_t TransportShm::Consume(char* data, size_t size, size_t progress) {
 
 size_t TransportShm::SpaceAvailable() const {
     const uint64_t head = Cursors()->head.load(std::memory_order_relaxed);
-    const uint64_t tail = Cursors()->tail.load(std::memory_order_acquire);
-    return kShmRingCapacity - static_cast<size_t>(head - tail);
+    size_t room = kShmRingCapacity - static_cast<size_t>(head - cached_tail);
+    if (room == 0) {
+        cached_tail = Cursors()->tail.load(std::memory_order_acquire);
+        room = kShmRingCapacity - static_cast<size_t>(head - cached_tail);
+    }
+    return room;
 }
 
 size_t TransportShm::DataAvailable() const {
-    const uint64_t head = Cursors()->head.load(std::memory_order_acquire);
     const uint64_t tail = Cursors()->tail.load(std::memory_order_relaxed);
-    return static_cast<size_t>(head - tail);
+    size_t available = static_cast<size_t>(cached_head - tail);
+    if (available == 0) {
+        cached_head = Cursors()->head.load(std::memory_order_acquire);
+        available = static_cast<size_t>(cached_head - tail);
+    }
+    return available;
 }
 
 void TransportShm::Drain(int efd) const {

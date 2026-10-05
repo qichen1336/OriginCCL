@@ -35,7 +35,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 ### 共享内存（`TransportShm`）
 
 - 与 TCP 同构的 listener/connection 双形态：`Listen(path, 0)` + `Accept()`（被动端），`Connect(rendezvous_path, port)`（主动端，`port` 忽略）。`Listen` 的 `port` 参数无意义，`GetListenPort()` 恒返回 0。
-- 建立流程：主动端建 2 MiB 数据容量的 memfd 环 + data-ready/space-ready 两个 eventfd，用 `SOCK_SEQPACKET` + `SCM_RIGHTS` 一次性传给对端并带方向；被动端取补方向。环元数据是 cache line 分隔、单调递增的 `std::atomic<uint64_t>` head/tail（producer 写 head、consumer 写 tail，acquire/release 配对）。
+- 建立流程：主动端建 2 MiB 数据容量的 memfd 环 + data-ready/space-ready 两个 eventfd，用 `SOCK_SEQPACKET` + `SCM_RIGHTS` 一次性传给对端并带方向；被动端取补方向。环元数据是 cache line 分隔、单调递增的 `std::atomic<uint64_t>` head/tail（producer 写 head、consumer 写 tail，acquire/release 配对）。producer 缓存 tail、consumer 缓存 head，仅在缓存判断满/空时 acquire 刷新；事件模式 drain 通知后复检并刷新缓存。
 - **环光标只由主动端（建环方）初始化一次**：`MapRing(fd, initialize)` 仅在 `CreateRing` 传 `initialize=true` 时 placement-new `ShmRingCursors{}`；被动端 `Adopt` 传 `false`，只 mmap 不重写。若两端都初始化，被动端稍晚的映射会把共享 head/tail 归零，与主动端已写入/推进的光标竞争，在连接数较多（如 tree 拓扑）时表现为接收端读不到数据而活锁。这是共享内存映射的隐含约定：**谁创建谁初始化，采用者只读**。
 - 控制 socket 与数据面分开：调用方第一次阻塞 `Send`/`Recv`（即 communicator 握手）走 control socket，接收方回 1 字节 ack，双方随即关闭；之后所有操作走环。
 - 方向在此是约束：producer 只 `Send`、consumer 只 `Recv`，反向 `LOG_ERROR` + `false`。方向只约束数据面。

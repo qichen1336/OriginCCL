@@ -102,4 +102,6 @@ private:
     char* map = nullptr;
     bool connected = false;
     TransportWaitMode wait_mode = TransportWaitMode::EventDriven;
+    mutable uint64_t cached_tail = 0;
+    mutable uint64_t cached_head = 0;
 };
