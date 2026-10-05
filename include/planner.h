@@ -19,7 +19,8 @@ public:
 private:
     bool PlanCollective(Communicator& comm, const CollTask& task, CollPlan& plan) const;
     bool PlanP2pRound(Communicator& comm, const std::vector<CollTask>& tasks, int round, CollPlan& plan) const;
-    bool PrepareRound(Communicator& comm, const std::vector<CollTask>& tasks, int round) const;
+    bool PrepareRound(Communicator& comm, const std::vector<CollTask>& sends,
+                      const std::vector<CollTask>& recvs) const;
     bool ValidateP2p(const Communicator& comm, const CollTask& task) const;
     bool P2pUsable(const Communicator& comm, int peer) const;
 };

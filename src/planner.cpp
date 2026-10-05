@@ -112,7 +112,7 @@ bool Planner::PlanP2pRound(Communicator& comm, const std::vector<CollTask>& task
     if (sends.empty() && recvs.empty()) {
         return true;
     }
-    if (!PrepareRound(comm, tasks, round)) {
+    if (!PrepareRound(comm, sends, recvs)) {
         return false;
     }
     auto append = [&](const CollTask& task, int channel_id) {
@@ -199,22 +199,21 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
     return true;
 }
 
-bool Planner::PrepareRound(Communicator& comm, const std::vector<CollTask>& tasks, int round) const {
-    const int rank = comm.GetRank();
-    const int world_size = comm.GetWorldSize();
+bool Planner::PrepareRound(Communicator& comm, const std::vector<CollTask>& sends,
+                           const std::vector<CollTask>& recvs) const {
     std::vector<int> send_peers;
     std::vector<int> recv_peers;
-    for (const CollTask& task : tasks) {
-        if (!IsP2p(task.func) || P2pRoundOf(task.func, rank, task.peer, world_size) != round) {
-            continue;
-        }
-        if (!ValidateP2p(comm, task)) {
-            return false;
-        }
+    for (const CollTask& task : sends) {
         if (task.count == 0) {
             continue;
         }
-        (task.func == CollFunc::Send ? send_peers : recv_peers).push_back(task.peer);
+        send_peers.push_back(task.peer);
+    }
+    for (const CollTask& task : recvs) {
+        if (task.count == 0) {
+            continue;
+        }
+        recv_peers.push_back(task.peer);
     }
     auto dedup = [](std::vector<int>& peers) {
         std::sort(peers.begin(), peers.end());

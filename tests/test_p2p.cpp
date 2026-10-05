@@ -180,23 +180,86 @@ void CheckGroupCollective(Communicator& comm) {
 void CheckGroupMixed(Communicator& comm) {
     const int rank = comm.GetRank();
     const int world_size = comm.GetWorldSize();
-    const int next = (rank + 1) % world_size;
-    const int previous = (rank + world_size - 1) % world_size;
-    int collective_send = rank + 1;
-    int collective_recv = 0;
-    int p2p_send = rank * 10 + 3;
-    int p2p_recv = -1;
-
+    const int expected_sum = world_size * (world_size + 1) / 2;
+    int sum_send = rank + 1;
+    int sum_recv = 0;
+    int max_send = rank + 10;
+    int max_recv = 0;
+    int pair_send[2] = {rank + 1, (rank + 1) * 3};
+    int pair_recv[2] = {};
+    int gather_send = rank + 100;
+    std::vector<int> gather_recv(static_cast<size_t>(world_size), 0);
+    int reduce_send = rank + 1;
+    int reduce_recv = 0;
+    int broadcast_buffer = rank;
+    std::vector<int> scatter_send(static_cast<size_t>(world_size));
+    for (int index = 0; index < world_size; ++index) {
+        scatter_send[static_cast<size_t>(index)] = rank + index + 1;
+    }
+    int scatter_recv = 0;
+    int p2p_send[4] = {};
+    int p2p_recv[4] = {-1, -1, -1, -1};
+    for (int peer = 0; peer < world_size; ++peer) {
+        p2p_send[peer] = rank * 100 + peer;
+    }
+    const int p2p_edges[6][2] = {{0, 1}, {0, 2}, {1, 2}, {1, 3}, {2, 3}, {3, 0}};
+    int operation_count = 0;
+    auto submit_edge = [&](int source, int destination) {
+        if (rank == source) {
+            Require(comm.Send(&p2p_send[destination], 1, DataType::INT32, destination), "mixed group Send submit");
+            ++operation_count;
+        }
+        if (rank == destination) {
+            Require(comm.Recv(&p2p_recv[source], 1, DataType::INT32, source), "mixed group Recv submit");
+            ++operation_count;
+        }
+    };
     comm.GroupStart();
-    Require(comm.AllReduce(&collective_send, &collective_recv, 1, DataType::INT32, ReduceOp::SUM),
+    Require(comm.AllReduce(&sum_send, &sum_recv, 1, DataType::INT32, ReduceOp::SUM),
             "mixed group AllReduce submit");
-    Require(comm.Send(&p2p_send, 1, DataType::INT32, next), "mixed group Send submit");
-    Require(comm.Recv(&p2p_recv, 1, DataType::INT32, previous), "mixed group Recv submit");
+    ++operation_count;
+    submit_edge(p2p_edges[0][0], p2p_edges[0][1]);
+    Require(comm.AllGather(&gather_send, gather_recv.data(), 1, DataType::INT32), "mixed group AllGather submit");
+    ++operation_count;
+    submit_edge(p2p_edges[1][0], p2p_edges[1][1]);
+    Require(comm.Reduce(&reduce_send, rank == 1 ? &reduce_recv : nullptr, 1, DataType::INT32, ReduceOp::SUM, 1),
+            "mixed group Reduce submit");
+    ++operation_count;
+    submit_edge(p2p_edges[2][0], p2p_edges[2][1]);
+    Require(comm.Broadcast(&broadcast_buffer, 1, DataType::INT32, 2), "mixed group Broadcast submit");
+    ++operation_count;
+    submit_edge(p2p_edges[3][0], p2p_edges[3][1]);
+    Require(comm.AllReduce(pair_send, pair_recv, 2, DataType::INT32, ReduceOp::SUM),
+            "mixed group pair AllReduce submit");
+    ++operation_count;
+    submit_edge(p2p_edges[4][0], p2p_edges[4][1]);
+    Require(comm.ReduceScatter(scatter_send.data(), &scatter_recv, 1, DataType::INT32, ReduceOp::SUM),
+            "mixed group ReduceScatter submit");
+    ++operation_count;
+    submit_edge(p2p_edges[5][0], p2p_edges[5][1]);
+    Require(comm.AllReduce(&max_send, &max_recv, 1, DataType::INT32, ReduceOp::MAX),
+            "mixed group max AllReduce submit");
+    ++operation_count;
+    Require(operation_count == 10, "mixed group must submit ten operations per rank");
     Require(comm.GroupEnd(), "mixed group execution");
 
-    const int expected_sum = world_size * (world_size + 1) / 2;
-    Require(collective_recv == expected_sum, "mixed group AllReduce result");
-    Require(p2p_recv == previous * 10 + 3, "mixed group P2P result");
+    Require(sum_recv == expected_sum, "mixed group AllReduce result");
+    Require(max_recv == world_size + 9, "mixed group max AllReduce result");
+    Require(pair_recv[0] == expected_sum && pair_recv[1] == expected_sum * 3,
+            "mixed group pair AllReduce result");
+    for (int source = 0; source < world_size; ++source) {
+        Require(gather_recv[static_cast<size_t>(source)] == source + 100, "mixed group AllGather result");
+    }
+    if (rank == 1) {
+        Require(reduce_recv == expected_sum, "mixed group Reduce result");
+    }
+    Require(broadcast_buffer == 2, "mixed group Broadcast result");
+    Require(scatter_recv == expected_sum + world_size * rank, "mixed group ReduceScatter result");
+    for (const auto& edge : p2p_edges) {
+        if (rank == edge[1]) {
+            Require(p2p_recv[edge[0]] == edge[0] * 100 + rank, "mixed group P2P result");
+        }
+    }
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
