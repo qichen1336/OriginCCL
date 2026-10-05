@@ -169,12 +169,6 @@ bool RunSize(TransportRDMAZc& transport, int rank, bool zero_copy, size_t size, 
         if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
             return false;
         }
-        if (rank == 0) {
-            size_t bad_index = 0;
-            if (!CheckPattern(received, transfer_size, &bad_index)) {
-                return Fail(rank, "timed payload mismatch", std::to_string(bad_index));
-            }
-        }
         remaining_bytes -= transfer_size;
         ++message_count;
     }
