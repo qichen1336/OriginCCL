@@ -88,6 +88,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - `GetFd()` 返回的 fd 生命周期由 transport 管理，executor 只注册/注销。channel 边 send/recv 是各自独立 transport，fd 必然不同（含 2 rank `prev == next` 退化情形，见 [communicator.md](communicator.md)）。
 - **共享内存失败即初始化失败**，不得自动回退 TCP（`OCCL_DISABLE_SHM=1` 是显式选择）。RDMA 同理不得自动回退（`OCCL_DISABLE_RDMA=1` 是显式选择）。
 - **RDMA 接收队列必须预投递**：`WRITE_WITH_IMM` 消耗 RQ WQE，少投一个会 RNR，环形缓冲无法建立。
+- **零拷贝的独立 QP 靠 `rnr_retry = 7` 容忍惰性投递**：基类 RQ 预投整池，零拷贝的 recv WR 只在 `TryRecv` 里按窗口投，报文可能早于 WR 到达。RC 建链里 REP 携带的 `rnr_retry` 配置的是**主动端** QP，而零拷贝的发送方在连接一上正是主动端，所以 accept 侧也必须给 `retry_count`/`rnr_retry_count` 置 7（IB 里 7 = 无限重试），不能留零值；漏掉会确定性 `IBV_WC_RNR_RETRY_EXC_ERR`（硬件靠延迟掩盖，软 RoCE 立刻暴露）。
 - **零拷贝子类的独立 QP 是接收队列隔离，不是收发配对**：调用方保证两端操作配对且 `size` 相同，但基类 QP 的 RQ 小缓冲池仍会抢走大块 `SEND` 的匹配，所以大块必须走独立 QP。
 - **RDMA 槽位复用只保留 credit 一道门控**：credit 已蕴含「本地已读完该槽」，补一道本地 send CQE（`local_completed`）只会收紧窗口、不会更安全。
 - **RDMA `private_data` 保持裸 `Wire{base_addr, rkey}`**：连接合法性由 CM 保证，无 magic 校验。

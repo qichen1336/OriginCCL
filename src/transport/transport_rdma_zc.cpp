@@ -126,6 +126,8 @@ bool TransportRDMAZc::FinalizeConnection() {
             return false;
         }
         rdma_conn_param parameter{};
+        parameter.retry_count = 7;
+        parameter.rnr_retry_count = 7;
         if (rdma_accept(zc_id, &parameter) != 0) {
             LOG_ERROR("Failed to accept the zero-copy connection: {}", strerror(errno));
             return false;
