@@ -289,6 +289,10 @@ bool TransportRDMAZc::TrySend(const void* data, size_t size, size_t* progress, b
     if (size < threshold_) {
         return TransportRDMA::TrySend(data, size, progress, done);
     }
+    if (!IsTransferSizeSupported(size)) {
+        LOG_ERROR("The zero-copy send size {} exceeds the {} byte limit", size, kRdmaZcMaxTransferSize);
+        return false;
+    }
     if (!connected || !IsProducer()) {
         LOG_ERROR("The RDMA endpoint is not a connected producer, cannot send");
         return false;
@@ -324,6 +328,10 @@ bool TransportRDMAZc::TrySend(const void* data, size_t size, size_t* progress, b
 bool TransportRDMAZc::TryRecv(void* data, size_t size, size_t* progress, bool* done) {
     if (size < threshold_) {
         return TransportRDMA::TryRecv(data, size, progress, done);
+    }
+    if (!IsTransferSizeSupported(size)) {
+        LOG_ERROR("The zero-copy receive size {} exceeds the {} byte limit", size, kRdmaZcMaxTransferSize);
+        return false;
     }
     if (!connected || IsProducer()) {
         LOG_ERROR("The RDMA endpoint is not a connected consumer, cannot receive");

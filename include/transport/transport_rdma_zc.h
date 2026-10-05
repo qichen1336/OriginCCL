@@ -9,12 +9,17 @@
 
 constexpr size_t kRdmaZcThreshold = 16 * 1024 * 1024;
 constexpr size_t kRdmaZcChunk = 16 * 1024 * 1024;
+constexpr size_t kRdmaZcMaxTransferSize = size_t{1} << 30;
 constexpr uint32_t kRdmaZcWindow = 8;
 
 class TransportRDMAZc : public TransportRDMA {
 public:
     explicit TransportRDMAZc(size_t threshold = kRdmaZcThreshold);
     ~TransportRDMAZc() override;
+
+    static constexpr bool IsTransferSizeSupported(size_t size) {
+        return size <= kRdmaZcMaxTransferSize;
+    }
 
     bool TrySend(const void* data, size_t size, size_t* progress, bool* done) override;
     bool TryRecv(void* data, size_t size, size_t* progress, bool* done) override;

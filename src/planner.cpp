@@ -272,6 +272,19 @@ bool Planner::ValidateP2p(const Communicator& comm, const CollTask& task) const 
         LOG_ERROR("Rank {}: Invalid P2P buffer, dtype or count", comm.GetRank());
         return false;
     }
+    if (task.count != 0) {
+        const auto& local_node = comm.all_nodes_[static_cast<size_t>(comm.GetRank())];
+        const auto& peer_node = comm.all_nodes_[static_cast<size_t>(task.peer)];
+        const bool same_machine = local_node.hostname == peer_node.hostname;
+        const bool use_shm = same_machine && comm.use_shm_;
+        const bool use_rdma_zc = !use_shm && (!same_machine || comm.rdma_ready_);
+        const size_t bytes = task.count * type_size;
+        if (use_rdma_zc && !TransportRDMAZc::IsTransferSizeSupported(bytes)) {
+            LOG_ERROR("Rank {}: P2P size {} exceeds the RDMA_ZC limit of {} bytes", comm.GetRank(), bytes,
+                      kRdmaZcMaxTransferSize);
+            return false;
+        }
+    }
     return true;
 }
 

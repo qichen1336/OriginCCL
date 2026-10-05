@@ -18,6 +18,9 @@ constexpr int kMaxIterations = 400000;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c; // "OCCL"
 
+static_assert(TransportRDMAZc::IsTransferSizeSupported(kRdmaZcMaxTransferSize));
+static_assert(!TransportRDMAZc::IsTransferSizeSupported(kRdmaZcMaxTransferSize + 1));
+
 struct ControlMessage {
     uint32_t magic;
     int32_t role;
