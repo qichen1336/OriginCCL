@@ -215,8 +215,7 @@ void CheckGroupMixed(Communicator& comm) {
         }
     };
     comm.GroupStart();
-    Require(comm.AllReduce(&sum_send, &sum_recv, 1, DataType::INT32, ReduceOp::SUM),
-            "mixed group AllReduce submit");
+    Require(comm.AllReduce(&sum_send, &sum_recv, 1, DataType::INT32, ReduceOp::SUM), "mixed group AllReduce submit");
     ++operation_count;
     submit_edge(p2p_edges[0][0], p2p_edges[0][1]);
     Require(comm.AllGather(&gather_send, gather_recv.data(), 1, DataType::INT32), "mixed group AllGather submit");
@@ -245,8 +244,7 @@ void CheckGroupMixed(Communicator& comm) {
 
     Require(sum_recv == expected_sum, "mixed group AllReduce result");
     Require(max_recv == world_size + 9, "mixed group max AllReduce result");
-    Require(pair_recv[0] == expected_sum && pair_recv[1] == expected_sum * 3,
-            "mixed group pair AllReduce result");
+    Require(pair_recv[0] == expected_sum && pair_recv[1] == expected_sum * 3, "mixed group pair AllReduce result");
     for (int source = 0; source < world_size; ++source) {
         Require(gather_recv[static_cast<size_t>(source)] == source + 100, "mixed group AllGather result");
     }
