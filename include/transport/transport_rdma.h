@@ -46,6 +46,9 @@ public:
 
     int GetFd() const override;
     uint32_t GetPollEvents() const override;
+    void SetWaitMode(TransportWaitMode mode) override {
+        wait_mode = mode;
+    }
 
     void Close() override;
     bool IsConnected() const override {
@@ -82,6 +85,7 @@ protected:
     ibv_cq* cq = nullptr;
     Wire peer{};
     bool connected = false;
+    TransportWaitMode wait_mode = TransportWaitMode::EventDriven;
 
 private:
     char* SlotData(size_t slot) const {
@@ -99,6 +103,9 @@ private:
     bool PostControlSend(size_t length);
     bool PostWrite(size_t slot, size_t length);
     bool PostCredit(size_t slots);
+    bool ProcessCompletionEvents();
+    bool DrainCompletionEvents(bool rearm);
+    bool PollCompletionQueue();
 
     bool WaitFlag(bool& flag);
     void CloseCm();

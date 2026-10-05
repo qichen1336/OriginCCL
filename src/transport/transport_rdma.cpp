@@ -467,22 +467,38 @@ bool TransportRDMA::PostCredit(size_t slots) {
 }
 
 bool TransportRDMA::ProcessCompletions() {
-    if (comp_channel != nullptr) {
-        while (WaitReadable(comp_channel->fd, 0)) {
-            ibv_cq* event_cq = nullptr;
-            void* context = nullptr;
-            if (ibv_get_cq_event(comp_channel, &event_cq, &context) != 0) {
-                LOG_ERROR("Failed to read an RDMA completion event: {}", ErrnoText());
-                return false;
-            }
-            ibv_ack_cq_events(event_cq, 1);
-            if (ibv_req_notify_cq(event_cq, 0) != 0) {
-                LOG_ERROR("Failed to re-arm the RDMA completion queue: {}", ErrnoText());
-                return false;
-            }
-        }
+    if (wait_mode == TransportWaitMode::EventDriven && !ProcessCompletionEvents()) {
+        return false;
     }
 
+    return PollCompletionQueue();
+}
+
+bool TransportRDMA::ProcessCompletionEvents() {
+    return DrainCompletionEvents(true);
+}
+
+bool TransportRDMA::DrainCompletionEvents(bool rearm) {
+    if (comp_channel == nullptr) {
+        return true;
+    }
+    while (WaitReadable(comp_channel->fd, 0)) {
+        ibv_cq* event_cq = nullptr;
+        void* context = nullptr;
+        if (ibv_get_cq_event(comp_channel, &event_cq, &context) != 0) {
+            LOG_ERROR("Failed to read an RDMA completion event: {}", ErrnoText());
+            return false;
+        }
+        ibv_ack_cq_events(event_cq, 1);
+        if (rearm && ibv_req_notify_cq(event_cq, 0) != 0) {
+            LOG_ERROR("Failed to re-arm the RDMA completion queue: {}", ErrnoText());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool TransportRDMA::PollCompletionQueue() {
     ibv_wc completions[16];
     for (;;) {
         const int count = ibv_poll_cq(cq, 16, completions);
@@ -713,6 +729,7 @@ void TransportRDMA::CloseResources() {
     if (cm_id != nullptr && cm_id->qp != nullptr) {
         rdma_destroy_qp(cm_id);
     }
+    DrainCompletionEvents(false);
     if (mr != nullptr) {
         ibv_dereg_mr(mr);
         mr = nullptr;
