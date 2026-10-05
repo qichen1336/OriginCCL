@@ -189,10 +189,37 @@ size_t TransportRDMAZc::ZcChunkLength(size_t index) const {
     return std::min(zc_chunk, zc_size - index * zc_chunk);
 }
 
-bool TransportRDMAZc::BeginZcSend(const void* data, size_t size) {
-    zc_mr = ibv_reg_mr(pd, const_cast<void*>(data), size, IBV_ACCESS_LOCAL_WRITE);
+// The MR is kept registered across transfers: steady-state messages reuse the same buffer, so
+// re-registering every time would dominate the cost of the transfer itself. A new buffer, size
+// or direction replaces it.
+bool TransportRDMAZc::AcquireZcMr(void* buffer, size_t size, bool send) {
+    if (zc_mr != nullptr && zc_mr_buffer == buffer && zc_mr_size == size && zc_mr_send == send) {
+        return true;
+    }
+    DropZcMr();
+    zc_mr = ibv_reg_mr(pd, buffer, size, IBV_ACCESS_LOCAL_WRITE);
     if (zc_mr == nullptr) {
-        LOG_ERROR("Failed to register the zero-copy send buffer: {}", strerror(errno));
+        LOG_ERROR("Failed to register the zero-copy buffer: {}", strerror(errno));
+        return false;
+    }
+    zc_mr_buffer = buffer;
+    zc_mr_size = size;
+    zc_mr_send = send;
+    return true;
+}
+
+void TransportRDMAZc::DropZcMr() {
+    if (zc_mr != nullptr) {
+        ibv_dereg_mr(zc_mr);
+        zc_mr = nullptr;
+    }
+    zc_mr_buffer = nullptr;
+    zc_mr_size = 0;
+    zc_mr_send = false;
+}
+
+bool TransportRDMAZc::BeginZcSend(const void* data, size_t size) {
+    if (!AcquireZcMr(const_cast<void*>(data), size, true)) {
         return false;
     }
     zc_send_data = static_cast<const char*>(data);
@@ -203,9 +230,7 @@ bool TransportRDMAZc::BeginZcSend(const void* data, size_t size) {
 }
 
 bool TransportRDMAZc::BeginZcRecv(void* data, size_t size) {
-    zc_mr = ibv_reg_mr(pd, data, size, IBV_ACCESS_LOCAL_WRITE);
-    if (zc_mr == nullptr) {
-        LOG_ERROR("Failed to register the zero-copy receive buffer: {}", strerror(errno));
+    if (!AcquireZcMr(data, size, false)) {
         return false;
     }
     zc_recv_data = static_cast<char*>(data);
@@ -248,10 +273,6 @@ bool TransportRDMAZc::PostZcRecv(size_t index) {
 }
 
 void TransportRDMAZc::ReleaseZc() {
-    if (zc_mr != nullptr) {
-        ibv_dereg_mr(zc_mr);
-        zc_mr = nullptr;
-    }
     zc_send_data = nullptr;
     zc_recv_data = nullptr;
     zc_size = 0;
@@ -354,6 +375,7 @@ void TransportRDMAZc::CloseZc() {
 
 void TransportRDMAZc::CloseResources() {
     ReleaseZc();
+    DropZcMr();
     CloseZc();
     TransportRDMA::CloseResources();
 }

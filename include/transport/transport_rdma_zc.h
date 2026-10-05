@@ -38,6 +38,8 @@ private:
     void CloseZc();
 
     size_t ZcChunkLength(size_t index) const;
+    bool AcquireZcMr(void* buffer, size_t size, bool send);
+    void DropZcMr();
     bool BeginZcSend(const void* data, size_t size);
     bool BeginZcRecv(void* data, size_t size);
     bool PostZcSend(size_t index);
@@ -51,6 +53,9 @@ private:
     uint16_t zc_port = 0;
     ibv_qp* zc_qp = nullptr;
     ibv_mr* zc_mr = nullptr;
+    void* zc_mr_buffer = nullptr;
+    size_t zc_mr_size = 0;
+    bool zc_mr_send = false;
     const char* zc_send_data = nullptr;
     char* zc_recv_data = nullptr;
     size_t zc_size = 0;
