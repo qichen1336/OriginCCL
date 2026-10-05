@@ -22,7 +22,7 @@
 
 # 实现原理
 
-- **P2P 规划**：`Plan` 开头的 `ValidateP2p` 检查 peer 范围且不能是自己，非空消息检查 buffer 与字节数；合法零长度不建连。每个轮次用 `PrepareRound` 取该轮去重后的收发 peer：双向都需建连时并行开一个 `ConnectP2p` 线程与一个 `AcceptP2p` 线程同时连接，join 后再组装任务；只缺一个方向时在该线程内联完成。发送连接写 `channel 0` 的 `send_p2p[peer]`，接收连接写 `channel 1` 的 `recv_p2p[peer]`（非目标来源只缓存连接）。成功后每个任务生成一个完整长度的单向 `PlanTask`，绑定 `TopologyP2p`，不切片、不设置流水 chunk，并追加至统一 plan 的对应 channel。
+- **P2P 规划**：`Plan` 开头的 `ValidateP2p` 检查 peer 范围且不能是自己，非空消息检查 buffer 与字节数；合法零长度不建连。每个轮次用 `PrepareRound` 取该轮去重后的收发 peer，并先剔除已缓存连接：双向都有新连接时并行开一个 `ConnectP2p` 线程与一个 `AcceptP2p` 线程同时连接，join 后再组装任务；只有一侧有新连接时在当前线程内联完成；两侧连接均已缓存则不启动建连线程。发送连接写 `channel 0` 的 `send_p2p[peer]`，接收连接写 `channel 1` 的 `recv_p2p[peer]`（非目标来源只缓存连接）。成功后每个任务生成一个完整长度的单向 `PlanTask`，绑定 `TopologyP2p`，不切片、不设置流水 chunk，并追加至统一 plan 的对应 channel。
 - **P2P 建连由 planner 执行**：communicator 持有节点表和独立 P2P listener，Planner 通过 friend 访问；Send 主动连接并发送本 rank 握手，Recv 轮询 listener、接入并按来源 rank 存入 channel 1 的 `recv_p2p`，直到目标连接就绪。Plan 在 executor 启动前按轮次准备全部连接，失败经 Plan 的 false 上报。
 - **P2P 传输选择**：同 hostname 且 SHM 启用时用 SHM；同机禁用 SHM 时沿用集合的全局 RDMA/TCP 网络选择（P2P 的 RDMA 使用 RDMA_ZC）。不同 hostname 必须用双方已公布端点的 RDMA_ZC，任一端不可用直接失败，不回退 TCP。无设备不妨碍集合通信初始化或零长度 P2P。
 - `PlanTask.chunk_size` 语义按拓扑解释：ring = `ceil(elem_count / world_size)`（AllReduce 块划分）；tree = `kChunkBytes / type_size`（流水粒度，逐 chunk 推进）。

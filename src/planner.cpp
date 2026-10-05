@@ -313,6 +313,17 @@ bool Planner::PrepareRound(Communicator& comm, const std::vector<CollTask>& send
     };
     dedup(send_peers);
     dedup(recv_peers);
+    auto remove_connected = [](std::vector<int>& peers, const auto& connectors) {
+        peers.erase(
+            std::remove_if(peers.begin(), peers.end(),
+                           [&](int peer) { return connectors[static_cast<size_t>(peer)].transport != nullptr; }),
+            peers.end());
+    };
+    remove_connected(send_peers, comm.GetChannel(kP2pSendChannel).send_p2p);
+    remove_connected(recv_peers, comm.GetChannel(kP2pRecvChannel).recv_p2p);
+    if (send_peers.empty() && recv_peers.empty()) {
+        return true;
+    }
     if (!send_peers.empty() && !recv_peers.empty()) {
         std::atomic<bool> error(false);
         std::thread connect_thread([&]() {
