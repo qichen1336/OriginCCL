@@ -11,7 +11,7 @@ constexpr uint32_t kRdmaZcWindow = 8;
 
 class TransportRDMAZc : public TransportRDMA {
 public:
-    TransportRDMAZc();
+    explicit TransportRDMAZc(size_t threshold = kRdmaZcThreshold);
     ~TransportRDMAZc() override;
 
     bool TrySend(const void* data, size_t size, size_t* progress, bool* done) override;
@@ -38,6 +38,7 @@ private:
     bool PostZcRecv(size_t index);
     void ReleaseZc();
 
+    size_t threshold_;
     ibv_qp* zc_qp = nullptr;
     ibv_mr* zc_mr = nullptr;
     const char* zc_send_data = nullptr;

@@ -44,3 +44,6 @@ target_link_libraries(test_transport_rdma occl_transport_support)
 
 add_executable(test_transport_rdma_zc test_transport_rdma_zc.cpp)
 target_link_libraries(test_transport_rdma_zc occl_transport_support)
+
+add_executable(test_rdma_zc_benchmark test_rdma_zc_benchmark.cpp)
+target_link_libraries(test_rdma_zc_benchmark occl_transport_support)

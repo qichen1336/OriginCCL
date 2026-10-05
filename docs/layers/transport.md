@@ -62,11 +62,18 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 独立 QP 不是为收发大小不一致准备的（调用方保证两次操作配对且大小相同），而是为隔离接收队列：基类 QP 的 RQ 预投了 64 个 256 B 的 credit 池，大块 `SEND` 会匹配队首的小缓冲。独立 QP 只投递用户缓冲，两者互不干扰。
 - 独立 QP 是普通 `ibv_create_qp`，CM 只驱动它自己创建的 QP，因此对端 QPN 走 private data，路径属性由 `rdma_init_qp_attr` 提供。注意 `rdma_init_qp_attr` 会整段覆盖传入的 `ibv_qp_attr`（含目的 QPN），所以它返回后必须重新覆盖 `dest_qp_num`/`rq_psn`/PSN/重试等字段再 `ibv_modify_qp`。
 - 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单 chunk 一次 WR，超过则多 WR；发送窗口 `kRdmaZcWindow` = 8，post 与补投在同一调用内完成。
-- 对外 `progress` 为全有或全无：`kRdmaZcChunk` 覆盖（普通尺寸一个 WR）时 `{0, size}`；超单 WR 限制分块时可按完成字节推进，但绝不报告只 post 未完成的字节。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
+- 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：首次推进时 `ibv_reg_mr`，本次操作 `done` 后 `ibv_dereg_mr`，不缓存；发送/接收各一个在飞的 MR。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，因此就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
 - 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 16 MiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
+
+### RDMA 零拷贝阈值 benchmark
+
+- 独立性能程序 `tests/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
+- 对每种路径、每个尺寸预热 3 次，再累计传输 45 GB 数据，测试 `32 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`。copy 通过限定调用基类 `TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。生产默认阈值仍为 16 MiB。
+- 表格输出接收端、发送端总耗时与基于接收端总耗时计算的有效 GB/s；不是分位数统计。发送端的完成语义不同：copy 表示已提交到本地 ring，ZC 则等待发送 CQE；发送端数据仅作辅助观察。计时包含每条消息的 payload 校验、MR 注册/注销和就绪等待，不包含连接建立及预热。
+- 结果受 CPU/NUMA 与 RDMA NIC 亲和性、系统负载及锁页限制影响。应将两个 rank 绑定到靠近 NIC 的 CPU/NUMA 节点，并确保 `ulimit -l` 足以锁定最大 ZC 消息缓冲区；不同机器上的结果不应直接视为同一阈值结论。
 
 # 隐含约定
 

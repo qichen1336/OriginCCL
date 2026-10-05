@@ -8,7 +8,7 @@ namespace {
 constexpr size_t kZcRecvBase = kRdmaRecvPool;
 }
 
-TransportRDMAZc::TransportRDMAZc() {}
+TransportRDMAZc::TransportRDMAZc(size_t threshold) : threshold_(threshold) {}
 
 TransportRDMAZc::~TransportRDMAZc() {
     Close();
@@ -110,7 +110,7 @@ bool TransportRDMAZc::FinalizeConnection() {
 }
 
 std::shared_ptr<TransportRDMA> TransportRDMAZc::MakePeer() {
-    return std::make_shared<TransportRDMAZc>();
+    return std::make_shared<TransportRDMAZc>(threshold_);
 }
 
 bool TransportRDMAZc::HandleCompletion(const ibv_wc& completion) {
@@ -207,7 +207,7 @@ void TransportRDMAZc::ReleaseZc() {
 }
 
 bool TransportRDMAZc::TrySend(const void* data, size_t size, size_t* progress, bool* done) {
-    if (size < kRdmaZcThreshold) {
+    if (size < threshold_) {
         return TransportRDMA::TrySend(data, size, progress, done);
     }
     if (!connected || !IsProducer()) {
@@ -243,7 +243,7 @@ bool TransportRDMAZc::TrySend(const void* data, size_t size, size_t* progress, b
 }
 
 bool TransportRDMAZc::TryRecv(void* data, size_t size, size_t* progress, bool* done) {
-    if (size < kRdmaZcThreshold) {
+    if (size < threshold_) {
         return TransportRDMA::TryRecv(data, size, progress, done);
     }
     if (!connected || IsProducer()) {
