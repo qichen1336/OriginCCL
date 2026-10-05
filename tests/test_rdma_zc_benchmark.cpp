@@ -163,6 +163,16 @@ bool RunSize(TransportRDMAZc& transport, int rank, bool zero_copy, size_t size, 
     TransferCounts timed_counts;
     uint64_t remaining_bytes = kBytesPerCase;
     uint64_t message_count = 0;
+    // The ECS link bursts above its sustained rate until the credits drain, so the first half of
+    // every case is transferred untimed; the table reports the sustained rate, not a burst average.
+    const uint64_t timed_bytes = kBytesPerCase - kBytesPerCase / 2;
+    while (remaining_bytes > timed_bytes) {
+        const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes - timed_bytes));
+        if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
+            return false;
+        }
+        remaining_bytes -= transfer_size;
+    }
     const auto start = Clock::now();
     while (remaining_bytes > 0) {
         const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
@@ -184,9 +194,9 @@ bool RunSize(TransportRDMAZc& transport, int rank, bool zero_copy, size_t size, 
     if (rank == 0) {
         const double receiver_seconds = static_cast<double>(gathered_elapsed_ns[0]) / 1e9;
         const double sender_seconds = static_cast<double>(gathered_elapsed_ns[1]) / 1e9;
-        const double gigabytes_per_second = static_cast<double>(kBytesPerCase) / receiver_seconds / 1e9;
+        const double gigabytes_per_second = static_cast<double>(timed_bytes) / receiver_seconds / 1e9;
         fmt::print("{:<4} {:>10} {:>12} {:>8.3f} {:>9.2f} {:>9.2f} {:>9} {:>7} {:>5}\n",
-                   zero_copy ? "ZC" : "copy", size, kBytesPerCase, gigabytes_per_second,
+                   zero_copy ? "ZC" : "copy", size, timed_bytes, gigabytes_per_second,
                    receiver_seconds, sender_seconds, message_count, total_counts[0], total_counts[1]);
     }
     MPI_Barrier(MPI_COMM_WORLD);

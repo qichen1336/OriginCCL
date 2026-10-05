@@ -72,7 +72,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 
 - 独立性能程序 `tests/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
 - 对每种路径、每个尺寸预热 3 次，再累计传输 45 GB 数据，测试 `32 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`。copy 通过限定调用基类 `TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。生产默认阈值仍为 16 MiB。
-- 表格输出接收端、发送端总耗时与基于接收端总耗时计算的有效 GB/s；不是分位数统计。发送端的完成语义不同：copy 表示已提交到本地 ring，ZC 则等待发送 CQE；发送端数据仅作辅助观察。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输；正确性由预热阶段校验保证。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。
+- 表格输出接收端、发送端总耗时与基于接收端总耗时计算的有效 GB/s；不是分位数统计。**每档前一半字节不计时**（ECS 等虚拟网络会突发高于标称带宽，只有跑满 credit 池后才落到持续带宽），`bytes` 列是计时的字节数，即该档有效吞吐是持续值而非突发均值。发送端的完成语义不同：copy 表示已提交到本地 ring，ZC 则等待发送 CQE；发送端 数据仅作辅助观察。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输；正确性由预热阶段校验保证。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。
 - 结果受 CPU/NUMA 与 RDMA NIC 亲和性、系统负载及锁页限制影响。应将两个 rank 绑定到靠近 NIC 的 CPU/NUMA 节点，并确保 `ulimit -l` 足以锁定最大 ZC 消息缓冲区；不同机器上的结果不应直接视为同一阈值结论。
 
 # 隐含约定
