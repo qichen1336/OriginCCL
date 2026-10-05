@@ -22,9 +22,10 @@ constexpr int kWarmups = 3;
 constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c;
-constexpr size_t kMessageSizes[] = {32 * 1024, 1 * 1024 * 1024, 5 * 1024 * 1024,
-                                    16 * 1024 * 1024 - 1, 16 * 1024 * 1024, 17 * 1024 * 1024,
-                                    32 * 1024 * 1024, 48 * 1024 * 1024};
+constexpr size_t kMessageSizes[] = {32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024,
+                                    1 * 1024 * 1024, 5 * 1024 * 1024, 16 * 1024 * 1024 - 1,
+                                    16 * 1024 * 1024, 17 * 1024 * 1024, 32 * 1024 * 1024,
+                                    48 * 1024 * 1024};
 
 struct ControlMessage {
     uint32_t magic;
