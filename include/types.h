@@ -136,4 +136,5 @@ struct CollPlan {
     }
 
     std::vector<ChannelPlan> channels;
+    std::vector<PlanTask> collectives;
 };

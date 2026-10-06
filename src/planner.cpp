@@ -162,7 +162,7 @@ bool Planner::SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) 
     return true;
 }
 
-bool Planner::Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const {
+bool Planner::Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan, bool preempt) const {
     for (const CollTask& task : tasks) {
         if (IsP2p(task.func)) {
             if (!ValidateP2p(comm, task)) {
@@ -178,9 +178,23 @@ bool Planner::Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollP
         if (IsP2p(task.func)) {
             continue;
         }
-        if (!PlanCollective(comm, task, plan)) {
+        std::vector<PlanTask> slices;
+        if (!PlanCollectiveSlices(comm, task, slices)) {
             return false;
         }
+        if (preempt) {
+            for (PlanTask& slice : slices) {
+                plan.collectives.push_back(std::move(slice));
+            }
+        } else {
+            for (PlanTask& slice : slices) {
+                const int channel_id = slice.channel_id;
+                plan.channels[static_cast<size_t>(channel_id)].tasks.push_back(std::move(slice));
+            }
+        }
+    }
+    if (preempt) {
+        return true;
     }
     for (int round = 1; round < comm.GetWorldSize(); ++round) {
         if (!PlanP2pRound(comm, tasks, round, plan)) {
@@ -231,7 +245,7 @@ bool Planner::PlanP2pRound(Communicator& comm, const std::vector<CollTask>& task
     return true;
 }
 
-bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan& plan) const {
+bool Planner::PlanCollectiveSlices(Communicator& comm, const CollTask& task, std::vector<PlanTask>& slices) const {
     size_t type_size = Utils::GetDataTypeSize(task.dtype);
     size_t total_bytes = task.count * type_size;
     int max_channels = std::max(comm.GetNChannels(), 1);
@@ -266,7 +280,6 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
         }
         size_t elem_count = channel_bytes / type_size;
         const int channel_id = c % max_channels;
-        ChannelPlan& channel = plan.channels[static_cast<size_t>(channel_id)];
         Channel& comm_channel = comm.GetChannel(channel_id);
         PlanTask plantask;
         plantask.func = task.func;
@@ -285,7 +298,7 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
                                        : (elem_count + static_cast<size_t>(plantask.world_size) - 1) /
                                              static_cast<size_t>(plantask.world_size);
         plantask.topology->FillTransports(comm_channel, plantask);
-        channel.tasks.push_back(std::move(plantask));
+        slices.push_back(std::move(plantask));
         offset += elem_count;
     }
     return true;

@@ -38,6 +38,7 @@ set(ORIGIN_CCL_SOURCES
     src/bootstrap.cpp
     src/planner.cpp
     src/executor/multi_thread_executor.cpp
+    src/executor/preempt_multi_thread_executor.cpp
     src/executor/epoll_executor.cpp
     src/executor/polling_executor.cpp
     src/executor/reactor_executor.cpp

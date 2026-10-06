@@ -6,7 +6,8 @@
 
 - `CollTask` 表达五种 collective 与 Send/Recv 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`、`peer`。peer 仅用于 P2P，无根操作忽略 root，非归约操作忽略 op。
 - `Planner::SortTasks` 与 `Planner::Plan(comm, tasks, plan)` 分别对一个任务批次稳定排序、将批次中全部集合与 P2P 任务组装到一个 `CollPlan`。Plan 先切片集合任务，再按轮次准备 P2P 连接并把任务追加到固定方向 channel。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
-- **排序规则**：集合在前，按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序（无效维度取 0）；P2P 在后，按轮次升序。轮次由 planner 推导：`Send` 到 `p` 的轮次是 `world_size - (p-rank+world_size)%world_size`，`Recv` 自 `p` 的轮次是 `world_size - (rank-p+world_size)%world_size`，两端对同一消息得到同一轮次编号。同轮内 `Send` 先于 `Recv`、同方向按 peer 稳定排序。
+- **排序规则**：集合在前，按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序（无效维度取 0）；P2P 在后，按轮次升序。轮次由 planner 推导：`Send` 到 `p` 的轮次是 `world_size - (p-rank+world_size)%world_size`，`Recv` 自 `p` 的轮次是 `world_size - (rank-p+world_size)%world_size`，两端对同一消息得到同一轮次编号。同轮内 `Send` 先于 `Recv`、同方向按 peer 稳定排序。该规则只依赖任务内容，因此同 key 集合任务的相对顺序在各 rank 上一致。
+- **两种计划形态**：`Plan(comm, tasks, plan, preempt=false)` 默认把切片按 `n_used` 个连续环绕 channel 摊入 `plan.channels`；`preempt=true`（纯集合 Group 且选了 preempt executor）则把同一批切片按规范顺序平铺进 `plan.collectives`，不摊入任何 channel，由 executor 在运行期把 slice 重绑到某条 lane。切片内容不依赖 channel 号，这是运行期改绑的前提。
 - **channel 分配**：每个集合任务都从 channel 0 开始，用 `n_used` 个连续环绕物理 channel；多个任务可排入同一 channel 的 FIFO 队列。P2P 固定 `Send`→channel 0、`Recv`→channel 1。
 - **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce / ReduceScatter / AllGather 永远 ring；只有 AllReduce 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。tree 仅实现 AllReduce（见 [topology.md](topology.md)）。
 - `PlanTask` 显式携带该 slice 的 send/recv 地址、元素数、dtype、reduce op、rank/world size、root、peer、rank_stride、topology 指针、**所属 channel 的 `channel_id`**、**对应 channel 的 send/recv transport 向量**。
@@ -18,7 +19,7 @@
 | 文件 | 职责 |
 |------|------|
 | `include/planner.h` / `src/planner.cpp` | `CollTask` → `CollPlan` 切片与组装；transport 向量经 `Topology::FillTransports` 填充 |
-| `include/types.h` | 核心数据模型：`CommConfig`、`NodeInfo`、`CollTask`、`CollEvent`、`CollOpState`、`PlanTask`（含 transport 向量与 `state`）、`ChannelPlan`、`CollPlan` |
+| `include/types.h` | 核心数据模型：`CommConfig`、`NodeInfo`、`CollTask`、`CollEvent`、`CollOpState`、`PlanTask`（含 transport 向量与 `state`）、`ChannelPlan`、`CollPlan`（含 `channels` 与 preempt 的 `collectives`） |
 
 # 实现原理
 

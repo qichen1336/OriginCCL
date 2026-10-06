@@ -12,13 +12,13 @@ public:
 
     bool ValidateCollectiveTask(const CollTask& task, int rank, int world_size) const;
     bool SortTasks(std::vector<CollTask>& tasks, int rank, int world_size) const;
-    bool Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan) const;
+    bool Plan(Communicator& comm, const std::vector<CollTask>& tasks, CollPlan& plan, bool preempt = false) const;
 
     bool ConnectP2p(Communicator& comm, int peer) const;
     bool AcceptP2pOne(Communicator& comm, int peer) const;
 
 private:
-    bool PlanCollective(Communicator& comm, const CollTask& task, CollPlan& plan) const;
+    bool PlanCollectiveSlices(Communicator& comm, const CollTask& task, std::vector<PlanTask>& slices) const;
     bool PlanP2pRound(Communicator& comm, const std::vector<CollTask>& tasks, int round, CollPlan& plan) const;
     bool PrepareRound(Communicator& comm, const std::vector<CollTask>& sends, const std::vector<CollTask>& recvs) const;
     bool ValidateP2p(const Communicator& comm, const CollTask& task) const;

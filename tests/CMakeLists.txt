@@ -54,3 +54,9 @@ target_compile_definitions(test_allreduce_benchmark PRIVATE "OCCL_BENCH_BUILD_TY
 if(OCCL_SMALL_TESTS)
     target_compile_definitions(test_allreduce_benchmark PRIVATE OCCL_SMALL_TESTS)
 endif()
+
+# Group-level scheduler benchmark: it must see the production chunk granularity, because the
+# static per-channel split it measures depends on kChunkBytes. Deliberately not driven by
+# scripts/run_tests.sh; run it on two machines with OCCL_EXECUTOR=multithread|preempt.
+add_executable(test_group_benchmark test_group_benchmark.cpp)
+target_link_libraries(test_group_benchmark occl_test_support)

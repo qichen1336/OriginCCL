@@ -11,7 +11,7 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 - 等待 task 各 transport 的就绪（`GetFd()` + `GetPollEvents()`），把就绪喂给 `Topology::CollectiveStep`；不展开算法步骤。
 - 就绪到逻辑操作的映射由 transport 在 task 中的位置决定：`send_transports` 任一连接就绪推进 Writable（send），`recv_transports` 任一连接就绪推进 Readable（recv）。executor 不认具体 transport 类型，也不把就绪位当成方向（共享内存发送端等的是可读的 eventfd）。
 - 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进；隐含保证 worker/单线程独占自己 channel，`PlanTask.state` 单写者，不加锁。
-- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `multi_thread`，核数不够（已超订）用 `epoll`，避免 worker 争抢 CPU。`polling` / `reactor` 仍编译在库里，但没有选取它们的路径。
+- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `multi_thread`，核数不够（已超订）用 `epoll`，避免 worker 争抢 CPU。`polling` / `reactor` 仍编译在库里，但没有选取它们的路径。环境变量 `OCCL_EXECUTOR=preempt` 显式选中 preempt executor（仅用于 A/B 基准，不进 `run_tests.sh` 矩阵）。
 
 # 文件介绍
 
@@ -19,6 +19,7 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
 | `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + per-task `epoll`（`EPOLLET`），遍历注册两侧连接、就绪全喂 Step，批次同步与错误汇总 |
+| `include/executor/preempt_multi_thread_executor.h` / `src/executor/preempt_multi_thread_executor.cpp` | 同样 per-lane worker + per-task `epoll`，但任务来自公共队列：rank0 动态发放租约，其余 rank 从 lane 上的控制广播同构地推导出同一份租约 |
 | `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
 | `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |
@@ -26,6 +27,7 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 # 实现原理
 
 - **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；每 worker 在每个 task 上建一个 `epoll`（`EPOLLET`），遍历该 task 两侧 transport 注册就绪，等待后全喂 Step。
+- **PreemptMultiThreadExecutor**（`OCCL_EXECUTOR=preempt`）：同样 `n_channels` 个 worker，worker `i` 固定使用 channel `i` 的连接（lane），但任务来自 `plan.collectives` 这个公共队列，不再预绑定 channel。每轮 worker `i` 先在 lane `i` 上做一次 16 字节 ring `Broadcast` 控制帧（`magic + lane + first + lease`，`elem_count=4`、`dtype=INT32`、`root=0`）：rank0 在持有调度锁时按**字节预算**取一批连续 slice（`budget = 剩余字节 / 活跃 lane 数`，单次最多 2 个，至少 1 个），其余 rank 直接读该帧。所有 rank 得到同一帧，因此各 lane 的任务序列完全一致。执行前把每个 slice 的 `channel_id` 与 transport 向量按 lane 重绑（`FillTransports(lane)`，该函数先 clear）。`lease == 0` 表示队列耗尽，该 lane 退出本轮。
 - **EpollExecutor**：单线程把每 channel 队首 task 的各 transport 就绪注册进一个 epoll；channel 内多 task 顺序推进。
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Collective*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job（job 带逻辑 step 位，不带原始 epoll 位），worker 用 mutex + completion 队列 + eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
@@ -42,3 +44,5 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 - **边沿触发（EPOLLET）勿回退**：四种 executor 全以 `EPOLLET` 注册，配套两条——(a) transport 的 `Try*` 必须排空到不能再推进（eventfd 是 drain+复检、socket 是读到 EAGAIN），否则漏下一个边沿死锁；(b) step 完成、`BeginPhase` 重置 done 后立刻对两侧各喂一次（`BeginPhase` 内调 `PushBuffer`），让刚重置那侧立刻消费并复位计数，之后的 0→1 边沿才能再触发。**删掉这次补喂会死锁**（SHM 的 `Try*` 是 drain-to-empty，不补喂计数永不复位）。`polling` 不监听 fd，与触发模式无关。
 - **Reactor 派发期间必须注销 fd**：fd 交 worker 前 `EPOLL_CTL_DEL`，completion 返回 Waiting 后再注册，保证 `PlanTask.state` 单写者；`Run` 返回前必须 drain 完所有 in-flight job，否则 worker 引用已销毁的 `CollPlan`。
 - **`CollectiveInit`/`CollectiveStep` 是 `noexcept`，`false` 是唯一可恢复失败通道**：executor 见到 false 立即补打 channel + init/step 上下文日志，停止派发后续任务，清理资源（注销 fd、join worker）并让 `Run()` 返回 `false`，不调用 `exit()`。`std::thread` 构造异常直接逃逸（不可恢复资源错误）；多线程 executor 不提供在途 `poll` 的抢占式取消，已阻塞 worker 需自然返回。
+- **preempt 只在「纯集合 Group」上生效**：`Communicator::Flush` 仅当本批次任务全是集合操作、且已选中 preempt executor 时传 `preempt=true` 给 planner，planner 于是只填 `plan.collectives` 不填 `plan.channels`；含 P2P 的批次一律走原路径。`OCCL_EXECUTOR=preempt` 与集合任务范围是同一个开关的两个条件，两者都不满足时该 executor 不会被执行到。
+- **preempt 控制帧的隐含保证**：(a) 各 rank 的 `plan.collectives` 内容与顺序必须逐 slice 一致（planner 对集合切片只依赖 world_size / channel 数，与 rank 无关），因此「第 k 个 slice」在各 rank 上指向同一段数据；(b) 控制帧与数据面复用 lane `i` 的同一批连接，单 worker 顺序「先控制后数据」，不会与数据交错；(c) lane 号即 channel 号，task 执行前必须重绑 `channel_id` 与 transport 向量，否则会用到切片时建议 lane 的连接。

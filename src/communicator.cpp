@@ -22,6 +22,7 @@
 #include "topology/topology_p2p.h"
 #include "executor/epoll_executor.h"
 #include "executor/multi_thread_executor.h"
+#include "executor/preempt_multi_thread_executor.h"
 
 namespace {
 constexpr int kDefaultChannelCount = 4;
@@ -31,7 +32,16 @@ constexpr int kConnectRetryIntervalMs = 100;
 
 constexpr const char* kRendezvousDir = "/tmp/originccl";
 
-std::unique_ptr<Executor> MakeExecutor(int local_size) {
+bool PreemptRequested() {
+    const char* value = std::getenv("OCCL_EXECUTOR");
+    return value != nullptr && std::strcmp(value, "preempt") == 0;
+}
+
+std::unique_ptr<Executor> MakeExecutor(Communicator& comm, int local_size) {
+    if (PreemptRequested()) {
+        LOG_INFO("Using the preempt multi-thread executor");
+        return std::make_unique<PreemptMultiThreadExecutor>(comm);
+    }
     const long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores >= local_size) {
         LOG_INFO("Using the multi-thread executor ({} cores for {} local ranks)", cores, local_size);
@@ -127,7 +137,8 @@ bool Communicator::Init(const CommConfig& cfg) {
         is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
         Utils::PinProcessToCpu(local_rank);
-        executor = MakeExecutor(local_size);
+        executor = MakeExecutor(*this, local_size);
+        preempt_ = PreemptRequested();
         return true;
     }
 
@@ -267,7 +278,8 @@ bool Communicator::Init(const CommConfig& cfg) {
     ring_topology_->FillChannels(*this, channels);
     tree_topology_->FillChannels(*this, channels);
 
-    executor = MakeExecutor(local_size);
+    executor = MakeExecutor(*this, local_size);
+    preempt_ = PreemptRequested();
     Utils::PinProcessToCpu(local_rank);
 
     if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {
@@ -364,7 +376,12 @@ bool Communicator::Flush() {
     }
 
     CollPlan plan;
-    return planner.Plan(*this, tasks, plan) && executor->Run(plan);
+    // A pure-collective group is the only shape the preempt scheduler can balance: it has a single
+    // shared queue to hand out, and every rank derives the same schedule from it.
+    const bool all_collective = std::all_of(tasks.begin(), tasks.end(), [](const CollTask& task) {
+        return task.func != CollFunc::Send && task.func != CollFunc::Recv;
+    });
+    return planner.Plan(*this, tasks, plan, preempt_ && all_collective) && executor->Run(plan);
 }
 
 bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {
