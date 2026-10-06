@@ -21,7 +21,7 @@
 #include "topology/topology_tree.h"
 #include "topology/topology_p2p.h"
 #include "executor/epoll_executor.h"
-#include "executor/polling_executor.h"
+#include "executor/multi_thread_executor.h"
 
 namespace {
 constexpr int kDefaultChannelCount = 4;
@@ -31,13 +31,11 @@ constexpr int kConnectRetryIntervalMs = 100;
 
 constexpr const char* kRendezvousDir = "/tmp/originccl";
 
-// Each rank pins itself to one core, so a machine where the local ranks already saturate the
-// cores gives polling its own CPU; an oversubscribed one blocks in epoll instead of spinning.
 std::unique_ptr<Executor> MakeExecutor(int local_size) {
     const long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores >= local_size) {
-        LOG_INFO("Using the polling executor ({} cores for {} local ranks)", cores, local_size);
-        return std::make_unique<PollingExecutor>();
+        LOG_INFO("Using the multi-thread executor ({} cores for {} local ranks)", cores, local_size);
+        return std::make_unique<MultiThreadExecutor>();
     }
     LOG_INFO("Using the epoll executor ({} cores for {} local ranks)", cores, local_size);
     return std::make_unique<EpollExecutor>();

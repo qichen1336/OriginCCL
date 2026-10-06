@@ -67,7 +67,7 @@ Without RDMA, cross-machine rejection is checked and RDMA_ZC transfers are SKIP.
 The multi-machine suite makes one host look like several machines through a logical
 hostname, so it never leaves the local node. Level 1 and 2 need enough cores or
 --oversubscribe. RDMA and the zero-copy RDMA variant without a device with an active
-port are reported as SKIP, never as a pass. The executor is picked at runtime: polling
+port are reported as SKIP, never as a pass. The executor is picked at runtime: multi-thread
 when the cores cover the local ranks, epoll when they do not.
 
 Exit codes:

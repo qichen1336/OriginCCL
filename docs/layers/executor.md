@@ -11,7 +11,7 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 - 等待 task 各 transport 的就绪（`GetFd()` + `GetPollEvents()`），把就绪喂给 `Topology::CollectiveStep`；不展开算法步骤。
 - 就绪到逻辑操作的映射由 transport 在 task 中的位置决定：`send_transports` 任一连接就绪推进 Writable（send），`recv_transports` 任一连接就绪推进 Readable（recv）。executor 不认具体 transport 类型，也不把就绪位当成方向（共享内存发送端等的是可读的 eventfd）。
 - 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进；隐含保证 worker/单线程独占自己 channel，`PlanTask.state` 单写者，不加锁。
-- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `polling`，核数不够（已超订）用 `epoll`，不忙等抢 CPU。`multi_thread` / `reactor` 仍编译在库里，但没有选取它们的路径。
+- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `multi_thread`，核数不够（已超订）用 `epoll`，避免 worker 争抢 CPU。`polling` / `reactor` 仍编译在库里，但没有选取它们的路径。
 
 # 文件介绍
 
