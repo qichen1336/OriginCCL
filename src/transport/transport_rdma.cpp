@@ -17,6 +17,8 @@ constexpr size_t kCreditBatch = 8;
 constexpr int kResolveTimeoutMs = 5000;
 constexpr int kEstablishTimeoutMs = 15000;
 constexpr int kControlTimeoutMs = 30000;
+// Benchmark experiment: the barrier between passes keeps the compiler from collapsing them into one.
+constexpr int kCopyRepeat = 100;
 
 uint32_t EncodeDataImmediate(size_t slot, size_t length) {
     return static_cast<uint32_t>((slot << 16) | (length - 1));
@@ -455,7 +457,10 @@ bool TransportRDMA::PostWrites(const char* source, size_t size, size_t progress,
         if (use_inline) {
             requests[i].send_flags = IBV_SEND_INLINE;
         } else {
-            std::memcpy(SlotData(slot), write_data, write_length);
+            for (int repeat = 0; repeat < kCopyRepeat; ++repeat) {
+                std::memcpy(SlotData(slot), write_data, write_length);
+                asm volatile("" ::: "memory");
+            }
             write_data = SlotData(slot);
         }
         elements[i] = ibv_sge{reinterpret_cast<uintptr_t>(write_data), static_cast<uint32_t>(write_length), mr->lkey};
@@ -722,7 +727,10 @@ bool TransportRDMA::TryRecv(void* data, size_t size, size_t* progress, bool* don
         const size_t slot = arrival_head % kRdmaSlotCount;
         const size_t length = arrival_lengths[slot];
         const size_t chunk = std::min(length - arrival_offset, size - *progress);
-        std::memcpy(destination + *progress, SlotData(slot) + arrival_offset, chunk);
+        for (int repeat = 0; repeat < kCopyRepeat; ++repeat) {
+            std::memcpy(destination + *progress, SlotData(slot) + arrival_offset, chunk);
+            asm volatile("" ::: "memory");
+        }
         arrival_offset += chunk;
         *progress += chunk;
         if (arrival_offset == length) {
