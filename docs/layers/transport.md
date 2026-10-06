@@ -64,7 +64,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 独立 QP 由 CM 托管：主连接建立后，接受方在同一地址上再 `rdma_listen` 一个临时端口，用主连接 private data 的尾部把端口告诉主动方，双方再各建一条 CM 连接并 `rdma_create_qp`。这样 QP 的路径与状态迁移都是 CM 的事，在 iWARP 上也成立——手工 `ibv_modify_qp` 迁 INIT/RTR/RTS 在 iWARP 上必失败（`iwcm_init_qp_rts_attr` 返回空掩码，QP 状态由 provider 驱动）。
 - 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单次零拷贝传输最大为 1 GiB（64 个默认 chunk）；每次按发送/接收窗口链式批量 post，发送链尾请求 signaled CQE，完成的 `wr_id` 表示此前有序 WR 均已完成；发送窗口 `kRdmaZcWindow` = 8。
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
-- MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销（实测：逐消息注册会让 32 KiB 传输慢 400 倍）。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
+- MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销；注册/注销是按消息的固定成本，靠大 `size` 摊薄：实测同一对 eRDMA 上 32 KiB 慢 ~200 倍、5 MiB ~3.3 倍、16 MiB ~2.3 倍，到 48 MiB 才摊到 ~1.2 倍，所以小尺寸必须缓存。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，所以完成事件由一个 CQ 收集、以 `qp_num` 区分，就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
 - 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 16 MiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
