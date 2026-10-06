@@ -7,7 +7,7 @@
 #include <rdma/rdma_cma.h>
 #include "transport/transport_rdma.h"
 
-constexpr size_t kRdmaZcThreshold = 16 * 1024 * 1024;
+constexpr size_t kRdmaZcThreshold = 256 * 1024;
 constexpr size_t kRdmaZcChunk = 16 * 1024 * 1024;
 constexpr size_t kRdmaZcMaxTransferSize = size_t{1} << 30;
 constexpr uint32_t kRdmaZcWindow = 8;

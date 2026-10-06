@@ -58,21 +58,21 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 
 ### RDMA 零拷贝子类（`TransportRDMAZc`）
 
-- `TransportRDMAZc` 继承 `TransportRDMA`，只为大消息换数据面：`size >= kRdmaZcThreshold`（16 MiB）时注册用户缓冲为 MR，走独立 RC QP 直接 `SEND/RECV`；`size <` 阈值时逐字转调基类的环形缓冲路径。阈值按**单次逻辑传输的完整 `size`** 判断，不按集合总量或剩余 `size - progress`。
+- `TransportRDMAZc` 继承 `TransportRDMA`，只为大消息换数据面：`size >= kRdmaZcThreshold`（256 KiB）时注册用户缓冲为 MR，走独立 RC QP 直接 `SEND/RECV`；`size <` 阈值时逐字转调基类的环形缓冲路径。阈值按**单次逻辑传输的完整 `size`** 判断，不按集合总量或剩余 `size - progress`。
 - 基类为此开放最小扩展点：`Wire` 增加 `kWireTailSize` 尾部（子类在 CM private data 里捎带自己的连接参数）、`SetupResources`/`PrepareWire`/`FinalizeConnection`/`HandleCompletion`/`MakePeer`/`CloseResources` 虚化。子类用 `PrepareWire` 写 `ZcWire{port, chunk}`、`FinalizeConnection` 读对端端口并建立第二条 CM 连接。
 - 独立 QP 不是为收发大小不一致准备的（调用方保证两次操作配对且大小相同），而是为隔离接收队列：基类 QP 的 RQ 预投了 64 个 256 B 的 credit 池，大块 `SEND` 会匹配队首的小缓冲。独立 QP 只投递用户缓冲，两者互不干扰。
 - 独立 QP 由 CM 托管：主连接建立后，接受方在同一地址上再 `rdma_listen` 一个临时端口，用主连接 private data 的尾部把端口告诉主动方，双方再各建一条 CM 连接并 `rdma_create_qp`。这样 QP 的路径与状态迁移都是 CM 的事，在 iWARP 上也成立——手工 `ibv_modify_qp` 迁 INIT/RTR/RTS 在 iWARP 上必失败（`iwcm_init_qp_rts_attr` 返回空掩码，QP 状态由 provider 驱动）。
 - 分块：`kRdmaZcChunk` = 16 MiB，收发端在建链时交换 `chunk` 取较小者，保证两侧 chunk 边界一致。单次零拷贝传输最大为 1 GiB（64 个默认 chunk）；每次按发送/接收窗口链式批量 post，发送链尾请求 signaled CQE，完成的 `wr_id` 表示此前有序 WR 均已完成；发送窗口 `kRdmaZcWindow` = 8。
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
-- MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销；注册/注销是按消息的固定成本，靠大 `size` 摊薄：实测同一对 eRDMA 上 32 KiB 慢 ~200 倍、5 MiB ~3.3 倍、16 MiB ~2.3 倍，到 48 MiB 才摊到 ~1.2 倍，所以小尺寸必须缓存。同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
+- MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销；同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，所以完成事件由一个 CQ 收集、以 `qp_num` 区分，就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
-- 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 16 MiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
+- 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 256 KiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
 
 ### RDMA 零拷贝阈值 benchmark
 
 - 独立性能程序 `tests/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
-- 对每种路径、每个尺寸预热 3 次，再累计传输 45 GB 数据，测试 `32 KiB`、`64 KiB`、`128 KiB`、`256 KiB`、`512 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`（阈值附近逐倍采样，便于看小消息每消息固定开销何时被带宽摊平）。copy 通过限定调用基类 `TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。生产默认阈值仍为 16 MiB。
+- 对每种路径、每个尺寸预热 3 次，常规档目标传输量为 45 GB。尺寸为 `32 B`、`1 KiB`、`4 KiB`、`16 KiB`、`32 KiB`、`64 KiB`、`128 KiB`、`256 KiB`、`512 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`；前四个小尺寸先传输 3.2 MB 未计时数据，再用 128 条消息校准并计时约 3 秒，故 `bytes` 随尺寸和传输路径变化。copy 通过限定调用基类 `TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。最近同一对 eRDMA 的实测中，copy 各尺寸约 `3.055–3.056 GB/s`；ZC 在 `32/64/128 KiB` 分别为 `0.744/1.347/2.357 GB/s`，从 `256 KiB` 起约 `3.04–3.07 GB/s`，故生产默认阈值设为 `256 KiB`。
 - 表格输出接收端、发送端总耗时与基于接收端总耗时计算的有效 GB/s；不是分位数统计。**每档前一半字节不计时**（ECS 等虚拟网络会突发高于标称带宽，只有跑满 credit 池后才落到持续带宽），`bytes` 列是计时的字节数，即该档有效吞吐是持续值而非突发均值。发送端的完成语义不同：copy 表示已提交到本地 ring，ZC 则等待发送 CQE；发送端 数据仅作辅助观察。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输；正确性由预热阶段校验保证。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。
 - 结果受 CPU/NUMA 与 RDMA NIC 亲和性、系统负载及锁页限制影响。应将两个 rank 绑定到靠近 NIC 的 CPU/NUMA 节点，并确保 `ulimit -l` 足以锁定最大 ZC 消息缓冲区；不同机器上的结果不应直接视为同一阈值结论。
 

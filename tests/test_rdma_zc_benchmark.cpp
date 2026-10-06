@@ -19,13 +19,16 @@ namespace {
 constexpr int kWaitMs = 10000;
 constexpr int kMaxIterations = 400000;
 constexpr int kWarmups = 3;
+constexpr int kSmallCaseCalibrationMessages = 128;
+constexpr uint64_t kSmallCaseDurationNs = 3ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
+constexpr uint64_t kSmallCaseWarmupBytes = 3200000;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c;
-constexpr size_t kMessageSizes[] = {32 * 1024, 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024,
-                                    1 * 1024 * 1024, 5 * 1024 * 1024, 16 * 1024 * 1024 - 1,
-                                    16 * 1024 * 1024, 17 * 1024 * 1024, 32 * 1024 * 1024,
-                                    48 * 1024 * 1024};
+constexpr size_t kMessageSizes[] = {32, 1024, 4096, 16384, 32 * 1024, 64 * 1024,
+                                    128 * 1024, 256 * 1024, 512 * 1024, 1 * 1024 * 1024,
+                                    5 * 1024 * 1024, 16 * 1024 * 1024 - 1, 16 * 1024 * 1024,
+                                    17 * 1024 * 1024, 32 * 1024 * 1024, 48 * 1024 * 1024};
 
 struct ControlMessage {
     uint32_t magic;
@@ -162,29 +165,69 @@ bool RunSize(TransportRDMAZc& transport, int rank, bool zero_copy, size_t size, 
     MPI_Barrier(MPI_COMM_WORLD);
 
     TransferCounts timed_counts;
-    uint64_t remaining_bytes = kBytesPerCase;
     uint64_t message_count = 0;
-    // The ECS link bursts above its sustained rate until the credits drain, so the first half of
-    // every case is transferred untimed; the table reports the sustained rate, not a burst average.
-    const uint64_t timed_bytes = kBytesPerCase - kBytesPerCase / 2;
-    while (remaining_bytes > timed_bytes) {
-        const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes - timed_bytes));
-        if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
-            return false;
+    uint64_t timed_bytes = 0;
+    uint64_t elapsed_ns = 0;
+    if (size < 32 * 1024) {
+        uint64_t remaining_bytes = kSmallCaseWarmupBytes;
+        while (remaining_bytes > 0) {
+            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
+            if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
+                return false;
+            }
+            remaining_bytes -= transfer_size;
         }
-        remaining_bytes -= transfer_size;
-    }
-    const auto start = Clock::now();
-    while (remaining_bytes > 0) {
-        const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
-        if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
-            return false;
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        const auto calibration_start = Clock::now();
+        for (int iteration = 0; iteration < kSmallCaseCalibrationMessages; ++iteration) {
+            if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, size, &timed_counts)) {
+                return false;
+            }
         }
-        remaining_bytes -= transfer_size;
-        ++message_count;
+        if (rank == 0) {
+            elapsed_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - calibration_start).count());
+        }
+        MPI_Bcast(&elapsed_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        message_count = std::max<uint64_t>(
+            1, (kSmallCaseDurationNs * kSmallCaseCalibrationMessages + elapsed_ns - 1) / elapsed_ns);
+
+        MPI_Barrier(MPI_COMM_WORLD);
+        const auto start = Clock::now();
+        for (uint64_t iteration = 0; iteration < message_count; ++iteration) {
+            if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, size, &timed_counts)) {
+                return false;
+            }
+        }
+        elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        timed_bytes = message_count * size;
+    } else {
+        uint64_t remaining_bytes = kBytesPerCase;
+        const uint64_t timed_target_bytes = kBytesPerCase - kBytesPerCase / 2;
+        // The ECS link bursts above its sustained rate until the credits drain, so the first half of
+        // every case is transferred untimed; the table reports the sustained rate, not a burst average.
+        while (remaining_bytes > timed_target_bytes) {
+            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes - timed_target_bytes));
+            if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
+                return false;
+            }
+            remaining_bytes -= transfer_size;
+        }
+        const auto start = Clock::now();
+        while (remaining_bytes > 0) {
+            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
+            if (!Transfer(transport, rank, rank == 1, zero_copy, payload, received, transfer_size, &timed_counts)) {
+                return false;
+            }
+            remaining_bytes -= transfer_size;
+            ++message_count;
+        }
+        elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        timed_bytes = timed_target_bytes;
     }
-    const uint64_t elapsed_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 
     uint64_t gathered_elapsed_ns[2] = {};
     MPI_Gather(&elapsed_ns, 1, MPI_UINT64_T, gathered_elapsed_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
@@ -258,8 +301,8 @@ int main(int argc, char** argv) {
     FillPattern(payload.data(), payload.size());
 
     if (rank == 0) {
-        fmt::print("RDMA-ZC strategy benchmark: address={} warmups={} payload_per_case={} GB\n", address_buffer,
-                   kWarmups, kBytesPerCase / 1000 / 1000 / 1000);
+        fmt::print("RDMA-ZC strategy benchmark: address={} warmups={} payload_per_case=up to {} GB\n",
+               address_buffer, kWarmups, kBytesPerCase / 1000 / 1000 / 1000);
         fmt::print("{:<4} {:>10} {:>12} {:>8} {:>9} {:>9} {:>9} {:>7} {:>5}\n", "mode", "size", "bytes",
                    "GB/s", "recv_s", "send_s", "messages", "calls", "waits");
     }
