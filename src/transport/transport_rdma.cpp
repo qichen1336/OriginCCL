@@ -11,6 +11,7 @@
 #include "logger.h"
 
 namespace {
+constexpr size_t kRdmaInlineThreshold = 64;
 constexpr uint32_t kCreditImmediate = 0x80000000;
 constexpr size_t kCreditBatch = 8;
 constexpr int kResolveTimeoutMs = 5000;
@@ -383,10 +384,23 @@ bool TransportRDMA::SetupResources() {
     attributes.cap.max_recv_wr = kRdmaQueueDepth;
     attributes.cap.max_send_sge = 1;
     attributes.cap.max_recv_sge = 1;
+    attributes.cap.max_inline_data = kRdmaInlineThreshold;
     if (rdma_create_qp(cm_id, pd, &attributes) != 0) {
-        LOG_ERROR("Failed to create the RDMA queue pair: {}", ErrnoText());
-        return false;
+        ibv_qp_init_attr fallback{};
+        fallback.send_cq = cq;
+        fallback.recv_cq = cq;
+        fallback.qp_type = IBV_QPT_RC;
+        fallback.cap.max_send_wr = kRdmaQueueDepth;
+        fallback.cap.max_recv_wr = kRdmaQueueDepth;
+        fallback.cap.max_send_sge = 1;
+        fallback.cap.max_recv_sge = 1;
+        if (rdma_create_qp(cm_id, pd, &fallback) != 0) {
+            LOG_ERROR("Failed to create the RDMA queue pair: {}", ErrnoText());
+            return false;
+        }
+        attributes = fallback;
     }
+    inline_capacity = attributes.cap.max_inline_data;
 
     if (kRdmaRecvPool > static_cast<size_t>(kRdmaQueueDepth)) {
         LOG_ERROR("The RDMA receive queue depth {} cannot hold the {} entry pool", kRdmaQueueDepth, kRdmaRecvPool);
@@ -436,9 +450,15 @@ bool TransportRDMA::PostWrites(const char* source, size_t size, size_t progress,
     for (size_t i = 0; i < count; ++i) {
         const size_t slot = (send_seq + i) % kRdmaSlotCount;
         const size_t write_length = std::min(kRdmaSlotSize, size - progress - *bytes);
-        std::memcpy(SlotData(slot), source + progress + *bytes, write_length);
-        elements[i] =
-            ibv_sge{reinterpret_cast<uintptr_t>(SlotData(slot)), static_cast<uint32_t>(write_length), mr->lkey};
+        const bool use_inline = write_length < kRdmaInlineThreshold && write_length <= inline_capacity;
+        const char* write_data = source + progress + *bytes;
+        if (use_inline) {
+            requests[i].send_flags = IBV_SEND_INLINE;
+        } else {
+            std::memcpy(SlotData(slot), write_data, write_length);
+            write_data = SlotData(slot);
+        }
+        elements[i] = ibv_sge{reinterpret_cast<uintptr_t>(write_data), static_cast<uint32_t>(write_length), mr->lkey};
         requests[i].wr_id = slot + 1;
         requests[i].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
         requests[i].imm_data = htonl(EncodeDataImmediate(slot, write_length));
@@ -449,7 +469,7 @@ bool TransportRDMA::PostWrites(const char* source, size_t size, size_t progress,
         requests[i].next = i + 1 < count ? &requests[i + 1] : nullptr;
         *bytes += write_length;
     }
-    requests[count - 1].send_flags = IBV_SEND_SIGNALED;
+    requests[count - 1].send_flags |= IBV_SEND_SIGNALED;
     ibv_send_wr* failed = nullptr;
     if (ibv_post_send(cm_id->qp, requests, &failed) != 0) {
         LOG_ERROR("Failed to post {} chained RDMA writes: {}", count, ErrnoText());

@@ -118,6 +118,7 @@ private:
     bool control_received = false;
     bool control_sent = false;
     size_t control_index = 0;
+    uint32_t inline_capacity = 0;
 
     size_t send_seq = 0;
     size_t credits_received = 0;

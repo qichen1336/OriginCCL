@@ -48,13 +48,13 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 建链用 RDMA CM，数据面用 RC + `IBV_WR_RDMA_WRITE_WITH_IMM`：`Listen(addr, port)` 用 `rdma_listen`（`port=0` 时内核选端口，用 `rdma_get_local_addr` 读回真实端口）；主动端 `rdma_resolve_addr` → `rdma_resolve_route` → `rdma_connect`，被动端 `rdma_accept`，QP 都是 `IBV_QPT_RC`。
 - 对端内存信息走 CM private data（`Wire{base_addr, rkey}`），两端在事件里直接得到；被动端在 `CONNECT_REQUEST`、主动端在 `ESTABLISHED` 事件里。
 - 握手与数据方向解耦：控制通道由「主动连接方先 `Send`、被动方先 `Recv`」决定，与 `SetDirection` 无关。集合由 `rank < peer` 的一端 Connect，P2P 由发送方 Connect。调用方首次阻塞 `Send`/`Recv` 走 RC `IBV_WR_SEND`。
-- 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 把数据 `memcpy` 进当前槽后按可用 credit 将多个 write 链式提交，整批只对链尾请求 signaled CQE；`*progress` 表示已被读入自有槽并提交的字节，`*done` 置位后调用方缓冲区即可复用。
+- 数据面是 1 MiB 预注册环形缓冲，`32 KiB × 32` 槽位：producer 对小于 64 B 且 QP inline 能力足够的 write，直接从调用方缓冲发 `IBV_SEND_INLINE`，仍写入对端环形槽并携带相同 immediate；其它 write 把数据 `memcpy` 进本地槽。随后按可用 credit 将多个 write 链式提交，整批只对链尾请求 signaled CQE。QP 请求 64 B inline，设备不支持时回退到普通槽位 copy。`*progress` 表示已被拷入本地槽或 inline 提交的字节，`*done` 置位后调用方缓冲区即可复用。
 - 槽位复用只由 credit 一个门控：可发窗口是 `credits_received + kRdmaSlotCount`；credit 蕴含「本地读已完成」，故 `IBV_WC_RDMA_WRITE` 完成事件被忽略。credit 反向归还：consumer 交还整个槽后用一次 `WRITE_WITH_IMM` 写对端控制区（payload 1 B，不受方向限制）。immediate 的位布局是两种用途共用：bit 31 为 credit 标志，bit 16–30 是槽号，bit 0–15 是 `length - 1`（长度减 1 才能双射进 16 bit）。`kCreditBatch = 8` 批量归还，队列排空时立刻归还余数。
 - 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
 - `WRITE_WITH_IMM` 消耗接收方 RQ 的 WQE，接收队列是纯 credit 池（预投 `kRdmaRecvPool` 个空 WQE，每收到一个 write-imm 立即补投），不预投会 RNR。
 - 就绪与 EPOLLET：`GetFd()` 连接后返回 completion channel fd，监听态返回 CM channel fd；`GetPollEvents()` 恒 `EPOLLIN`。就绪 fd 只表达数据到来，对端消失经被 flush 的接收 WQE 产生 CQE、`HandleCompletion` 判为 `Try*` 的 `false`。`EventDriven` 模式的 `Try*` 非阻塞 drain 后必须 `ibv_get_cq_event` → `ibv_ack_cq_events` → `ibv_req_notify_cq` 重新 arm 再 poll CQ，否则漏下一次边沿；`Polling` 模式只 poll CQ，不轮询 completion fd。
 - 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，先扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址；设备不发布这种 GID 时（RoCE v1、iWARP）退到该 GID 绑定的网卡（`ibv_query_gid_ex` 的 `ndev_ifindex`），取该网卡上的首个 AF_INET 地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
-- 限制：Linux + `libibverbs`/`librdmacm` 是硬依赖。首版接受一次用户缓冲 ↔ 注册缓冲的拷贝，不做零拷贝/RDMA Read/多 rail。
+- 限制：Linux + `libibverbs`/`librdmacm` 是硬依赖。除支持 inline 的小 write 外，首版接受一次用户缓冲 ↔ 注册缓冲的拷贝，不做零拷贝/RDMA Read/多 rail。
 
 ### RDMA 零拷贝子类（`TransportRDMAZc`）
 

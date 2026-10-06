@@ -19,7 +19,7 @@ constexpr size_t kStallSize = 8 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c; // "OCCL"
 
 const size_t kBoundaries[] = {
-    1, 65535, 65536, 65537, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 2 * 1024 * 1024 + 1, 5 * 1024 * 1024};
+    1, 63, 64, 65, 65535, 65536, 65537, 2 * 1024 * 1024 - 1, 2 * 1024 * 1024, 2 * 1024 * 1024 + 1, 5 * 1024 * 1024};
 
 struct ControlMessage {
     uint32_t magic;
