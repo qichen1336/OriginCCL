@@ -4,7 +4,7 @@
 
 # 核心职责边界
 
-- 初始化链路：同时构造 `TopologyRing` 与 `TopologyTree` → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 机器分组（写入成员）+ 按 `local_rank` 绑核 → 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → 两个拓扑 `FillChannels(*this, channels)` → `InitChannels` 按 `FillPeers` 的边并集建 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
+- 初始化链路：同时构造 `TopologyRing` 与 `TopologyTree` → 铺 channel 骨架（id + send/recv 槽位）→ 建三类 listener（数据面 TCP + 共享内存 rendezvous + RDMA）→ Bootstrap 交换 `NodeInfo`（含 `rdma_addr`/`rdma_port`）→ local 分组 + 机器分组（写入成员）→ 全局判定所有 rank 都有可用 RDMA 才启用 RDMA → 两个拓扑 `FillChannels(*this, channels)` → `InitChannels` 按 `FillPeers` 的边并集建 send/recv transport（本机 edge 走共享内存，跨机 edge 走 RDMA 或 TCP）。
 - 执行链路：五个 collective 与 Send/Recv 公开方法构造 `CollTask` 后统一提交；非组内调用是单元素批次，直接走批量规划；`GroupStart()`/`GroupEnd()` 之间的调用只入队，最外层 `GroupEnd()` 统一规划并调用 executor 一次。planner 负责排序与批量规划，入口不展开算法。P2P 固定由 `TopologyP2p` 执行，planner 在 executor 启动前按轮次建立连接并把任务加入统一 plan。
 - collective task 在 `Submit` 入队前统一验证参数；无效任务立即返回 `false`，不会进入 Group 队列。Planner 的排序与规划入口也复用同一校验，以覆盖直接调用路径。
 - 暴露本机视角：`GetLocalRank()` / `GetLocalSize()` / `GetLocalRanks()` / `IsSingleMachine()`；以及两个拓扑的访问器 `GetRingTopology()` / `GetTreeTopology()`（planner 用它二选一，见 [planner.md](planner.md)）。
@@ -69,5 +69,4 @@
 - **共享内存失败即初始化失败**，无自动回退 TCP；RDMA 同理，全局选定后建链/QP/MR 错误直接 `LOG_ERROR` + `false`，不静默改走 TCP（`OCCL_DISABLE_RDMA=1` 是显式选择而非回退）。
 - **机器身份 = hostname**（`Utils::GetHostname()` → `gethostname()`），不是 IP。
 - **`Finalize` 先 `executor->Shutdown()`（多线程需 join worker），再关 channel transport**。`PlanTask` 经 `shared_ptr<Transport>` 保证 transport 在 plan 执行期间有效。
-- **绑核用 `local_rank`（非全局 rank），非致命**：失败只 `LOG_WARN` 并继续初始化，不能让 `Init` 失败。
 - 改动传输选择后跑 `scripts/run_tests.sh`：`test_multi_machine` 用 `CommConfig::get_hostname` 注入逻辑 hostname（`rank / ranks_per_machine` 推导机器号），断言 local 视角与全量集合用例；`test_single_machine` 断言真实单机的 local 视角。等级决定布局（0/1/2 = 4×1 / 4×2 / 8×4），`OCCL_DISABLE_SHM`/`OCCL_DISABLE_RDMA` 不再是测试维度。集合档位只做黑盒接口断言，不再检查环边的具体传输类型。

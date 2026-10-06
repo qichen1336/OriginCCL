@@ -136,7 +136,6 @@ bool Communicator::Init(const CommConfig& cfg) {
         local_ranks = {0};
         is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
-        Utils::PinProcessToCpu(local_rank);
         executor = MakeExecutor(*this, local_size);
         preempt_ = PreemptRequested();
         return true;
@@ -280,7 +279,6 @@ bool Communicator::Init(const CommConfig& cfg) {
 
     executor = MakeExecutor(*this, local_size);
     preempt_ = PreemptRequested();
-    Utils::PinProcessToCpu(local_rank);
 
     if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);
