@@ -4,7 +4,7 @@
 /test-reports/
 
 .cache/
-
+.vscode/
 graphify-out/
 .scratch/
 CMakeFiles/
