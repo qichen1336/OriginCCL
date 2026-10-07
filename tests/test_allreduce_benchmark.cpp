@@ -25,7 +25,7 @@ struct Options {
     uint64_t max_bytes = 64ULL * 1024 * 1024;
     uint64_t factor = 2;
     int warmup = 5;
-    int iterations = 20;
+    int iterations = 100;
     int repeats = 5;
     int channels = 4;
 };
