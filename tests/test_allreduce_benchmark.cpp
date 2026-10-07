@@ -21,12 +21,12 @@
 
 namespace {
 struct Options {
-    uint64_t min_bytes = 4;
-    uint64_t max_bytes = 64ULL * 1024 * 1024;
+    uint64_t min_bytes = 256ULL * 1024 * 1024;
+    uint64_t max_bytes = 256ULL * 1024 * 1024;
     uint64_t factor = 2;
     int warmup = 5;
     int iterations = 100;
-    int repeats = 5;
+    int repeats = 1;
     int channels = 4;
 };
 
@@ -146,12 +146,12 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
 
 void PrintUsage(const char* program) {
     fmt::print("Usage: {} [options]\n"
-               "  --min-bytes N   first per-rank message size (default 4)\n"
-               "  --max-bytes N   maximum per-rank message size (default 64M)\n"
+               "  --min-bytes N   first per-rank message size (default 256M)\n"
+               "  --max-bytes N   maximum per-rank message size (default 256M)\n"
                "  --factor N      size multiplier, integer >= 2 (default 2)\n"
                "  --warmup N      untimed warmup calls (default 5)\n"
-               "  --iters N       AllReduce calls per timed batch (default 20)\n"
-               "  --repeats N     timed batches per size (default 5)\n"
+               "  --iters N       AllReduce calls per timed batch (default 100)\n"
+               "  --repeats N     timed batches per size (default 1)\n"
                "  --channels N    communicator channel count (default 4)\n"
                "Sizes accept B (omitted), K, M, or G binary units.\n",
                program);
