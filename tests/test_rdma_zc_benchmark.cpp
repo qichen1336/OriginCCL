@@ -23,6 +23,7 @@ constexpr int kSmallCaseCalibrationMessages = 128;
 constexpr uint64_t kSmallCaseDurationNs = 3ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kSmallCaseWarmupBytes = 3200000;
+constexpr uint64_t kPipelineDepth = 8;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c;
 constexpr size_t kMessageSizes[] = {32 * 1024, 128 * 1024, 512 * 1024, 2 * 1024 * 1024,
@@ -127,23 +128,29 @@ bool RunBidirectional(const Endpoints& endpoints, int rank, bool zero_copy, cons
         bool advanced = false;
         bool send_stalled = false;
         bool recv_stalled = false;
-        if (outgoing.budget > 0) {
+        while (outgoing.budget > 0 && outgoing.messages < incoming.messages + kPipelineDepth) {
             const uint64_t budget_before = outgoing.budget;
             const size_t progress_before = outgoing.progress;
             if (!AdvanceStream(outgoing, rank, zero_copy, payload, received)) {
                 return false;
             }
-            advanced |= outgoing.budget != budget_before || outgoing.progress != progress_before;
-            send_stalled = outgoing.budget == budget_before && outgoing.progress == progress_before;
+            if (outgoing.budget == budget_before && outgoing.progress == progress_before) {
+                send_stalled = true;
+                break;
+            }
+            advanced = true;
         }
-        if (incoming.budget > 0) {
+        while (incoming.budget > 0) {
             const uint64_t budget_before = incoming.budget;
             const size_t progress_before = incoming.progress;
             if (!AdvanceStream(incoming, rank, zero_copy, payload, received)) {
                 return false;
             }
-            advanced |= incoming.budget != budget_before || incoming.progress != progress_before;
-            recv_stalled = incoming.budget == budget_before && incoming.progress == progress_before;
+            if (incoming.budget == budget_before && incoming.progress == progress_before) {
+                recv_stalled = true;
+                break;
+            }
+            advanced = true;
         }
         if (advanced) {
             idle = 0;
