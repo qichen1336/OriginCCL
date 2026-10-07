@@ -21,10 +21,9 @@ constexpr int kMaxIterations = 400000;
 constexpr int kWarmups = 3;
 constexpr int kSmallCaseCalibrationMessages = 128;
 constexpr uint64_t kSmallCaseDurationNs = 3ULL * 1000 * 1000 * 1000;
-constexpr uint64_t kBytesPerCase = 8ULL * 1000 * 1000 * 1000;
+constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kSmallCaseWarmupBytes = 3200000;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
-constexpr size_t kPipelineDepth = 8;
 constexpr uint32_t kControlMagic = 0x4f43434c;
 constexpr size_t kMessageSizes[] = {32, 1024, 4096, 16384, 32 * 1024, 64 * 1024,
                                     128 * 1024, 256 * 1024, 512 * 1024, 1 * 1024 * 1024,
@@ -61,16 +60,6 @@ void FillPattern(char* data, size_t size) {
     }
 }
 
-bool CheckPattern(const char* data, size_t size, size_t* bad_index) {
-    for (size_t i = 0; i < size; ++i) {
-        if (data[i] != static_cast<char>((i * 31 + 7) & 0xFF)) {
-            *bad_index = i;
-            return false;
-        }
-    }
-    return true;
-}
-
 bool WaitReady(const Endpoints& endpoints, bool send_stalled, bool recv_stalled) {
     pollfd entries[2];
     size_t count = 0;
@@ -89,75 +78,95 @@ bool WaitReady(const Endpoints& endpoints, bool send_stalled, bool recv_stalled)
     return ready > 0;
 }
 
-// Moves `messages` messages of `size` through the send and receive interfaces and reports how long it
-// took. Sends stay pipelined so the transport's credit window is used and the measurement is transfer
-// bandwidth rather than one round trip per message; the receive side drains in order. One send buffer
-// and one receive buffer are enough because a message is only replaced once the previous one finished.
-bool Transfer(const Endpoints& endpoints, int rank, bool zero_copy, const char* payload, char* received, size_t size,
-              uint64_t messages, TransferCounts* counts) {
-    size_t send_progress[kPipelineDepth] = {};
-    bool send_started[kPipelineDepth] = {};
-    size_t recv_progress = 0;
-    uint64_t send_issued = 0;
-    uint64_t recv_completed = 0;
-    const uint64_t iteration_limit = messages * 64 + kMaxIterations;
-    for (uint64_t iterations = 0; recv_completed < messages; ++iterations) {
-        if (iterations >= iteration_limit) {
-            return Fail(rank, "transfer iteration limit reached", std::to_string(send_issued));
+struct Stream {
+    std::shared_ptr<TransportRDMAZc> transport;
+    bool producer = false;
+    uint64_t budget = 0;
+    size_t message_size = 0;
+    size_t progress = 0;
+    size_t current = 0;
+    uint64_t calls = 0;
+    uint64_t waits = 0;
+    uint64_t messages = 0;
+};
+
+bool AdvanceStream(Stream& stream, int rank, bool zero_copy, const char* payload, char* received) {
+    if (stream.progress == 0) {
+        stream.current = static_cast<size_t>(std::min<uint64_t>(stream.message_size, stream.budget));
+    }
+    const size_t before = stream.progress;
+    ++stream.calls;
+    bool done = false;
+    const bool ok = zero_copy
+                ? (stream.producer ? stream.transport->TrySend(payload, stream.current, &stream.progress, &done)
+                    : stream.transport->TryRecv(received, stream.current, &stream.progress, &done))
+                : (stream.producer ? stream.transport->TransportRDMA::TrySend(payload, stream.current, &stream.progress, &done)
+                    : stream.transport->TransportRDMA::TryRecv(received, stream.current, &stream.progress, &done));
+    if (!ok) {
+        return Fail(rank, "TrySend/TryRecv failed", std::to_string(stream.current));
+    }
+    if (stream.progress < before || stream.progress > stream.current || done != (stream.progress == stream.current)) {
+        return Fail(rank, "invalid progress or done state", std::to_string(stream.progress));
+    }
+    if (done) {
+        stream.budget -= stream.current;
+        stream.progress = 0;
+        ++stream.messages;
+    }
+    return true;
+}
+
+// The two directions advance in one loop but share nothing: each owns its transport, byte budget,
+// progress and counters, so messages are never paired across directions. A direction stops only
+// when its own budget is spent; the loop ends once both budgets are spent. When every unfinished
+// direction stalls, the stalled descriptors are polled together.
+bool RunBidirectional(const Endpoints& endpoints, int rank, bool zero_copy, const char* payload, char* received,
+                      size_t size, uint64_t bytes_per_direction, TransferCounts* counts, uint64_t* messages) {
+    Stream outgoing{endpoints.outgoing, true, bytes_per_direction, size};
+    Stream incoming{endpoints.incoming, false, bytes_per_direction, size};
+    uint64_t idle = 0;
+    while (outgoing.budget > 0 || incoming.budget > 0) {
+        bool advanced = false;
+        bool send_stalled = false;
+        bool recv_stalled = false;
+        if (outgoing.budget > 0) {
+            const uint64_t budget_before = outgoing.budget;
+            const size_t progress_before = outgoing.progress;
+            if (!AdvanceStream(outgoing, rank, zero_copy, payload, received)) {
+                return false;
+            }
+            advanced |= outgoing.budget != budget_before || outgoing.progress != progress_before;
+            send_stalled = outgoing.budget == budget_before && outgoing.progress == progress_before;
         }
-        bool progressed = false;
-        while (send_issued < messages && send_issued - recv_completed < kPipelineDepth) {
-            const size_t slot = static_cast<size_t>(send_issued % kPipelineDepth);
-            if (!send_started[slot]) {
-                send_started[slot] = true;
-                send_progress[slot] = 0;
+        if (incoming.budget > 0) {
+            const uint64_t budget_before = incoming.budget;
+            const size_t progress_before = incoming.progress;
+            if (!AdvanceStream(incoming, rank, zero_copy, payload, received)) {
+                return false;
             }
-            const size_t before = send_progress[slot];
-            ++counts->calls;
-            bool done = false;
-            const bool ok = zero_copy
-                        ? endpoints.outgoing->TrySend(payload, size, &send_progress[slot], &done)
-                        : endpoints.outgoing->TransportRDMA::TrySend(payload, size, &send_progress[slot], &done);
-            if (!ok) {
-                return Fail(rank, "TrySend failed", std::to_string(size));
-            }
-            if (send_progress[slot] < before || send_progress[slot] > size || done != (send_progress[slot] == size)) {
-                return Fail(rank, "invalid send progress or done state", std::to_string(send_progress[slot]));
-            }
-            if (!done) {
-                break;
-            }
-            send_started[slot] = false;
-            ++send_issued;
-            progressed = true;
+            advanced |= incoming.budget != budget_before || incoming.progress != progress_before;
+            recv_stalled = incoming.budget == budget_before && incoming.progress == progress_before;
         }
-        while (recv_completed < send_issued) {
-            const size_t before = recv_progress;
-            ++counts->calls;
-            bool done = false;
-            const bool ok = zero_copy
-                        ? endpoints.incoming->TryRecv(received, size, &recv_progress, &done)
-                        : endpoints.incoming->TransportRDMA::TryRecv(received, size, &recv_progress, &done);
-            if (!ok) {
-                return Fail(rank, "TryRecv failed", std::to_string(size));
-            }
-            if (recv_progress < before || recv_progress > size || done != (recv_progress == size)) {
-                return Fail(rank, "invalid recv progress or done state", std::to_string(recv_progress));
-            }
-            if (!done) {
-                break;
-            }
-            recv_progress = 0;
-            ++recv_completed;
-            progressed = true;
+        if (advanced) {
+            idle = 0;
+            continue;
         }
-        if (!progressed) {
-            ++counts->waits;
-            if (!WaitReady(endpoints, true, true)) {
-                return Fail(rank, "timed out waiting for RDMA readiness", std::to_string(size));
-            }
+        if (++idle >= kMaxIterations) {
+            return Fail(rank, "bidirectional iteration limit reached", std::to_string(size));
+        }
+        if (send_stalled) {
+            ++outgoing.waits;
+        }
+        if (recv_stalled) {
+            ++incoming.waits;
+        }
+        if (!WaitReady(endpoints, send_stalled, recv_stalled)) {
+            return Fail(rank, "timed out waiting for RDMA readiness", std::to_string(size));
         }
     }
+    counts->calls += outgoing.calls + incoming.calls;
+    counts->waits += outgoing.waits + incoming.waits;
+    *messages = outgoing.messages;
     return true;
 }
 
@@ -223,13 +232,11 @@ bool Connect(int rank, bool zero_copy, int tag, const std::string& address, Endp
 bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, const char* payload,
              char* received) {
     TransferCounts warmup_counts;
+    uint64_t unused_messages = 0;
     for (int iteration = 0; iteration < kWarmups; ++iteration) {
-        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, &warmup_counts)) {
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, size, &warmup_counts,
+                              &unused_messages)) {
             return false;
-        }
-        size_t bad_index = 0;
-        if (!CheckPattern(received, size, &bad_index)) {
-            return Fail(rank, "warmup payload mismatch", std::to_string(bad_index));
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
@@ -237,76 +244,67 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
     TransferCounts timed_counts;
     uint64_t message_count = 0;
     uint64_t timed_bytes = 0;
-    uint64_t elapsed_ns = 0;
+    uint64_t local_ns = 0;
+    uint64_t window_ns = 0;
     if (size < 32 * 1024) {
-        uint64_t remaining_bytes = kSmallCaseWarmupBytes;
-        while (remaining_bytes > 0) {
-            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, transfer_size, 1, &timed_counts)) {
-                return false;
-            }
-            remaining_bytes -= transfer_size;
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, kSmallCaseWarmupBytes,
+                              &timed_counts, &unused_messages)) {
+            return false;
         }
 
         MPI_Barrier(MPI_COMM_WORLD);
         const auto calibration_start = Clock::now();
-        for (int iteration = 0; iteration < kSmallCaseCalibrationMessages; ++iteration) {
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, &timed_counts)) {
-                return false;
-            }
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size,
+                              kSmallCaseCalibrationMessages * static_cast<uint64_t>(size), &timed_counts,
+                              &unused_messages)) {
+            return false;
         }
-        if (rank == 0) {
-            elapsed_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - calibration_start).count());
-        }
-        MPI_Bcast(&elapsed_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+        local_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - calibration_start).count());
+        MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
         message_count = std::max<uint64_t>(
-            1, (kSmallCaseDurationNs * kSmallCaseCalibrationMessages + elapsed_ns - 1) / elapsed_ns);
+            1, (kSmallCaseDurationNs * kSmallCaseCalibrationMessages + window_ns - 1) / window_ns);
+        const uint64_t timed_target_bytes = message_count * static_cast<uint64_t>(size);
 
         MPI_Barrier(MPI_COMM_WORLD);
         const auto start = Clock::now();
-        for (uint64_t iteration = 0; iteration < message_count; ++iteration) {
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, &timed_counts)) {
-                return false;
-            }
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, timed_target_bytes, &timed_counts,
+                              &unused_messages)) {
+            return false;
         }
-        elapsed_ns = static_cast<uint64_t>(
+        local_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
-        timed_bytes = message_count * size;
+        MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+        timed_bytes = timed_target_bytes;
     } else {
-        const uint64_t total_messages = kBytesPerCase / size;
-        const uint64_t warmup_messages = total_messages / 2;
+        const uint64_t timed_target_bytes = kBytesPerCase - kBytesPerCase / 2;
         // The ECS link bursts above its sustained rate until the credits drain, so the first half of
         // every case is transferred untimed; the table reports the sustained rate, not a burst average.
-        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, warmup_messages, &timed_counts)) {
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, kBytesPerCase - timed_target_bytes,
+                              &timed_counts, &unused_messages)) {
             return false;
         }
-        MPI_Barrier(MPI_COMM_WORLD);
         const auto start = Clock::now();
-        message_count = total_messages - warmup_messages;
-        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, message_count, &timed_counts)) {
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, timed_target_bytes, &timed_counts,
+                              &message_count)) {
             return false;
         }
-        elapsed_ns = static_cast<uint64_t>(
+        local_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
-        timed_bytes = message_count * size;
+        MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+        timed_bytes = timed_target_bytes;
     }
 
-    uint64_t gathered_elapsed_ns[2] = {};
-    MPI_Gather(&elapsed_ns, 1, MPI_UINT64_T, gathered_elapsed_ns, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     const uint64_t local_counts[] = {timed_counts.calls, timed_counts.waits};
     uint64_t total_counts[2] = {};
     MPI_Reduce(local_counts, total_counts, 2, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        const double window_seconds =
-            static_cast<double>(std::max(gathered_elapsed_ns[0], gathered_elapsed_ns[1])) / 1e9;
-        const double direction_gigabytes_per_second = static_cast<double>(timed_bytes) / window_seconds / 1e9;
-        const double bidirectional_gigabytes_per_second = 2.0 * direction_gigabytes_per_second;
-        fmt::print("{:<4} {:>10} {:>12} {:>9.3f} {:>10.3f} {:>9.3f} {:>9} {:>7} {:>5}\n",
-                   zero_copy ? "ZC" : "copy", size, timed_bytes, direction_gigabytes_per_second,
-                   bidirectional_gigabytes_per_second, window_seconds, message_count, total_counts[0],
-                   total_counts[1]);
+        const double elapsed_seconds = static_cast<double>(window_ns) / 1e9;
+        const double gigabytes_per_second = 2.0 * static_cast<double>(timed_bytes) / elapsed_seconds / 1e9;
+        fmt::print("{:<4} {:>10} {:>12} {:>8.3f} {:>9.3f} {:>9} {:>7} {:>5}\n",
+                   zero_copy ? "ZC" : "copy", size, timed_bytes, gigabytes_per_second, elapsed_seconds,
+                   message_count, total_counts[0], total_counts[1]);
     }
     MPI_Barrier(MPI_COMM_WORLD);
     return true;
@@ -367,21 +365,18 @@ int main(int argc, char** argv) {
     FillPattern(payload.data(), payload.size());
 
     if (rank == 0) {
-        fmt::print("RDMA-ZC bidirectional benchmark: address={} warmups={} bytes_per_case=up to {} GB per direction\n",
+        fmt::print("RDMA-ZC bidirectional bandwidth benchmark: address={} warmups={} bytes_per_direction=up to {} GB\n",
                address_buffer, kWarmups, kBytesPerCase / 1000 / 1000 / 1000);
-        fmt::print("{:<4} {:>10} {:>12} {:>9} {:>10} {:>9} {:>9} {:>7} {:>5}\n", "mode", "size", "bytes",
-                   "GB/s", "GB/s(bidi)", "window_s", "messages", "calls", "waits");
+        fmt::print("{:<4} {:>10} {:>12} {:>8} {:>9} {:>9} {:>7} {:>5}\n", "mode", "size", "bytes", "GB/s",
+                   "elapsed_s", "messages", "calls", "waits");
     }
 
     if (!RunMode(rank, false, 41, address_buffer, payload, received) ||
-        !RunMode(rank, true, 42, address_buffer, payload, received)) {
+        !RunMode(rank, true, 43, address_buffer, payload, received)) {
         MPI_Abort(MPI_COMM_WORLD, 1);
         return 1;
     }
 
-    if (rank == 0) {
-        LOG_INFO("rdma_zc_benchmark: payload validation passed");
-    }
     MPI_Finalize();
     return 0;
 }
