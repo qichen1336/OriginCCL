@@ -24,6 +24,7 @@ constexpr uint64_t kSmallCaseDurationNs = 3ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kSmallCaseWarmupBytes = 3200000;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
+constexpr size_t kPipelineDepth = 8;
 constexpr uint32_t kControlMagic = 0x4f43434c;
 constexpr size_t kMessageSizes[] = {32, 1024, 4096, 16384, 32 * 1024, 64 * 1024,
                                     128 * 1024, 256 * 1024, 512 * 1024, 1 * 1024 * 1024,
@@ -88,55 +89,76 @@ bool WaitReady(const Endpoints& endpoints, bool send_stalled, bool recv_stalled)
     return ready > 0;
 }
 
+// Keeps up to `depth` messages in flight per direction. A depth of one pays a full round trip per
+// message and leaves the credit window unused; the callers size `depth` so the send slots cap at the
+// window and the receive slots stay inside the caller buffer.
 bool Transfer(const Endpoints& endpoints, int rank, bool zero_copy, const char* payload, char* received, size_t size,
-              TransferCounts* counts) {
-    size_t send_progress = 0;
-    size_t recv_progress = 0;
-    bool send_done = false;
-    bool recv_done = false;
-    for (int iterations = 0; !(send_done && recv_done); ++iterations) {
-        if (iterations >= kMaxIterations) {
-            return Fail(rank, "transfer iteration limit reached",
-                        std::to_string(send_progress) + "/" + std::to_string(recv_progress));
+              uint64_t messages, size_t depth, TransferCounts* counts) {
+    std::vector<size_t> send_progress(depth, 0);
+    std::vector<uint64_t> send_slot(depth, UINT64_MAX);
+    std::vector<size_t> recv_progress(depth, 0);
+    std::vector<uint64_t> recv_slot(depth, UINT64_MAX);
+    uint64_t send_issued = 0;
+    uint64_t recv_completed = 0;
+    const uint64_t iteration_limit = messages * 64 + kMaxIterations;
+    for (uint64_t iterations = 0; recv_completed < messages; ++iterations) {
+        if (iterations >= iteration_limit) {
+            return Fail(rank, "transfer iteration limit reached", std::to_string(send_issued));
         }
-        bool send_stalled = false;
-        bool recv_stalled = false;
-        if (!send_done) {
-            const size_t before = send_progress;
+        bool progressed = false;
+        while (send_issued < messages && send_issued - recv_completed < depth) {
+            const size_t slot = static_cast<size_t>(send_issued % depth);
+            if (send_slot[slot] != send_issued) {
+                send_slot[slot] = send_issued;
+                send_progress[slot] = 0;
+            }
+            const size_t before = send_progress[slot];
             ++counts->calls;
+            bool done = false;
             const bool ok = zero_copy
-                        ? endpoints.outgoing->TrySend(payload, size, &send_progress, &send_done)
-                        : endpoints.outgoing->TransportRDMA::TrySend(payload, size, &send_progress, &send_done);
+                        ? endpoints.outgoing->TrySend(payload, size, &send_progress[slot], &done)
+                        : endpoints.outgoing->TransportRDMA::TrySend(payload, size, &send_progress[slot], &done);
             if (!ok) {
                 return Fail(rank, "TrySend failed", std::to_string(size));
             }
-            if (send_progress < before || send_progress > size || send_done != (send_progress == size)) {
-                return Fail(rank, "invalid send progress or done state", std::to_string(send_progress));
+            if (send_progress[slot] < before || send_progress[slot] > size || done != (send_progress[slot] == size)) {
+                return Fail(rank, "invalid send progress or done state", std::to_string(send_progress[slot]));
             }
-            send_stalled = !send_done && send_progress == before;
+            if (!done) {
+                break;
+            }
+            ++send_issued;
+            progressed = true;
         }
-        if (!recv_done) {
-            const size_t before = recv_progress;
+        while (recv_completed < send_issued) {
+            const size_t slot = static_cast<size_t>(recv_completed % depth);
+            if (recv_slot[slot] != recv_completed) {
+                recv_slot[slot] = recv_completed;
+                recv_progress[slot] = 0;
+            }
+            const size_t before = recv_progress[slot];
             ++counts->calls;
+            bool done = false;
             const bool ok = zero_copy
-                        ? endpoints.incoming->TryRecv(received, size, &recv_progress, &recv_done)
-                        : endpoints.incoming->TransportRDMA::TryRecv(received, size, &recv_progress, &recv_done);
+                        ? endpoints.incoming->TryRecv(received + slot * size, size, &recv_progress[slot], &done)
+                        : endpoints.incoming->TransportRDMA::TryRecv(received + slot * size, size, &recv_progress[slot], &done);
             if (!ok) {
                 return Fail(rank, "TryRecv failed", std::to_string(size));
             }
-            if (recv_progress < before || recv_progress > size || recv_done != (recv_progress == size)) {
-                return Fail(rank, "invalid recv progress or done state", std::to_string(recv_progress));
+            if (recv_progress[slot] < before || recv_progress[slot] > size || done != (recv_progress[slot] == size)) {
+                return Fail(rank, "invalid recv progress or done state", std::to_string(recv_progress[slot]));
             }
-            recv_stalled = !recv_done && recv_progress == before;
+            if (!done) {
+                break;
+            }
+            ++recv_completed;
+            progressed = true;
         }
-        if ((send_stalled || recv_stalled) && !WaitReady(endpoints, send_stalled, recv_stalled)) {
-            return Fail(rank, "timed out waiting for RDMA readiness", std::to_string(size));
-        }
-        if (send_stalled) {
+        if (!progressed) {
             ++counts->waits;
-        }
-        if (recv_stalled) {
-            ++counts->waits;
+            if (!WaitReady(endpoints, true, true)) {
+                return Fail(rank, "timed out waiting for RDMA readiness", std::to_string(size));
+            }
         }
     }
     return true;
@@ -203,9 +225,14 @@ bool Connect(int rank, bool zero_copy, int tag, const std::string& address, Endp
 
 bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, const char* payload,
              char* received) {
+    // Zero copy holds one registered buffer and one send and receive state per transport, so it stays
+    // single message; the copy path fills the credit window instead. The caller buffer bounds the
+    // depth, since every message in flight needs its own receive slot.
+    const size_t depth =
+        zero_copy || size < 32 * 1024 ? 1 : std::min<size_t>(kPipelineDepth, kBufferSize / size);
     TransferCounts warmup_counts;
     for (int iteration = 0; iteration < kWarmups; ++iteration) {
-        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, &warmup_counts)) {
+        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, depth, &warmup_counts)) {
             return false;
         }
         size_t bad_index = 0;
@@ -223,7 +250,7 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
         uint64_t remaining_bytes = kSmallCaseWarmupBytes;
         while (remaining_bytes > 0) {
             const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, transfer_size, &timed_counts)) {
+            if (!Transfer(endpoints, rank, zero_copy, payload, received, transfer_size, 1, 1, &timed_counts)) {
                 return false;
             }
             remaining_bytes -= transfer_size;
@@ -232,7 +259,7 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
         MPI_Barrier(MPI_COMM_WORLD);
         const auto calibration_start = Clock::now();
         for (int iteration = 0; iteration < kSmallCaseCalibrationMessages; ++iteration) {
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, &timed_counts)) {
+            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, 1, &timed_counts)) {
                 return false;
             }
         }
@@ -247,7 +274,7 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
         MPI_Barrier(MPI_COMM_WORLD);
         const auto start = Clock::now();
         for (uint64_t iteration = 0; iteration < message_count; ++iteration) {
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, &timed_counts)) {
+            if (!Transfer(endpoints, rank, zero_copy, payload, received, size, 1, 1, &timed_counts)) {
                 return false;
             }
         }
@@ -255,29 +282,22 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
         timed_bytes = message_count * size;
     } else {
-        uint64_t remaining_bytes = kBytesPerCase;
-        const uint64_t timed_target_bytes = kBytesPerCase - kBytesPerCase / 2;
+        const uint64_t total_messages = kBytesPerCase / size;
+        const uint64_t warmup_messages = total_messages / 2;
         // The ECS link bursts above its sustained rate until the credits drain, so the first half of
         // every case is transferred untimed; the table reports the sustained rate, not a burst average.
-        while (remaining_bytes > timed_target_bytes) {
-            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes - timed_target_bytes));
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, transfer_size, &timed_counts)) {
-                return false;
-            }
-            remaining_bytes -= transfer_size;
+        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, warmup_messages, depth, &timed_counts)) {
+            return false;
         }
+        MPI_Barrier(MPI_COMM_WORLD);
         const auto start = Clock::now();
-        while (remaining_bytes > 0) {
-            const size_t transfer_size = static_cast<size_t>(std::min<uint64_t>(size, remaining_bytes));
-            if (!Transfer(endpoints, rank, zero_copy, payload, received, transfer_size, &timed_counts)) {
-                return false;
-            }
-            remaining_bytes -= transfer_size;
-            ++message_count;
+        message_count = total_messages - warmup_messages;
+        if (!Transfer(endpoints, rank, zero_copy, payload, received, size, message_count, depth, &timed_counts)) {
+            return false;
         }
         elapsed_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
-        timed_bytes = timed_target_bytes;
+        timed_bytes = message_count * size;
     }
 
     uint64_t gathered_elapsed_ns[2] = {};
