@@ -26,6 +26,14 @@ void PinThreadToCpu(int cpu) {
     }
 }
 
+void CpuPause() {
+#if defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#endif
+}
+
 void SetPlanWaitMode(const CollPlan& plan) {
     for (const ChannelPlan& channel : plan.channels) {
         for (const PlanTask& task : channel.tasks) {
@@ -123,7 +131,7 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         const size_t after_recv =
             std::accumulate(task.state.recv_progress.begin(), task.state.recv_progress.end(), size_t{0});
         if (after_send == before_send && after_recv == before_recv && task.state.phase == before_phase) {
-            sched_yield();
+            CpuPause();
         }
     }
 
