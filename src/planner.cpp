@@ -281,9 +281,10 @@ bool Planner::PlanCollective(Communicator& comm, const CollTask& task, CollPlan&
         plantask.channel_id = comm_channel.id;
         plantask.rank = comm.GetRank();
         plantask.world_size = comm.GetWorldSize();
-        plantask.chunk_size = use_tree ? OcclConfig::kChunkBytes / type_size
-                                       : (elem_count + static_cast<size_t>(plantask.world_size) - 1) /
-                                             static_cast<size_t>(plantask.world_size);
+        plantask.chunk_size = (use_tree || task.func == CollFunc::AllReduce)
+                                  ? OcclConfig::kChunkBytes / type_size
+                                  : (elem_count + static_cast<size_t>(plantask.world_size) - 1) /
+                                        static_cast<size_t>(plantask.world_size);
         plantask.topology->FillTransports(comm_channel, plantask);
         channel.tasks.push_back(std::move(plantask));
         offset += elem_count;

@@ -14,7 +14,7 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 - `FillChannels(comm, channels)`：bootstrap 之后、`FillPeers`/`InitChannels` 之前调用，把拓扑形状写入每个 `Channel`（ring 填 `channel.ring.prev/next`，tree 填 `channel.tree` 的 `parent`/`children`/`star_peers`）；本机视角与机器分组从 `comm` 成员读取，tree 同时把每个 channel 的运行时角色表 `channel_roles_` 与 `is_leader_` 记到自己成员。
 - `FillPeers(channel, edges)`：返回本 rank 在该拓扑下要连接的全部 peer（`TopoEdge{peer, is_send}`，每条有向边一条），形状来源是 `channel`（ring 读 `channel.ring`，tree 读 `channel.tree` 三桶）。communicator 据此建连接（见 [communicator.md](communicator.md)）。
 - `FillTransports(channel, task)`：按拓扑语义填充 task.send_transports/recv_transports；tree 按 `[star_peers, children, parent]` 顺序输出，与该 channel 的角色表一一对齐；P2P 按 task.func/peer 选择独立连接。
-- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有游标 `algo`**（`algo.ring.step` 与 `algo.tree.{recv_chunk,send_chunk}`；一个 task 只绑定一种拓扑，只有对应的一份被读写）。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
+- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有游标 `algo`**（`algo.ring.step` 与 `algo.tree.{recv_chunk,send_chunk}`；一个 task 只绑定一种拓扑，只有对应的一份被读写）。`algo.ring.step` 对 AllReduce 是阶段内扁平 micro-op 序号，对 ring 其余操作是环内 step。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
 - 不负责：不监听 fd、不决定等待策略、不开线程；无可变成员状态。
 
 # 文件介绍
@@ -28,18 +28,18 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 
 # 实现原理
 
-- 所有算法仅向 next 发送、从 prev 接收，不反向使用已有 transport。chunk 布局/指针/字节数由 `phase/step/rank` 现算（`topology_ring.cpp` 匿名命名空间的 helper），不存进 state。
+- 所有算法仅向 next 发送、从 prev 接收，不反向使用已有 transport。chunk 布局/指针/字节数由 `phase/step/rank` 现算（`topology_ring.cpp` 匿名命名空间的 helper），不存进 state。除 AllReduce 外每轮收发 1 块；AllReduce 的 chunk 索引是「unit × world_size + 环内 chunk」，因此同一 task 聚合的多个 `kChunkBytes × world_size` unit 各自独立成环，每次 `TrySend`/`TryRecv` 仍只搬一个 `kChunkBytes` 块。
 
 | 操作 | 阶段与布局 |
 |------|------------|
-| AllReduce | ReduceScatter + AllGather 两阶段，支持原地；AVG 在 RS→AG 边界仅对本 rank 完成块除一次 |
+| AllReduce | ReduceScatter + AllGather 两阶段，支持原地；`algo.ring.step` 是当前阶段内的扁平 micro-op 游标（`unit = step / (world_size-1)`、`step_in_unit = step % (world_size-1)`），先跑完全部 unit 的 ReduceScatter 再跑完全部 unit 的 AllGather；每轮只收发一个 `kChunkBytes` 块；AVG 在每 unit 每 chunk 的 RS→AG 边界仅对本 rank 完成块除一次 |
 | Broadcast | root 发起，非 root 收齐后转发，root 的前驱只接收 |
 | Reduce | root 的 next 发起部分结果，各节点合并自身输入后转发，root 最后归约；非 root 使用 scratch |
 | AllGather | 先复制本 rank 块，再执行 N-1 轮并发收发，recv_buf 按来源 rank 排列 |
 | ReduceScatter | 滑动部分和：每轮发当前累计块、收 prev 部分和并入本 rank 对应输入块；`recv_buf` 与 1 块 scratch 按 step 奇偶交替承担发/收，N-1 轮后结果落在 `recv_buf`；`send_buf` 只读 |
 
 - Reduce、ReduceScatter 与 AllReduce 的 AVG 均先按 SUM 归约，再对最终输出除以 world_size（整数规则复用 `ApplyAverage`）。
-- 临时数据只存于 `state.temp_buffer`（Reduce 2 块、ReduceScatter 1 块、AllReduce 1 个 chunk），不改写 `task.func/root`，不递归调用 communicator 或 executor。
+- 临时数据只存于 `state.temp_buffer`（Reduce 2 块、ReduceScatter 1 块、AllReduce 1 个 micro-chunk），不改写 `task.func/root`，不递归调用 communicator 或 executor。
 - 多连接数据面语义：`TrySend`/`TryRecv` 的 `size` 是「每条连接各收发多少字节」，同一份 `send_data`/`recv_data` 对每条连接各自维护进度。
 
 # Tree 拓扑（`TopologyTree`）

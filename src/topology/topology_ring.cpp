@@ -17,20 +17,33 @@ size_t ChunkElemCount(size_t count, size_t chunk_size, int chunk_index) {
     return start >= count ? 0 : std::min(chunk_size, count - start);
 }
 
+int AllreduceUnit(const PlanTask& task) {
+    return task.state.algo.ring.step / (task.world_size - 1);
+}
+
+int AllreduceStepInUnit(const PlanTask& task) {
+    return task.state.algo.ring.step % (task.world_size - 1);
+}
+
 int AllreduceSendChunk(const PlanTask& task) {
-    const CollOpState& s = task.state;
-    if (s.phase == kPhaseReduceScatter) {
-        return (task.rank - s.algo.ring.step + task.world_size) % task.world_size;
-    }
-    return (task.rank - s.algo.ring.step + 1 + task.world_size) % task.world_size;
+    const int step = AllreduceStepInUnit(task);
+    const int world_size = task.world_size;
+    const int chunk = task.state.phase == kPhaseReduceScatter ? (task.rank - step + world_size) % world_size
+                                                             : (task.rank - step + 1 + world_size) % world_size;
+    return AllreduceUnit(task) * world_size + chunk;
 }
 
 int AllreduceRecvChunk(const PlanTask& task) {
-    const CollOpState& s = task.state;
-    if (s.phase == kPhaseReduceScatter) {
-        return (task.rank - s.algo.ring.step + task.world_size - 1) % task.world_size;
-    }
-    return (task.rank - s.algo.ring.step + task.world_size) % task.world_size;
+    const int step = AllreduceStepInUnit(task);
+    const int world_size = task.world_size;
+    const int chunk = task.state.phase == kPhaseReduceScatter ? (task.rank - step + world_size - 1) % world_size
+                                                             : (task.rank - step + world_size) % world_size;
+    return AllreduceUnit(task) * world_size + chunk;
+}
+
+size_t AllreduceUnits(const PlanTask& task) {
+    const size_t per_unit = task.chunk_size * static_cast<size_t>(task.world_size);
+    return per_unit == 0 ? 0 : (task.elem_count + per_unit - 1) / per_unit;
 }
 
 size_t AllreduceSendBytes(const PlanTask& task) {
@@ -241,26 +254,29 @@ bool CompleteReduceScatter(PlanTask& task) {
 
 bool CompleteAllreduce(PlanTask& task) {
     CollOpState& s = task.state;
+    const int world_size = task.world_size;
+    const size_t ops_per_unit = static_cast<size_t>(world_size - 1);
+    const size_t total_ops = AllreduceUnits(task) * ops_per_unit;
     while (SideDone(s.send_done) && SideDone(s.recv_done) && s.phase != kPhaseDone) {
         size_t type_size = Utils::GetDataTypeSize(task.dtype);
         size_t chunk = task.chunk_size;
         char* data = static_cast<char*>(task.recv_buf);
         if (s.phase == kPhaseReduceScatter) {
-            size_t recv_chunk = AllreduceRecvChunk(task);
+            const int recv_chunk = AllreduceRecvChunk(task);
             size_t recv_count = ChunkElemCount(task.elem_count, chunk, recv_chunk);
-            char* recv_ptr = data + recv_chunk * chunk * type_size;
+            char* recv_ptr = data + static_cast<size_t>(recv_chunk) * chunk * type_size;
             Utils::PerformReduce(s.temp_buffer.data(), recv_ptr, recv_count, task.dtype,
                                  task.reduce_op == ReduceOp::AVG ? ReduceOp::SUM : task.reduce_op);
-            if (task.reduce_op == ReduceOp::AVG && s.algo.ring.step == task.world_size - 2) {
-                Utils::ApplyAverage(recv_ptr, recv_count, task.dtype, task.world_size);
+            if (task.reduce_op == ReduceOp::AVG && AllreduceStepInUnit(task) == world_size - 2) {
+                Utils::ApplyAverage(recv_ptr, recv_count, task.dtype, world_size);
             }
         }
 
         ++s.algo.ring.step;
-        if (s.phase == kPhaseReduceScatter && s.algo.ring.step >= task.world_size - 1) {
+        if (s.phase == kPhaseReduceScatter && static_cast<size_t>(s.algo.ring.step) >= total_ops) {
             s.phase = kPhaseAllGather;
             s.algo.ring.step = 0;
-        } else if (s.phase == kPhaseAllGather && s.algo.ring.step >= task.world_size - 1) {
+        } else if (s.phase == kPhaseAllGather && static_cast<size_t>(s.algo.ring.step) >= total_ops) {
             s.phase = kPhaseDone;
             return true;
         }
