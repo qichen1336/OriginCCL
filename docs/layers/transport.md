@@ -69,11 +69,13 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 256 KiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
 
-### RDMA 零拷贝阈值 benchmark
+### RDMA 零拷贝双向阈值 benchmark
 
 - 独立性能程序 `tests/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
-- 对每种路径、每个尺寸预热 3 次，常规档目标传输量为 45 GB。尺寸为 `32 B`、`1 KiB`、`4 KiB`、`16 KiB`、`32 KiB`、`64 KiB`、`128 KiB`、`256 KiB`、`512 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`；前四个小尺寸先传输 3.2 MB 未计时数据，再用 128 条消息校准并计时约 3 秒，故 `bytes` 随尺寸和传输路径变化。copy 通过限定调用基类 `TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。最近同一对 eRDMA 的实测中，copy 各尺寸约 `3.055–3.056 GB/s`；ZC 在 `32/64/128 KiB` 分别为 `0.744/1.347/2.357 GB/s`，从 `256 KiB` 起约 `3.04–3.07 GB/s`，故生产默认阈值设为 `256 KiB`。
-- 表格输出接收端、发送端总耗时与基于接收端总耗时计算的有效 GB/s；不是分位数统计。**每档前一半字节不计时**（ECS 等虚拟网络会突发高于标称带宽，只有跑满 credit 池后才落到持续带宽），`bytes` 列是计时的字节数，即该档有效吞吐是持续值而非突发均值。发送端的完成语义不同：copy 表示已提交到本地 ring，ZC 则等待发送 CQE；发送端 数据仅作辅助观察。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输；正确性由预热阶段校验保证。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。
+- **两个 rank 同时收发**：数据面按方向门控（`TrySend` 要求 `IsProducer()`、`TryRecv` 要求 `!IsProducer()`），单条连接只能单向承载，零拷贝子类更是每个 transport 只持有一份 MR 与收发状态，所以基准建**两条单向连接**——rank 0 当双 listener、rank 1 连两次（两个 MPI tag 各带一次端口交换与控制握手），每个 rank 各持一条 `outgoing`（自己发）与一条 `incoming`（自己收）。`Transfer` 每轮在同一个循环里推进两端的 `TrySend`/`TryRecv`，只在停滞的那一侧（一或两个 fd）`poll` 等待，两个方向都不互相饿死。
+- 对每种路径、每个尺寸预热 3 次，**两个 rank 都校验收到的 payload**；常规档目标传输量为**每方向** 45 GB。尺寸为 `32 B`、`1 KiB`、`4 KiB`、`16 KiB`、`32 KiB`、`64 KiB`、`128 KiB`、`256 KiB`、`512 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`；前四个小尺寸先每方向传输 3.2 MB 未计时数据，再用 128 条双向消息校准并计时约 3 秒，故 `bytes` 随尺寸和传输路径变化。copy 通过限定调用基类 `TransportRDMA::TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。
+- 表格的 `GB/s` 是**每方向**速率（`bytes / window_s`），`GB/s(bidi)` 是双向聚合（`2 ×` 每方向）；`window_s` 取两个 rank 计时耗时的较大者（两侧应几乎同时完成）。`bytes` 是**每方向**计时字节，`messages` 是每档双向消息条数，`calls`/`waits` 是两个 rank 的 `Try*` 调用数与停滞数之和。**每档前一半字节不计时**（ECS 等虚拟网络会突发高于标称带宽，只有跑满 credit 池后才落到持续带宽），故报告的是持续值而非突发均值。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输；正确性由预热阶段校验保证。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。链路全双工上限约 `5.7–5.8 GB/s`（聚合，详见 perftest 全双工记录），`GB/s(bidi)` 不应显著超过该量级。
+- **下述单向实测已与当前输出口径不同**，仅作为生产阈值 `kRdmaZcThreshold = 256 KiB` 的依据保留：旧单向程序（rank 1 发、rank 0 收，表格列为 `GB/s`/`recv_s`/`send_s`）在同一对 eRDMA 上 copy 各尺寸约 `3.055–3.056 GB/s`；ZC 在 `32/64/128 KiB` 分别为 `0.744/1.347/2.357 GB/s`，从 `256 KiB` 起约 `3.04–3.07 GB/s`。
 - 结果受 CPU/NUMA 与 RDMA NIC 亲和性、系统负载及锁页限制影响。应将两个 rank 绑定到靠近 NIC 的 CPU/NUMA 节点，并确保 `ulimit -l` 足以锁定最大 ZC 消息缓冲区；不同机器上的结果不应直接视为同一阈值结论。
 
 # 隐含约定
