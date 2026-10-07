@@ -12,7 +12,7 @@
 
 class MultiThreadExecutor : public Executor {
 public:
-    MultiThreadExecutor() = default;
+    explicit MultiThreadExecutor(int base_cpu = 0) : base_cpu_(base_cpu) {}
     ~MultiThreadExecutor() override;
 
     MultiThreadExecutor(const MultiThreadExecutor&) = delete;
@@ -38,4 +38,5 @@ private:
     size_t completed_channels_ = 0;
     bool batch_success_ = true;
     const CollPlan* plan_ = nullptr;
+    int base_cpu_ = 0;
 };

@@ -11,21 +11,21 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 - 等待 task 各 transport 的就绪（`GetFd()` + `GetPollEvents()`），把就绪喂给 `Topology::CollectiveStep`；不展开算法步骤。
 - 就绪到逻辑操作的映射由 transport 在 task 中的位置决定：`send_transports` 任一连接就绪推进 Writable（send），`recv_transports` 任一连接就绪推进 Readable（recv）。executor 不认具体 transport 类型，也不把就绪位当成方向（共享内存发送端等的是可读的 eventfd）。
 - 是 task 游标（`PlanTask.state`）的唯一推进者，故以非 const 引用推进；隐含保证 worker/单线程独占自己 channel，`PlanTask.state` 单写者，不加锁。
-- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数（每 rank 已 `PinProcessToCpu` 独占一核）用 `polling`，核数不够（已超订）用 `epoll`，不忙等抢 CPU。`multi_thread` / `reactor` 仍编译在库里，但没有选取它们的路径。
+- 运行时选定：`Communicator::Init` 在本地分组算完后按 `sysconf(_SC_NPROCESSORS_ONLN)` 与 `local_size` 选 executor——核数 ≥ local rank 数用 `multi_thread`（每 rank 主线程钉 `local_rank` 号核、每 channel worker 钉 `local_rank*n_channels+channel_id` 号核，并对总核数取模），核数不够（已超订）用 `epoll`，不忙等抢 CPU。`polling` / `reactor` 仍编译在库里，但没有选取它们的路径。
 
 # 文件介绍
 
 | 文件 | 职责 |
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
-| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker + per-task `epoll`（`EPOLLET`），遍历注册两侧连接、就绪全喂 Step，批次同步与错误汇总 |
+| `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker（channel `i` 由 worker `i` 执行），每 worker 忙轮询推进本 channel，无进展 `sched_yield()`；worker 钉 `base_cpu+channel_id` 号核（对总核数取模），批次同步与错误汇总 |
 | `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
 | `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |
 
 # 实现原理
 
-- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；每 worker 在每个 task 上建一个 `epoll`（`EPOLLET`），遍历该 task 两侧 transport 注册就绪，等待后全喂 Step。
+- **MultiThreadExecutor**（默认）：按 `plan.channels` 懒加载 worker，channel `i` 固定由 worker `i` 执行；每 worker 忙轮询本 channel 的 task（先 `CollectiveInit`，再循环对未完成 send/recv 分别喂 `CollectiveStep`，无进展 `sched_yield()`），`Run` 前把两侧 transport 设为 `Polling` 模式。
 - **EpollExecutor**：单线程把每 channel 队首 task 的各 transport 就绪注册进一个 epoll；channel 内多 task 顺序推进。
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Collective*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job（job 带逻辑 step 位，不带原始 epoll 位），worker 用 mutex + completion 队列 + eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。

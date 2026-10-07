@@ -1,13 +1,48 @@
-#include <cerrno>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
-#include <sys/epoll.h>
 #include <algorithm>
 #include <memory>
+#include <numeric>
 #include <vector>
 #include "executor/multi_thread_executor.h"
 #include "transport/transport.h"
 #include "topology/topology.h"
 #include "logger.h"
+
+namespace {
+void PinThreadToCpu(int cpu) {
+    const long cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_count <= 0) {
+        LOG_WARN("Failed to get the online CPU count, skip worker pinning");
+        return;
+    }
+    const int target = cpu % static_cast<int>(cpu_count);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(target, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        LOG_WARN("Failed to pin worker to CPU {}", target);
+    }
+}
+
+void SetPlanWaitMode(const CollPlan& plan) {
+    for (const ChannelPlan& channel : plan.channels) {
+        for (const PlanTask& task : channel.tasks) {
+            for (const auto& transport : task.send_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::Polling);
+                }
+            }
+            for (const auto& transport : task.recv_transports) {
+                if (transport) {
+                    transport->SetWaitMode(TransportWaitMode::Polling);
+                }
+            }
+        }
+    }
+}
+} // namespace
 
 MultiThreadExecutor::~MultiThreadExecutor() {
     StopWorkers();
@@ -62,73 +97,41 @@ bool MultiThreadExecutor::ExecuteTask(int channel_id, PlanTask& task) {
         return true;
     }
 
-    const int epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0) {
-        LOG_ERROR("MultiThreadExecutor failed to create epoll on channel {}", channel_id);
-        return false;
-    }
+    while (!topo->CollectiveDone(task)) {
+        const size_t before_send =
+            std::accumulate(task.state.send_progress.begin(), task.state.send_progress.end(), size_t{0});
+        const size_t before_recv =
+            std::accumulate(task.state.recv_progress.begin(), task.state.recv_progress.end(), size_t{0});
+        const int before_phase = task.state.phase;
 
-    auto add_fd = [&](Transport* transport, uint32_t tag) -> bool {
-        if (!transport) {
-            return true;
-        }
-        int fd = transport->GetFd();
-        uint32_t events = transport->GetPollEvents();
-        if (fd < 0 || events == 0) {
-            return true;
-        }
-        struct epoll_event ev;
-        ev.events = events | EPOLLET;
-        ev.data.u32 = tag;
-        if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            LOG_ERROR("MultiThreadExecutor epoll_ctl ADD fd {} failed on channel {}", fd, channel_id);
+        const bool send_done =
+            std::all_of(task.state.send_done.begin(), task.state.send_done.end(), [](char d) { return d != 0; });
+        const bool recv_done =
+            std::all_of(task.state.recv_done.begin(), task.state.recv_done.end(), [](char d) { return d != 0; });
+
+        if (!send_done && !topo->CollectiveStep(task, CollEvent::Writable)) {
+            LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
             return false;
         }
-        return true;
-    };
-
-    const size_t transport_count = task.recv_transports.size() + task.send_transports.size();
-    bool registered = true;
-    for (const auto& transport : task.recv_transports) {
-        if (!add_fd(transport.get(), 0u)) {
-            registered = false;
-            break;
+        if (!recv_done && !topo->CollectiveStep(task, CollEvent::Readable)) {
+            LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
+            return false;
         }
-    }
-    if (registered) {
-        for (const auto& transport : task.send_transports) {
-            if (!add_fd(transport.get(), 1u)) {
-                registered = false;
-                break;
-            }
+
+        const size_t after_send =
+            std::accumulate(task.state.send_progress.begin(), task.state.send_progress.end(), size_t{0});
+        const size_t after_recv =
+            std::accumulate(task.state.recv_progress.begin(), task.state.recv_progress.end(), size_t{0});
+        if (after_send == before_send && after_recv == before_recv && task.state.phase == before_phase) {
+            sched_yield();
         }
     }
 
-    std::vector<struct epoll_event> events(std::max<size_t>(transport_count, 1));
-    while (registered && !topo->CollectiveDone(task)) {
-        int ready = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), -1);
-        if (ready < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            LOG_ERROR("MultiThreadExecutor epoll_wait failed on channel {}", channel_id);
-            break;
-        }
-        for (int i = 0; i < ready; ++i) {
-            CollEvent op = (events[i].data.u32 == 0u) ? CollEvent::Readable : CollEvent::Writable;
-            if (!topo->CollectiveStep(task, op)) {
-                LOG_ERROR("MultiThreadExecutor step failed on channel {}", channel_id);
-                registered = false;
-                break;
-            }
-        }
-    }
-
-    close(epfd);
-    return registered && topo->CollectiveDone(task);
+    return true;
 }
 
 void MultiThreadExecutor::WorkerLoop(size_t channel_id, uint64_t completed_batch_id) {
+    PinThreadToCpu(base_cpu_ + static_cast<int>(channel_id));
     while (true) {
         const CollPlan* plan = nullptr;
         uint64_t batch_id = 0;
@@ -169,6 +172,7 @@ bool MultiThreadExecutor::Run(const CollPlan& plan) {
     EnsureWorkers(plan.channels.size());
 
     if (!plan.channels.empty()) {
+        SetPlanWaitMode(plan);
         std::unique_lock<std::mutex> lock(mutex_);
         plan_ = &plan;
         active_channels_ = workers_.size();

@@ -21,7 +21,7 @@
 #include "topology/topology_tree.h"
 #include "topology/topology_p2p.h"
 #include "executor/epoll_executor.h"
-#include "executor/polling_executor.h"
+#include "executor/multi_thread_executor.h"
 
 namespace {
 constexpr int kDefaultChannelCount = 4;
@@ -31,13 +31,13 @@ constexpr int kConnectRetryIntervalMs = 100;
 
 constexpr const char* kRendezvousDir = "/tmp/originccl";
 
-// Each rank pins itself to one core, so a machine where the local ranks already saturate the
-// cores gives polling its own CPU; an oversubscribed one blocks in epoll instead of spinning.
-std::unique_ptr<Executor> MakeExecutor(int local_size) {
+// The main thread pins to the local-rank core; each channel worker pins to a distinct core
+// offset from local_rank * n_channels, so ranks spread their workers across the machine.
+std::unique_ptr<Executor> MakeExecutor(int local_size, int local_rank, int n_channels) {
     const long cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (cores >= local_size) {
-        LOG_INFO("Using the polling executor ({} cores for {} local ranks)", cores, local_size);
-        return std::make_unique<PollingExecutor>();
+        LOG_INFO("Using the multi-thread executor ({} cores for {} local ranks)", cores, local_size);
+        return std::make_unique<MultiThreadExecutor>(local_rank * n_channels);
     }
     LOG_INFO("Using the epoll executor ({} cores for {} local ranks)", cores, local_size);
     return std::make_unique<EpollExecutor>();
@@ -129,7 +129,7 @@ bool Communicator::Init(const CommConfig& cfg) {
         is_single_machine = true;
         LOG_INFO("Rank {}: Single-rank communicator, skip data-plane connections", config.rank);
         Utils::PinProcessToCpu(local_rank);
-        executor = MakeExecutor(local_size);
+        executor = MakeExecutor(local_size, local_rank, n_channels);
         return true;
     }
 
@@ -269,7 +269,7 @@ bool Communicator::Init(const CommConfig& cfg) {
     ring_topology_->FillChannels(*this, channels);
     tree_topology_->FillChannels(*this, channels);
 
-    executor = MakeExecutor(local_size);
+    executor = MakeExecutor(local_size, local_rank, n_channels);
     Utils::PinProcessToCpu(local_rank);
 
     if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {
