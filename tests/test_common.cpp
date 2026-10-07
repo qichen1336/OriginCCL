@@ -352,6 +352,23 @@ std::vector<CaseSpec> BuildCases(int level) {
             }
         }
     }
+
+    const size_t world_size = static_cast<size_t>(ExpectedWorldSize(level));
+    for (size_t di = 0; di < 4; ++di) {
+        const size_t type_size = Utils::GetDataTypeSize(kDtypes[di]);
+        const size_t count = OcclConfig::kTreeThresholdChunks * OcclConfig::kChunkBytes / type_size + world_size + 1;
+        for (ReduceOp op : kOps) {
+            for (bool inplace : {false, true}) {
+                CaseSpec spec;
+                spec.func = CollFunc::AllReduce;
+                spec.count = count;
+                spec.dtype = kDtypes[di];
+                spec.op = op;
+                spec.inplace = inplace;
+                cases.push_back(spec);
+            }
+        }
+    }
     return cases;
 }
 
