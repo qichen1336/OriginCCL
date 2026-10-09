@@ -89,3 +89,37 @@ P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer
 `scripts/run_tests.sh --suite p2p --oversubscribe` 固定用四 rank，覆盖同机和模拟跨机、连接缓存与隔离、乱序接入、与集合操作交替、polling/epoll 及最大 48 MiB 数据。P2P 数据量不缩放；无 RDMA 时验证拒绝回退，再将跨机数据传输记为 SKIP。
 
 集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。
+
+## 性能基准结果（阿里云 ecs.g8y.8xlarge，2 节点，eRDMA，2026-10）
+
+环境：两台 `ecs.g8y.8xlarge`（aarch64，32 核），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE）。
+perftest 实测链路：单向 ~2.9 GB/s、双向合计 ~5.6–5.8 GB/s（每方向 ~2.9 GB/s）。
+两个性能程序都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
+
+### `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）
+
+每条消息各建两条单向连接（一收一发），单线程内 `if` 交错推进两方向；连接建立后 `SetWaitMode(Polling)`，
+与忙轮询驱动对齐（否则每个 `Try*` 都付一次 EventDriven 的 `poll(fd,0)` syscall，吞吐掉到 ~3.5 GB/s）。
+表格 `GB/s` 是双向聚合值，折合每方向 ~3 GB/s，与 perftest 单向一致：
+
+| size | copy | ZC |
+| --- | --- | --- |
+| 32 KiB | 5.59 | 1.68 |
+| 128 KiB | 5.96 | 5.19 |
+| 512 KiB | 5.54 | 6.07 |
+| 2 MiB | 5.47 | 6.02 |
+| 8 MiB | 5.30 | 6.02 |
+| 32 MiB | 5.64 | 6.06 |
+
+ZC 小尺寸（<512 KiB）慢是延迟主导：signaled SEND 的完成要等对端 ACK，每条消息含一个完整 RTT，与循环结构无关。
+
+### `test_allreduce_benchmark`（N=2 时 `busbw == algbw`）
+
+`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。默认 256 MiB / 100 次迭代：
+
+```
+bytes=268435456  count=67108864  busGB/s=2.92  PASS
+```
+
+2.92 GB/s 已打满每方向 ~2.9 GB/s 的链路可持续上限，与 perftest 单向一致。尺寸阶梯（短窗，偏高）：
+1 MiB 3.56 / 4 MiB 6.17 / 16 MiB 7.08 / 64 MiB 5.95 / 128 MiB 3.70 / 256 MiB 2.92 GB/s。
