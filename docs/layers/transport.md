@@ -24,10 +24,10 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 | `include/transport/transport_shm.h` / `src/transport/transport_shm.cpp` | 共享内存实现：memfd 环 + 两个 eventfd、rendezvous 控制 socket、方向约束 |
 | `include/transport/transport_rdma.h` / `src/transport/transport_rdma.cpp` | RDMA 实现：CM 建链、RC QP、`WRITE_WITH_IMM` 环形缓冲、credit 回收、completion channel 就绪 fd、设备探测 |
 | `include/transport/transport_rdma_zc.h` / `src/transport/transport_rdma_zc.cpp` | RDMA 子类：阈值以上注册用户 MR，用独立 RC QP 直接 `SEND/RECV`；阈值以下完全走基类环形缓冲 |
-| `tests/test_transport_shm.cpp` | mpirun 端点对的共享内存测试（rendezvous/描述符传递/握手/阻塞与非阻塞/回绕/反压/方向拒绝/释放） |
-| `tests/test_transport_rdma.cpp` | mpirun 端点对的 RDMA 测试（CM 握手、RC、write、槽位回收、边界尺寸到 5 MiB） |
-| `tests/test_transport_rdma_zc.cpp` | mpirun 端点对的零拷贝 RDMA 测试（阈值前后、多 chunk、两条路径交替、progress 全有或全无、方向角色对调） |
-| `tests/test_transport_tcp.cpp` | mpirun 端点对的 TCP 测试（连上即非阻塞、部分收发、背压与恢复、就绪掩码、有序关闭） |
+| `tests/regression/test_transport_shm.cpp` | mpirun 端点对的共享内存测试（rendezvous/描述符传递/握手/阻塞与非阻塞/回绕/反压/方向拒绝/释放） |
+| `tests/regression/test_transport_rdma.cpp` | mpirun 端点对的 RDMA 测试（CM 握手、RC、write、槽位回收、边界尺寸到 5 MiB） |
+| `tests/regression/test_transport_rdma_zc.cpp` | mpirun 端点对的零拷贝 RDMA 测试（阈值前后、多 chunk、两条路径交替、progress 全有或全无、方向角色对调） |
+| `tests/regression/test_transport_tcp.cpp` | mpirun 端点对的 TCP 测试（连上即非阻塞、部分收发、背压与恢复、就绪掩码、有序关闭） |
 | `tests/transport_check.*` | 三种传输共用的接口语义套件；不可共用的差异（方向约束、就绪掩码、对端关闭可检测性）在 `Setup` 里声明 |
 
 # 实现原理
@@ -66,12 +66,12 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 对外 `progress` 为全有或全无：所有尺寸都只报告 `{0, size}`，只有全部 WR 完成后才报告完整字节数。`done` 置位后调用方才能复用发送缓冲或读取接收数据。
 - MR 生命周期：按 `(buffer, size, 方向)` 缓存，命中即复用，不命中先 `ibv_dereg_mr` 旧的再 `ibv_reg_mr` 新的，直到 `CloseResources` 才释放。稳态下同一 buffer 重复收发不再付注册开销；同一 buffer 在 `done` 前必须保持地址与大小不变，换 buffer 直接拒绝；`done` 后调用方可安全改写缓冲。
 - 握手、阻塞 `Send`/`Recv`、方向约束、`GetFd`/`GetPollEvents` 都复用基类；独立 QP 共用同一 PD 与 CQ，所以完成事件由一个 CQ 收集、以 `qp_num` 区分，就绪仍然只有一个 fd。`Accept()` 通过虚 `MakePeer()` 创建 `TransportRDMAZc`，免得基类硬编码类型。
-- 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 256 KiB 阈值按用户消息长度生效。`tests/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/test_p2p.cpp` 验证公开接口和计划。
+- 集合连接仍选 `TransportRDMA`；P2P 网络连接选 RDMA 时使用 `TransportRDMAZc`，跨机 P2P 强制该类型且不回退 TCP。communicator 在 bootstrap 前建立独立零拷贝 listener，planner 首次使用时建连；P2P 整段提交使 256 KiB 阈值按用户消息长度生效。`tests/regression/test_transport_rdma_zc.cpp` 直接验证传输语义，`tests/regression/test_p2p.cpp` 验证公开接口和计划。
 - 测试用 `mpirun` 而非 fork（verbs/CM 初始化后只 fork 不 exec，子进程 `ibv_post_send` 报 EPERM）。
 
 ### RDMA 零拷贝双向阈值 benchmark
 
-- 独立性能程序 `tests/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
+- 独立性能程序 `tests/benchmark/test_rdma_zc_benchmark` 不属于 `scripts/run_tests.sh` 回归矩阵。构建后用两个 MPI rank 运行：`mpirun -np 2 build/tests/benchmark/test_rdma_zc_benchmark`。没有 active RDMA port 时返回 SKIP（退出码 2）。
 - **两个 rank 同时收发**：数据面按方向门控（`TrySend` 要求 `IsProducer()`、`TryRecv` 要求 `!IsProducer()`），单条连接只能单向承载，零拷贝子类更是每个 transport 只持有一份 MR 与收发状态，所以基准建**两条单向连接**——rank 0 当双 listener、rank 1 连两次（两个 MPI tag 各带一次端口交换与控制握手），每个 rank 各持一条 `outgoing`（自己发）与一条 `incoming`（自己收）。数据面在**单线程**里推进：`RunBidirectional` 用一个循环同时驱动两个方向，但两方向**状态完全隔离**（各自持有 transport、字节预算、进度与计数），以**整档字节预算**为单位推进而非逐条配对——一个方向可以领先另一个方向任意多条消息，只有两个方向的预算都耗尽才结束计时。发送侧把**在途消息数限在 `kPipelineDepth`（8）**内：逐条把整条消息交给 `TrySend` 会每次打满整条传输环窗口并触发 credit 回退，吞吐反而掉到 ~3.5 GB/s；把在途深度收在信用窗口之下能让信用平滑回补、跑到 ~6 GB/s。只要任一方向本节能推进就继续自旋，只有全部未完成方向都停滞时才把它们各自的 fd 一起 `poll` 等待，两个方向都不互相饿死。
 - 对每种路径、每个尺寸预热 3 次，**不做接收端数据校验、纯测带宽**（逐字节校验会反压发送端并引入额外 CPU 开销，正确性由 `test_transport_rdma_zc.cpp` / `test_p2p.cpp` 覆盖）；常规档目标传输量为**每方向** 45 GB。尺寸为 `32 B`、`1 KiB`、`4 KiB`、`16 KiB`、`32 KiB`、`64 KiB`、`128 KiB`、`256 KiB`、`512 KiB`、`1 MiB`、`5 MiB`、`16 MiB - 1`、`16 MiB`、`17 MiB`、`32 MiB`、`48 MiB`；前四个小尺寸先每方向传输 3.2 MB 未计时数据，再用 128 条双向消息校准并计时约 3 秒，故 `bytes` 随尺寸和传输路径变化。copy 通过限定调用基类 `TransportRDMA::TrySend`/`TryRecv` 强制使用注册环；ZC 通过阈值为 0 的实例强制直接路径。
 - 表格的 `GB/s` 是**双向聚合**速率（`2 × bytes / elapsed_s`）；`elapsed_s` 取两个 rank 计时耗时的较大者（两侧应几乎同时完成，慢的一侧决定耗时）。`bytes` 是**每方向**计时字节，`messages` 是每档每方向消息条数，`calls`/`waits` 是两个 rank 的 `Try*` 调用数与停滞数之和。**每档前一半字节不计时**（ECS 等虚拟网络会突发高于标称带宽，只有跑满 credit 池后才落到持续带宽），故报告的是持续值而非突发均值。计时不含 payload 校验：逐字节校验单核仅 ~1.5 GB/s，且 credit 门控下接收端的校验会反压拖慢发送端，一旦计入就测的是校验而非传输。计时包含 MR 注册/注销和就绪等待，不含连接建立及预热。链路全双工上限约 `5.7–5.8 GB/s`（聚合，详见 perftest 全双工记录），`GB/s` 不应显著超过该量级。

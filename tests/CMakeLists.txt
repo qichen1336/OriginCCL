@@ -1,7 +1,7 @@
 # Rank, world size and the bootstrap UniqueId all travel over MPI: rank 0 generates the id and
 # every rank receives it with MPI_Bcast, so every rank-based run must go through an MPI
 # launcher. A process started on its own is an MPI singleton (rank 0, world size 1). Use
-# scripts/run_tests.sh for the full matrix; the executables below are the five entries it drives.
+# scripts/run_tests.sh for the full matrix; it drives the regression/ executables.
 find_package(MPI REQUIRED COMPONENTS CXX)
 
 # The collective suites share the case generator, the independent oracle and the result
@@ -20,37 +20,8 @@ if(OCCL_SMALL_TESTS)
     target_compile_definitions(occl_test_support PRIVATE OCCL_SMALL_TESTS)
 endif()
 
-# Single-machine and multi-machine collective suites. The multi-machine suite injects a logical
-# hostname through CommConfig::get_hostname, so "several machines" never leaves one host.
-add_executable(test_single_machine test_single_machine.cpp)
-target_link_libraries(test_single_machine occl_test_support)
-
-add_executable(test_multi_machine test_multi_machine.cpp)
-target_link_libraries(test_multi_machine occl_test_support)
-
-add_executable(test_p2p test_p2p.cpp)
-target_link_libraries(test_p2p occl_test_support)
-
-# Transport suites. TCP and shared memory need two processes and no device; RDMA needs a device
-# with an active port and exits with 2 when there is none.
-add_executable(test_transport_tcp test_transport_tcp.cpp)
-target_link_libraries(test_transport_tcp occl_transport_support)
-
-add_executable(test_transport_shm test_transport_shm.cpp)
-target_link_libraries(test_transport_shm occl_transport_support)
-
-add_executable(test_transport_rdma test_transport_rdma.cpp)
-target_link_libraries(test_transport_rdma occl_transport_support)
-
-add_executable(test_transport_rdma_zc test_transport_rdma_zc.cpp)
-target_link_libraries(test_transport_rdma_zc occl_transport_support)
-
-add_executable(test_rdma_zc_benchmark test_rdma_zc_benchmark.cpp)
-target_link_libraries(test_rdma_zc_benchmark occl_transport_support)
-
-add_executable(test_allreduce_benchmark test_allreduce_benchmark.cpp)
-target_link_libraries(test_allreduce_benchmark occl_test_support)
-target_compile_definitions(test_allreduce_benchmark PRIVATE "OCCL_BENCH_BUILD_TYPE=\"$<CONFIG>\"")
-if(OCCL_SMALL_TESTS)
-    target_compile_definitions(test_allreduce_benchmark PRIVATE OCCL_SMALL_TESTS)
-endif()
+# The suites live in two subdirectories: regression/ holds the functional entries that
+# scripts/run_tests.sh drives, benchmark/ holds the standalone performance programs. Both are
+# added after the support libraries above so they can link them.
+add_subdirectory(regression)
+add_subdirectory(benchmark)

@@ -252,7 +252,7 @@ if [ "${LIST_CASES:-false}" = true ]; then
         echo "error: --list-cases needs an existing build; run once without it, or use --no-build" >&2
         exit "${EXIT_USAGE}"
     fi
-    binary="${BUILD_DIR}/tests/test_single_machine"
+    binary="${BUILD_DIR}/tests/regression/test_single_machine"
     if [ ! -x "${binary}" ]; then
         echo "error: ${binary} is missing; build first" >&2
         exit "${EXIT_USAGE}"
@@ -305,7 +305,7 @@ build() {
         cmake "${args[@]}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
         cmake --build "${BUILD_DIR}" -j "${JOBS}" >>"${REPORT_DIR}/build.log" 2>&1 || return 1
     fi
-    [ -x "${BUILD_DIR}/tests/test_single_machine" ] || return 1
+    [ -x "${BUILD_DIR}/tests/regression/test_single_machine" ] || return 1
     return 0
 }
 
@@ -375,19 +375,19 @@ fi
 
 # The case matrix is shared by both collective suites, so one listing is enough.
 if [ "${total_fail}" -eq 0 ]; then
-    case_per_rank="$("${BUILD_DIR}/tests/test_single_machine" --level "${LEVEL}" --list-cases 2>/dev/null |
+    case_per_rank="$("${BUILD_DIR}/tests/regression/test_single_machine" --level "${LEVEL}" --list-cases 2>/dev/null |
         grep -o 'cases=[0-9]*' | cut -d= -f2 | awk '{ sum += $1 } END { print sum + 0 }')"
     for suite in $(echo "${SUITES}" | tr ',' ' '); do
         case "${suite}" in
-        single) run_one "single" "${SINGLE_RANKS}" "test_single_machine" ;;
-        multi) run_one "multi" "${MULTI_RANKS}" "test_multi_machine" ;;
+        single) run_one "single" "${SINGLE_RANKS}" "regression/test_single_machine" ;;
+        multi) run_one "multi" "${MULTI_RANKS}" "regression/test_multi_machine" ;;
         p2p)
-            run_one "p2p-local" 4 "test_p2p"
-            run_one "p2p-rdma" 4 "test_p2p"
+            run_one "p2p-local" 4 "regression/test_p2p"
+            run_one "p2p-rdma" 4 "regression/test_p2p"
             ;;
         transport)
             for transport in tcp shm rdma rdma_zc; do
-                run_one "transport-${transport}" 2 "test_transport_${transport}"
+                run_one "transport-${transport}" 2 "regression/test_transport_${transport}"
             done
             ;;
         esac

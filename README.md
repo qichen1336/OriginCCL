@@ -82,7 +82,7 @@ sudo scripts/setup_softroce.sh --down   # 拆除
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-七个测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。
+`tests/regression/` 下七个功能回归测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。两个性能基准在 `tests/benchmark/`，不属回归矩阵，手动 `mpirun` 运行（二进制在 `build/tests/benchmark/`）。
 
 P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。发送连接固定在 channel 0、接收连接固定在 channel 1，按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
 
@@ -94,7 +94,7 @@ P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer
 
 环境：两台 `ecs.g8y.8xlarge`（aarch64，32 核），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE）。
 perftest 实测链路：单向 ~2.9 GB/s、双向合计 ~5.6–5.8 GB/s（每方向 ~2.9 GB/s）。
-两个性能程序都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
+两个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
 
 ### `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）
 
