@@ -92,12 +92,6 @@ struct CollOpState {
     struct {
         struct {
             int step;
-            size_t send_step;
-            size_t recv_step;
-            size_t send_chunk;
-            size_t recv_chunk;
-            std::vector<size_t> ready_chunks;
-            std::vector<size_t> allgather_ready_chunks;
         } ring;
         struct {
             std::vector<int> recv_chunk;

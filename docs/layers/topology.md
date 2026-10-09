@@ -14,7 +14,7 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 - `FillChannels(comm, channels)`：bootstrap 之后、`FillPeers`/`InitChannels` 之前调用，把拓扑形状写入每个 `Channel`（ring 填 `channel.ring.prev/next`，tree 填 `channel.tree` 的 `parent`/`children`/`star_peers`）；本机视角与机器分组从 `comm` 成员读取，tree 同时把每个 channel 的运行时角色表 `channel_roles_` 与 `is_leader_` 记到自己成员。
 - `FillPeers(channel, edges)`：返回本 rank 在该拓扑下要连接的全部 peer（`TopoEdge{peer, is_send}`，每条有向边一条），形状来源是 `channel`（ring 读 `channel.ring`，tree 读 `channel.tree` 三桶）。communicator 据此建连接（见 [communicator.md](communicator.md)）。
 - `FillTransports(channel, task)`：按拓扑语义填充 task.send_transports/recv_transports；tree 按 `[star_peers, children, parent]` 顺序输出，与该 channel 的角色表一一对齐；P2P 按 task.func/peer 选择独立连接。
-- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有游标 `algo`**（`algo.ring.step` 供 ring 非 AllReduce 操作使用；AllReduce 用独立的收发分区/chunk 游标与 `ready_chunks` 前缀；tree 用 `algo.tree.{recv_chunk,send_chunk}`；一个 task 只绑定一种拓扑，只有对应的一份被读写）。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
+- 算法游标 `CollOpState`（`include/types.h`）：纯数据、无回调、无 mutable，存 `phase`、`send_progress`、`recv_progress`、`send_done`、`recv_done`、`temp_buffer`，以及**拓扑私有游标 `algo`**（`algo.ring.step` 与 `algo.tree.{recv_chunk,send_chunk}`；一个 task 只绑定一种拓扑，只有对应的一份被读写）。`algo.ring.step` 对 AllReduce 是阶段内扁平 micro-op 序号，对 ring 其余操作是环内 step。progress/done 是与 transport 向量一一对应的向量（`send_done`/`recv_done` 用 `std::vector<char>` 而非 `vector<bool>`，因 `Try*` 的 done 是 `bool*` 出参）；整侧完成由 `std::all_of` 现算。失败不存于游标（Init/Step 返回值即错误通道）。
 - 不负责：不监听 fd、不决定等待策略、不开线程；无可变成员状态。
 
 # 文件介绍
@@ -32,7 +32,7 @@ topology 与 executor、transport 一样单独成目录；头文件从 include �
 
 | 操作 | 阶段与布局 |
 |------|------------|
-| AllReduce | 支持原地；每个 task 的数据先均衡切为 `world_size` 个逻辑分区，再在分区内按 `kChunkBytes` 收发。收发 cursor 都连续走过 `2 * (world_size - 1)` 个分区步，前半段为 ReduceScatter，后半段为 AllGather；但不存在 task 级阶段切换。接收 cursor 在某个 chunk 完成最后一次 reduce 后，立刻将该 chunk 放入 `allgather_ready_chunks`，后续接收对该 chunk 仅写入。发送 cursor 分别受 ReduceScatter 与 AllGather 的 ready 前缀约束，只有其追上对应接收 cursor 时才等待；AVG 在最后一次 reduce 后除一次 |
+| AllReduce | ReduceScatter + AllGather 两阶段，支持原地；`algo.ring.step` 是当前阶段内的扁平 micro-op 游标（`unit = step / (world_size-1)`、`step_in_unit = step % (world_size-1)`），先跑完全部 unit 的 ReduceScatter 再跑完全部 unit 的 AllGather；每轮只收发一个 `kChunkBytes` 块；AVG 在每 unit 每 chunk 的 RS→AG 边界仅对本 rank 完成块除一次 |
 | Broadcast | root 发起，非 root 收齐后转发，root 的前驱只接收 |
 | Reduce | root 的 next 发起部分结果，各节点合并自身输入后转发，root 最后归约；非 root 使用 scratch |
 | AllGather | 先复制本 rank 块，再执行 N-1 轮并发收发，recv_buf 按来源 rank 排列 |
