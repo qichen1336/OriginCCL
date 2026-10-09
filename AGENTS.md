@@ -38,7 +38,7 @@ scripts/                   run_tests.sh（唯一入口）
 
 | 层 | 头文件 | 职责 | 铁律 |
 | --- | --- | --- | --- |
-| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` / `transport/transport_rdma_zc.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态）；`transport_rdma_zc.h` 是 RDMA 的零拷贝子类，阈值 (16 MiB) 以上用独立 QP 直发用户 MR，以下完全走基类环形缓冲 |
+| **transport** | `transport/transport.h` / `transport/transport_tcp.h` / `transport/transport_shm.h` / `transport/transport_rdma.h` / `transport/transport_rdma_zc.h` | 字节搬运 + 就绪可等待性（readiness） | TCP/SHM/RDMA 同构（listener + connection 双形态）；`transport_rdma_zc.h` 是 RDMA 的零拷贝子类，阈值 (256 KiB) 以上用独立 QP 直发用户 MR，以下完全走基类环形缓冲 |
 | **topology** | `topology/topology.h` / `topology/topology_ring.h` / `topology/topology_tree.h` / `topology/topology_p2p.h` | 拥有集合与 P2P 算法，把 `PlanTask.state` 当游标推进 | 通用 `CollectiveInit/Step/Done` 三阶段接口，只做非阻塞事件处理 |
 | **planner** | `planner.h` | 把一批 `CollTask` 排序（集合在前、P2P 轮次在后）并规划为 `CollPlan`；集合切片，P2P 按轮次建连 | 集合纯规划，P2P 准备连接；无回调、无 `std::function`；排序/分批为独立函数（`SortTasks`/`Plan`/`PlanRound`） |
 | **executor** | `executor/executor.h` + 四实现 | 决定“如何等待 transport 就绪”，驱动 topology | `Init` 按核数与 local rank 数在 polling 与 epoll 间**运行时**选定；是 task 游标的**唯一推进者**；只调用通用三阶段接口，不按集合类型分派 |
