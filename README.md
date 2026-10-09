@@ -82,7 +82,7 @@ sudo scripts/setup_softroce.sh --down   # 拆除
 scripts/run_tests.sh --level 0 --list-cases --no-build
 ```
 
-`tests/regression/` 下七个功能回归测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。两个性能基准在 `tests/benchmark/`，不属回归矩阵，手动 `mpirun` 运行（二进制在 `build/tests/benchmark/`）。
+`tests/regression/` 下七个功能回归测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。三个性能基准在 `tests/benchmark/`，不属回归矩阵，手动 `mpirun` 运行（二进制在 `build/tests/benchmark/`）。
 
 P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。发送连接固定在 channel 0、接收连接固定在 channel 1，按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
 
@@ -94,7 +94,7 @@ P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer
 
 环境：两台 `ecs.g8y.8xlarge`（aarch64，32 核），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE）。
 perftest 实测链路：单向 ~2.9 GB/s、双向合计 ~5.6–5.8 GB/s（每方向 ~2.9 GB/s）。
-两个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
+三个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
 
 ### `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）
 
@@ -123,3 +123,15 @@ bytes=268435456  count=67108864  busGB/s=2.92  PASS
 
 2.92 GB/s 已打满每方向 ~2.9 GB/s 的链路可持续上限，与 perftest 单向一致。尺寸阶梯（短窗，偏高）：
 1 MiB 3.56 / 4 MiB 6.17 / 16 MiB 7.08 / 64 MiB 5.95 / 128 MiB 3.70 / 256 MiB 2.92 GB/s。
+
+### `test_allreduce_ompi_benchmark`（OriginCCL 的 OpenMPI 公平对照）
+
+复用与 `test_allreduce_benchmark` **逐行相同**的 harness（选项、尺寸阶梯、输入值、逐元素独立 oracle、`MPI_Wtime` 计时口径、`busbw` 公式与表格列），唯一差别是把 `comm.AllReduce(...)` 换成阻塞的 `MPI_Allreduce(..., MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD)` out-of-place；调用前用 `Utils::PinProcessToCpu(local_rank)` 绑到与 OriginCCL 相同的本机核，因此两边可逐档对读。
+
+`--channels` 为命令行兼容而被接受并忽略（MPI 后端无 channel 概念），其余选项默认值与 `test_allreduce_benchmark` 一致：
+
+```bash
+mpirun -np 2 --host <ip1>:1,<ip2>:1 build/tests/benchmark/test_allreduce_ompi_benchmark
+```
+
+两侧表格同为 `bytes / count / min_us / median_us / max_us / algGB/s / busGB/s / check`，直接并排比较即可。
