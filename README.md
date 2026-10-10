@@ -135,3 +135,40 @@ mpirun -np 2 --host <ip1>:1,<ip2>:1 build/tests/benchmark/test_allreduce_ompi_be
 ```
 
 两侧表格同为 `bytes / count / min_us / median_us / max_us / algGB/s / busGB/s / check`，直接并排比较即可。
+
+## 案例：copy 路径双向吞吐「一个方向被饿死」的定位（2026-10-11，已坐实）
+
+### 现象
+
+`test_rdma_zc_benchmark` 双向跑时，`rdmatop` 观察到 copy 路径的 TX / RX 不是同时打满，而是一侧 ~26 Gb/s、另一侧 ~1.7 Gb/s，持续数秒后**翻面**；整体停在 ~3.3 GB/s（半双工）。ZC 路径无此现象：两向各 ~26 Gb/s，满双工 ~6.4 GB/s。用户原问「为什么一个方向的吞吐被饿死、另一个方向起不来」，本节记录完整的定位链。
+
+### 前因：copy 的发送被 credit 门控，不是 CPU
+
+copy 路径发送由 credit 窗口门控：`TrySend` 里 `limit = CreditsReceived() + kRdmaSlotCount`，`CreditsReceived()` 读的是本端注册内存里一个 8 字节计数器——对端用一条 8 字节 signaled RDMA_WRITE 直接改写它。发送端的命根子就是这一个数：它涨就发得动，它停住则 `available=0`、一条 WRITE 都发不出，只能空转。因此「给再多 CPU 轮询也没用」——瓶颈是 credit 回不来，不是缺时间片。ZC 用 SEND/RECV、无 credit 环，所以免疫。
+
+### 决定性实验：`credit_probe` 逐拍时间戳（`tests/benchmark/credit_probe.cpp`）
+
+子类化 `TransportRDMA`（不改传输层），在两处挂钩：① `HandleCompletion` 识别 credit 帧的 CQE（credit 用 `wr_id=0`，数据帧 `wr_id=slot+1`，天然可区分），测 credit 帧 `ibv_post_send → CQE`（signaled WRITE，CQE 在对端 ACK 后产生）的完整往返；② `TrySend` 覆盖测发送端「credit 耗尽到重新到账」的 stall 时长。**同一条连接先跑单向（反向线空闲）再跑双向**，唯一变量是「有没有反向满速流量」。
+
+结果（两台 eRDMA，12 GB/方向/阶段，两次运行完全一致）：
+
+| credit 帧往返 | 单向 | 双向 rank0 | 双向 rank1 |
+| --- | --- | --- | --- |
+| mean | 37.9 µs | **360.2 µs** | 38.7 µs |
+| p50 | 37.7 µs | 38.0 µs | 38.2 µs |
+| p99 | 50.9 µs | **2951 µs** | 52.7 µs |
+| max | 636 µs | **7020 µs** | 592 µs |
+
+铁证：双向下 rank0 回传的 credit 帧往返尾部炸到 **p99≈3 ms、max≈7 ms（≈200× 基线）**，rank1 的 credit 往返干净如单向。credit 帧的「post→CQE」往返确实被拖到毫秒级，且**只发生在占优方向**。
+
+### 机制（精确定位）
+
+credit 帧不是被**对向**数据堵，是被**自己同方向 egress 上满速的 outgoing 数据**堵：每个 rank 的 NIC 物理 egress 同时承载两样东西——①本方向 outgoing 数据、②本方向回传的 credit 帧（receiver→sender 走同一条物理线）。占优方满速发数据 → 它的 egress 满载 → 它回传的 credit 帧排在数据后 → 对端等 credit → 对端被饿 → 对端 egress 空出来 → 对端 credit 畅通 → 占优方保持满速。**双向正反馈自增强**；p50 快 / p99 慢 的不对称正是「占优期 credit 被堵 / 让出线路期 credit 畅通」的翻面形态。
+
+### 为什么 `rdma_write_lat.cpp` 复现不出
+
+它是单向单条、对端 rank1 只 park 保活 QP 不回任何软件，`RDMA_WRITE` 的 ACK 由 NIC 硬件自动回、不经过 credit 反馈环，且 4 KiB / 17.6 µs ≈ 0.23 GB/s 远低于满速，无法占道也无对向流量。真正暴露 3.4× 的是双向软件往返的 `rdma_pingpong.cpp`。
+
+### 附带：512 槽死锁的根因
+
+`TrySend` 里 `send_seq += count` 在 `ibv_post_send` 成功**立即**加，而 credit 是接收端**消费后**才回的真实计数。当窗口 `kRdmaSlotCount` 512 > recv pool 64 时，`WRITE_WITH_IMM` 超出可匹配 WQE → RNR NACK → 该 WRITE 不写数据、不产生 IMM CQE、也不为它回 credit，但 `send_seq` 已虚增 → `send_seq - credits = 512`（窗口打满）→ 停发；接收端环空等数据。**双方都等对方 → 永久死锁**。32 槽（≤64）不死锁；128 槽虚增有限、credit 追平 → 慢但推进。不变量：**`kRdmaSlotCount ≤ kRdmaRecvPool`**。
