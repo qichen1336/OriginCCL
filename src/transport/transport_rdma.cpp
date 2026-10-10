@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netpacket/packet.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include "transport/transport_rdma.h"
@@ -94,7 +95,8 @@ bool TransportRDMA::Probe(std::string& addr) {
     return found;
 }
 
-// RoCE v1 and iWARP publish no IPv4-mapped GID, so the address comes from the net device the GID names.
+// RoCE v1 and iWARP publish no IPv4-mapped GID, so the address comes from the net device the GID
+// names, either through the index the provider reports or through the MAC the GID embeds.
 bool TransportRDMA::ResolvePortAddress(ibv_context* context, uint8_t port, int gid_count, std::string& addr) {
     for (int index = 0; index < gid_count; ++index) {
         ibv_gid gid{};
@@ -127,6 +129,38 @@ bool TransportRDMA::ResolvePortAddress(ibv_context* context, uint8_t port, int g
             if (inet_ntop(AF_INET, &address->sin_addr, text, sizeof(text)) != nullptr) {
                 addr = text;
                 found = true;
+            }
+        }
+    }
+
+    // eRDMA reports no netdev index and publishes a RoCE v1 GID that carries the netdev MAC in
+    // its first six bytes, so match that against the interfaces to recover the address.
+    if (!found) {
+        for (struct ifaddrs* link = interfaces; link != nullptr && !found; link = link->ifa_next) {
+            if (link->ifa_addr == nullptr || link->ifa_addr->sa_family != AF_PACKET) {
+                continue;
+            }
+            const auto* hardware = reinterpret_cast<const sockaddr_ll*>(link->ifa_addr);
+            if (hardware->sll_halen != 6) {
+                continue;
+            }
+            for (int index = 0; index < gid_count && !found; ++index) {
+                ibv_gid gid{};
+                if (ibv_query_gid(context, port, index, &gid) != 0 || memcmp(gid.raw, hardware->sll_addr, 6) != 0) {
+                    continue;
+                }
+                for (struct ifaddrs* ifa = interfaces; ifa != nullptr && !found; ifa = ifa->ifa_next) {
+                    if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET ||
+                        strcmp(ifa->ifa_name, link->ifa_name) != 0) {
+                        continue;
+                    }
+                    const auto* address = reinterpret_cast<const sockaddr_in*>(ifa->ifa_addr);
+                    char text[INET_ADDRSTRLEN] = {};
+                    if (inet_ntop(AF_INET, &address->sin_addr, text, sizeof(text)) != nullptr) {
+                        addr = text;
+                        found = true;
+                    }
+                }
             }
         }
     }

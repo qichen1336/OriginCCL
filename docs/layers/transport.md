@@ -53,7 +53,7 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - 环容量是在途窗口（在途 write ≤ 32 槽），不是每条消息配额；远大于 1 MiB 的消息分多轮推完。
 - `WRITE_WITH_IMM` 消耗接收方 RQ 的 WQE，接收队列是纯 credit 池（预投 `kRdmaRecvPool` 个空 WQE，每收到一个 write-imm 立即补投），不预投会 RNR。
 - 就绪与 EPOLLET：`GetFd()` 连接后返回 completion channel fd，监听态返回 CM channel fd；`GetPollEvents()` 恒 `EPOLLIN`。就绪 fd 只表达数据到来，对端消失经被 flush 的接收 WQE 产生 CQE、`HandleCompletion` 判为 `Try*` 的 `false`。`EventDriven` 模式的 `Try*` 非阻塞 drain 后必须 `ibv_get_cq_event` → `ibv_ack_cq_events` → `ibv_req_notify_cq` 重新 arm 再 poll CQ，否则漏下一次边沿；`Polling` 模式只 poll CQ，不轮询 completion fd。
-- 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，先扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址；设备不发布这种 GID 时（RoCE v1、iWARP）退到该 GID 绑定的网卡（`ibv_query_gid_ex` 的 `ndev_ifindex`），取该网卡上的首个 AF_INET 地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
+- 设备探测：`Probe(addr)` 遍历 `ibv_get_device_list()` 的每个设备与端口，要求 `IBV_PORT_ACTIVE`，先扫 GID 表找 IPv4-mapped GID（前十个字节为 0 且 `raw[10] == raw[11] == 0xFF`），取末 4 字节成地址；设备不发布这种 GID 时（RoCE v1、iWARP）退到该 GID 绑定的网卡（`ibv_query_gid_ex` 的 `ndev_ifindex`），取该网卡上的首个 AF_INET 地址；provider 不报 `ndev_ifindex` 时（旧 rdma-core 上的 eRDMA 会返回 0）改用 GID 前 6 字节携带的网卡 MAC 匹配接口，再取该接口的 AF_INET 地址。不能复用 `Utils::GetLocalIPAddress()` 的结果（那可能不是 RDMA 网卡）。
 - 限制：Linux + `libibverbs`/`librdmacm` 是硬依赖。除支持 inline 的小 write 外，首版接受一次用户缓冲 ↔ 注册缓冲的拷贝，不做零拷贝/RDMA Read/多 rail。
 
 ### RDMA 零拷贝子类（`TransportRDMAZc`）
@@ -95,6 +95,6 @@ transport 与 executor、topology 一样单独成目录；头文件从 include �
 - **RDMA 槽位复用只保留 credit 一道门控**：credit 已蕴含「本地已读完该槽」，补一道本地 send CQE（`local_completed`）只会收紧窗口、不会更安全。
 - **RDMA `private_data` 保持裸 `Wire{base_addr, rkey}`**：连接合法性由 CM 保证，无 magic 校验。
 - **`Try*` 必须同时排空 completion channel（ack + re-arm）并 poll CQ**：直接 poll CQ 不重新 arm 会在 EPOLLET 下漏边沿。
-- **RDMA 地址必须由 `Probe` 从设备得出**：优先设备发布的 IPv4-mapped GID，设备不发布时取 GID 绑定网卡的 IPv4；不能复用 `Utils::GetLocalIPAddress()` 结果。
+- **RDMA 地址必须由 `Probe` 从设备得出**：优先设备发布的 IPv4-mapped GID，设备不发布时按 GID 报告的 `ndev_ifindex`（provider 不报时退到 GID 内嵌的网卡 MAC）取该网卡的 IPv4；不能复用 `Utils::GetLocalIPAddress()` 结果。
 - 环容量固定 1 MiB 不做配置/扩容；隐含保证是单环单 producer + 单 consumer，不做容量协商/多生产者/双向的防御分支。
 - 改动本层后跑 `scripts/run_tests.sh`（默认 `--suite all`）中的 transport 档位（`test_transport_tcp`/`test_transport_shm`/`test_transport_rdma`/`test_transport_rdma_zc`，都是两进程端点对）：覆盖建连、控制握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义；RDMA 与零拷贝档位无设备时记 SKIP。集合通信档位在自动选择下走 SHM / RDMA / TCP（不再用 `OCCL_DISABLE_*` 覆盖作为矩阵维度），但只做黑盒接口断言，不检查具体传输类型。
