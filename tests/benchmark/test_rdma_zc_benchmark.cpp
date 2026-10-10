@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <memory>
 #include <poll.h>
 #include <string>
+#include <thread>
 #include <vector>
 #include <fmt/format.h>
 #include <mpi.h>
@@ -23,11 +25,10 @@ constexpr int kSmallCaseCalibrationMessages = 128;
 constexpr uint64_t kSmallCaseDurationNs = 3ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kBytesPerCase = 45ULL * 1000 * 1000 * 1000;
 constexpr uint64_t kSmallCaseWarmupBytes = 3200000;
-constexpr uint64_t kPipelineDepth = 8;
 constexpr size_t kBufferSize = 48 * 1024 * 1024;
 constexpr uint32_t kControlMagic = 0x4f43434c;
-constexpr size_t kMessageSizes[] = {32 * 1024, 128 * 1024, 512 * 1024, 2 * 1024 * 1024,
-                                    8 * 1024 * 1024, 32 * 1024 * 1024};
+constexpr size_t kMessageSizes[] = {32 * 1024,       128 * 1024,      512 * 1024,
+                                    2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024};
 
 struct ControlMessage {
     uint32_t magic;
@@ -63,12 +64,12 @@ bool WaitReady(const Endpoints& endpoints, bool send_stalled, bool recv_stalled)
     pollfd entries[2];
     size_t count = 0;
     if (send_stalled) {
-        entries[count++] = pollfd{endpoints.outgoing->GetFd(),
-                                  static_cast<short>(endpoints.outgoing->GetPollEvents()), 0};
+        entries[count++] =
+            pollfd{endpoints.outgoing->GetFd(), static_cast<short>(endpoints.outgoing->GetPollEvents()), 0};
     }
     if (recv_stalled) {
-        entries[count++] = pollfd{endpoints.incoming->GetFd(),
-                                  static_cast<short>(endpoints.incoming->GetPollEvents()), 0};
+        entries[count++] =
+            pollfd{endpoints.incoming->GetFd(), static_cast<short>(endpoints.incoming->GetPollEvents()), 0};
     }
     int ready = 0;
     do {
@@ -96,11 +97,12 @@ bool AdvanceStream(Stream& stream, int rank, bool zero_copy, const char* payload
     const size_t before = stream.progress;
     ++stream.calls;
     bool done = false;
-    const bool ok = zero_copy
-                ? (stream.producer ? stream.transport->TrySend(payload, stream.current, &stream.progress, &done)
-                    : stream.transport->TryRecv(received, stream.current, &stream.progress, &done))
-                : (stream.producer ? stream.transport->TransportRDMA::TrySend(payload, stream.current, &stream.progress, &done)
-                    : stream.transport->TransportRDMA::TryRecv(received, stream.current, &stream.progress, &done));
+    const bool ok =
+        zero_copy ? (stream.producer ? stream.transport->TrySend(payload, stream.current, &stream.progress, &done)
+                                     : stream.transport->TryRecv(received, stream.current, &stream.progress, &done))
+                  : (stream.producer
+                         ? stream.transport->TransportRDMA::TrySend(payload, stream.current, &stream.progress, &done)
+                         : stream.transport->TransportRDMA::TryRecv(received, stream.current, &stream.progress, &done));
     if (!ok) {
         return Fail(rank, "TrySend/TryRecv failed", std::to_string(stream.current));
     }
@@ -115,59 +117,28 @@ bool AdvanceStream(Stream& stream, int rank, bool zero_copy, const char* payload
     return true;
 }
 
-// The two directions advance in one loop but share nothing: each owns its transport, byte budget,
-// progress and counters, so messages are never paired across directions. A direction stops only
-// when its own budget is spent; the loop ends once both budgets are spent. When every unfinished
-// direction stalls, the stalled descriptors are polled together.
+// The two directions run on independent threads but share nothing: each owns its transport, byte
+// budget, progress and counters, so messages are never paired across directions. A direction stops
+// only when its own budget is spent; a failure in either thread stops both.
 bool RunBidirectional(const Endpoints& endpoints, int rank, bool zero_copy, const char* payload, char* received,
                       size_t size, uint64_t bytes_per_direction, TransferCounts* counts, uint64_t* messages) {
     Stream outgoing{endpoints.outgoing, true, bytes_per_direction, size};
     Stream incoming{endpoints.incoming, false, bytes_per_direction, size};
-    uint64_t idle = 0;
-    while (outgoing.budget > 0 || incoming.budget > 0) {
-        bool advanced = false;
-        bool send_stalled = false;
-        bool recv_stalled = false;
-        while (outgoing.budget > 0 && outgoing.messages < incoming.messages + kPipelineDepth) {
-            const uint64_t budget_before = outgoing.budget;
-            const size_t progress_before = outgoing.progress;
-            if (!AdvanceStream(outgoing, rank, zero_copy, payload, received)) {
-                return false;
+    std::atomic<bool> ok{true};
+    auto drive = [&](Stream& stream) {
+        while (ok.load() && stream.budget > 0) {
+            if (!AdvanceStream(stream, rank, zero_copy, payload, received)) {
+                ok.store(false);
+                return;
             }
-            if (outgoing.budget == budget_before && outgoing.progress == progress_before) {
-                send_stalled = true;
-                break;
-            }
-            advanced = true;
         }
-        while (incoming.budget > 0) {
-            const uint64_t budget_before = incoming.budget;
-            const size_t progress_before = incoming.progress;
-            if (!AdvanceStream(incoming, rank, zero_copy, payload, received)) {
-                return false;
-            }
-            if (incoming.budget == budget_before && incoming.progress == progress_before) {
-                recv_stalled = true;
-                break;
-            }
-            advanced = true;
-        }
-        if (advanced) {
-            idle = 0;
-            continue;
-        }
-        if (++idle >= kMaxIterations) {
-            return Fail(rank, "bidirectional iteration limit reached", std::to_string(size));
-        }
-        if (send_stalled) {
-            ++outgoing.waits;
-        }
-        if (recv_stalled) {
-            ++incoming.waits;
-        }
-        if (!WaitReady(endpoints, send_stalled, recv_stalled)) {
-            return Fail(rank, "timed out waiting for RDMA readiness", std::to_string(size));
-        }
+    };
+    std::thread sender(drive, std::ref(outgoing));
+    std::thread receiver(drive, std::ref(incoming));
+    sender.join();
+    receiver.join();
+    if (!ok.load()) {
+        return false;
     }
     counts->calls += outgoing.calls + incoming.calls;
     counts->waits += outgoing.waits + incoming.waits;
@@ -234,8 +205,7 @@ bool Connect(int rank, bool zero_copy, int tag, const std::string& address, Endp
     return true;
 }
 
-bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, const char* payload,
-             char* received) {
+bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, const char* payload, char* received) {
     TransferCounts warmup_counts;
     uint64_t unused_messages = 0;
     for (int iteration = 0; iteration < kWarmups; ++iteration) {
@@ -252,8 +222,8 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
     uint64_t local_ns = 0;
     uint64_t window_ns = 0;
     if (size < 32 * 1024) {
-        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, kSmallCaseWarmupBytes,
-                              &timed_counts, &unused_messages)) {
+        if (!RunBidirectional(endpoints, rank, zero_copy, payload, received, size, kSmallCaseWarmupBytes, &timed_counts,
+                              &unused_messages)) {
             return false;
         }
 
@@ -267,8 +237,8 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
         local_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - calibration_start).count());
         MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
-        message_count = std::max<uint64_t>(
-            1, (kSmallCaseDurationNs * kSmallCaseCalibrationMessages + window_ns - 1) / window_ns);
+        message_count =
+            std::max<uint64_t>(1, (kSmallCaseDurationNs * kSmallCaseCalibrationMessages + window_ns - 1) / window_ns);
         const uint64_t timed_target_bytes = message_count * static_cast<uint64_t>(size);
 
         MPI_Barrier(MPI_COMM_WORLD);
@@ -277,8 +247,8 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
                               &unused_messages)) {
             return false;
         }
-        local_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        local_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
         MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
         timed_bytes = timed_target_bytes;
     } else {
@@ -294,8 +264,8 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
                               &message_count)) {
             return false;
         }
-        local_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+        local_ns =
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
         MPI_Allreduce(&local_ns, &window_ns, 1, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
         timed_bytes = timed_target_bytes;
     }
@@ -307,9 +277,8 @@ bool RunSize(const Endpoints& endpoints, int rank, bool zero_copy, size_t size, 
     if (rank == 0) {
         const double elapsed_seconds = static_cast<double>(window_ns) / 1e9;
         const double gigabytes_per_second = 2.0 * static_cast<double>(timed_bytes) / elapsed_seconds / 1e9;
-        fmt::print("{:<4} {:>10} {:>12} {:>8.3f} {:>9.3f} {:>9} {:>7} {:>5}\n",
-                   zero_copy ? "ZC" : "copy", size, timed_bytes, gigabytes_per_second, elapsed_seconds,
-                   message_count, total_counts[0], total_counts[1]);
+        fmt::print("{:<4} {:>10} {:>12} {:>8.3f} {:>9.3f} {:>9} {:>7} {:>5}\n", zero_copy ? "ZC" : "copy", size,
+                   timed_bytes, gigabytes_per_second, elapsed_seconds, message_count, total_counts[0], total_counts[1]);
     }
     MPI_Barrier(MPI_COMM_WORLD);
     return true;
@@ -321,6 +290,8 @@ bool RunMode(int rank, bool zero_copy, int tag, const std::string& address, std:
     if (!Connect(rank, zero_copy, tag, address, endpoints)) {
         return false;
     }
+    endpoints.outgoing->SetWaitMode(TransportWaitMode::Polling);
+    endpoints.incoming->SetWaitMode(TransportWaitMode::Polling);
     for (const size_t size : kMessageSizes) {
         if (!RunSize(endpoints, rank, zero_copy, size, payload.data(), received.data())) {
             return false;
@@ -371,9 +342,9 @@ int main(int argc, char** argv) {
 
     if (rank == 0) {
         fmt::print("RDMA-ZC bidirectional bandwidth benchmark: address={} warmups={} bytes_per_direction=up to {} GB\n",
-               address_buffer, kWarmups, kBytesPerCase / 1000 / 1000 / 1000);
-        fmt::print("{:<4} {:>10} {:>12} {:>8} {:>9} {:>9} {:>7} {:>5}\n", "mode", "size", "bytes", "GB/s",
-                   "elapsed_s", "messages", "calls", "waits");
+                   address_buffer, kWarmups, kBytesPerCase / 1000 / 1000 / 1000);
+        fmt::print("{:<4} {:>10} {:>12} {:>8} {:>9} {:>9} {:>7} {:>5}\n", "mode", "size", "bytes", "GB/s", "elapsed_s",
+                   "messages", "calls", "waits");
     }
 
     if (!RunMode(rank, false, 41, address_buffer, payload, received) ||

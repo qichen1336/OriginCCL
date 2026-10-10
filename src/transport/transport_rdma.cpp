@@ -13,8 +13,6 @@
 
 namespace {
 constexpr size_t kRdmaInlineThreshold = 64;
-constexpr uint32_t kCreditImmediate = 0x80000000;
-constexpr size_t kCreditBatch = 8;
 constexpr int kResolveTimeoutMs = 5000;
 constexpr int kEstablishTimeoutMs = 15000;
 constexpr int kControlTimeoutMs = 30000;
@@ -513,11 +511,19 @@ bool TransportRDMA::PostWrites(const char* source, size_t size, size_t progress,
 }
 
 bool TransportRDMA::PostCredit(size_t slots) {
-    ibv_sge element{reinterpret_cast<uintptr_t>(buffer + kRdmaCreditOffset), 1, mr->lkey};
+    credits_returned += slots;
+    const bool use_inline = sizeof(credits_returned) <= inline_capacity;
+    if (!use_inline) {
+        std::memcpy(buffer + kRdmaCreditOffset, &credits_returned, sizeof(credits_returned));
+    }
+    const char* source = use_inline ? reinterpret_cast<const char*>(&credits_returned) : buffer + kRdmaCreditOffset;
+    ibv_sge element{reinterpret_cast<uintptr_t>(source), sizeof(credits_returned), mr->lkey};
     ibv_send_wr request{};
-    request.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    request.opcode = IBV_WR_RDMA_WRITE;
     request.send_flags = IBV_SEND_SIGNALED;
-    request.imm_data = htonl(kCreditImmediate | static_cast<uint32_t>(slots));
+    if (use_inline) {
+        request.send_flags |= IBV_SEND_INLINE;
+    }
     request.wr.rdma.remote_addr = peer.base_addr + kRdmaCreditOffset;
     request.wr.rdma.rkey = peer.rkey;
     request.sg_list = &element;
@@ -604,17 +610,13 @@ bool TransportRDMA::HandleCompletion(const ibv_wc& completion) {
 
     case IBV_WC_RECV_RDMA_WITH_IMM: {
         const uint32_t immediate = ntohl(completion.imm_data);
-        if ((immediate & kCreditImmediate) != 0) {
-            credits_received += immediate & ~kCreditImmediate;
-        } else {
-            const size_t slot = ImmediateSlot(immediate);
-            if (slot >= kRdmaSlotCount) {
-                LOG_ERROR("The RDMA peer announced an out of range ring slot {}", slot);
-                return false;
-            }
-            arrival_lengths[arrival_tail % kRdmaSlotCount] = ImmediateLength(immediate);
-            ++arrival_tail;
+        const size_t slot = ImmediateSlot(immediate);
+        if (slot >= kRdmaSlotCount) {
+            LOG_ERROR("The RDMA peer announced an out of range ring slot {}", slot);
+            return false;
         }
+        arrival_lengths[arrival_tail % kRdmaSlotCount] = ImmediateLength(immediate);
+        ++arrival_tail;
         return PostPoolRecv(static_cast<size_t>(completion.wr_id));
     }
 
@@ -724,7 +726,7 @@ bool TransportRDMA::TrySend(const void* data, size_t size, size_t* progress, boo
     }
 
     const char* source = static_cast<const char*>(data);
-    const size_t limit = credits_received + kRdmaSlotCount;
+    const size_t limit = CreditsReceived() + kRdmaSlotCount;
     const size_t available = send_seq < limit ? limit - send_seq : 0;
     const size_t remaining = size - *progress;
     const size_t chunks = remaining == 0 ? 0 : 1 + (remaining - 1) / kRdmaSlotSize;
@@ -766,7 +768,7 @@ bool TransportRDMA::TryRecv(void* data, size_t size, size_t* progress, bool* don
         }
     }
 
-    if (pending_credit >= kCreditBatch || (pending_credit > 0 && arrival_head == arrival_tail)) {
+    if (pending_credit > 0) {
         if (!PostCredit(pending_credit)) {
             return false;
         }
@@ -831,7 +833,7 @@ void TransportRDMA::Close() {
     control_index = 0;
     listen_port = 0;
     send_seq = 0;
-    credits_received = 0;
+    credits_returned = 0;
     arrival_head = 0;
     arrival_tail = 0;
     arrival_offset = 0;

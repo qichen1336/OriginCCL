@@ -95,6 +95,12 @@ private:
         return buffer + kRdmaScratchOffset + index * kRdmaControlSize;
     }
 
+    // The credit counter lives in the registered buffer so the peer advances it with a plain RDMA
+    // write into that address, instead of an immediate this side has to accumulate.
+    uint64_t CreditsReceived() const {
+        return __atomic_load_n(reinterpret_cast<const uint64_t*>(buffer + kRdmaCreditOffset), __ATOMIC_RELAXED);
+    }
+
     bool OpenChannel();
     bool Adopt(rdma_cm_id* connection, const Wire& wire);
     rdma_cm_event* AwaitEvent(rdma_cm_event_type type);
@@ -121,7 +127,7 @@ private:
     uint32_t inline_capacity = 0;
 
     size_t send_seq = 0;
-    size_t credits_received = 0;
+    uint64_t credits_returned = 0;
 
     size_t arrival_head = 0;
     size_t arrival_tail = 0;
