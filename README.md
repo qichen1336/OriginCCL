@@ -1,105 +1,123 @@
 # OriginCCL
 
-C++ 集合通信库。
+OriginCCL 是一个受 NCCL 启发的 **C++ 集合通信（collective communication）库**，面向多进程分布式训练场景。
 
-支持 AllReduce、Broadcast、Reduce、AllGather、ReduceScatter，以及同步点对点 Send/Recv。
-接口参数和缓冲区布局见 [Communicator 层文档](docs/layers/communicator.md)。四种 executor 均通过统一的三阶段接口驱动集合操作。
+## 概述
 
-## 批量下发（Group API）
+- **集合操作**：AllReduce、Broadcast、Reduce、AllGather、ReduceScatter
+- **点对点通信**：同步 Send / Recv
+- **批量下发**：`GroupStart()` / `GroupEnd()` 批量提交，支持嵌套，一次规划执行
+- **三种传输**：TCP、共享内存（SHM）、RDMA（含零拷贝变体），按机器分组自动选择
+- **三种拓扑**：Ring（多数集合）、Tree（小消息 AllReduce）、P2P（Send/Recv）
+- **运行时 executor 选择**：核数充足用多线程忙等，核数不足用 epoll 事件驱动
 
-`GroupStart()` / `GroupEnd()` 之间的通信调用只入队，最外层 `GroupEnd()` 排序后统一规划并执行到完成，返回是否全部成功。单独调用等价于只有一个任务的组，走同一条路径：
+最小使用示例（`mpirun` 启动，rank / world size 来自 MPI）：
 
 ```cpp
-comm.GroupStart();
-comm.AllReduce(a, a_out, n, DataType::FLOAT32, ReduceOp::SUM);
-comm.Send(buf, n, DataType::FLOAT32, peer);
-comm.Recv(recv, n, DataType::FLOAT32, peer);
-bool ok = comm.GroupEnd();
+#include <mpi.h>
+#include "communicator.h"
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    CommConfig config;
+    config.rank = rank;
+    config.world_size = size;
+    config.n_channels = 4;
+
+    Communicator comm;
+    if (rank == 0) comm.GetUniqueId(config.unique_id);
+    MPI_Bcast(&config.unique_id, sizeof(config.unique_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+    comm.Init(config);
+
+    int send = rank, recv = 0;
+    comm.AllReduce(&send, &recv, 1, DataType::INT32, ReduceOp::SUM);
+
+    comm.Finalize();
+    MPI_Finalize();
+}
 ```
 
-- 组内集合按 `(操作类型, 字节量, dtype, 有效 op, 有效 root)` 稳定升序排列，P2P 一律排在集合之后。
-- P2P 按轮次 `i = 1..world_size-1` 执行：第 i 轮向 `(rank-i+world_size)%world_size` 发送、从 `(rank+i)%world_size` 接收；发送任务进 channel 0、接收任务进 channel 1，两方向并发推进。同有向 rank 对保持 FIFO。
-- 支持嵌套：内层 `GroupEnd` 不执行，深度归零的最外层才执行。组内操作彼此独立（可共享只读输入、允许各自原有合法 in-place），不支持前一操作的输出作为同组后一操作的输入；这类依赖用 Group 边界表达。
-- 需要至少两个 channel（发送/接收各一个）。参数错误沿用 `LOG_ERROR` + `false`，配对与跨组消息匹配由调用方保证。
+接口契约与缓冲区布局见 [Communicator 层文档](docs/layers/communicator.md)。
+
+## 架构设计
+
+### 目录结构
+
+```
+include/          公开头文件（transport / topology / executor 单独成目录，限定路径引用）
+src/              实现（与 include 对应）
+docs/layers/      各层规则文档
+tests/            回归测试与性能基准
+scripts/          构建与测试脚本（run_tests.sh 是唯一测试入口）
+```
+
+### Communicator
+
+顶层编排对象，**唯一对外入口**。负责初始化建连（bootstrap → 机器分组 → 建 channel → 选 executor），暴露五种集合操作、同步 Send/Recv 与 `GroupStart`/`GroupEnd` 批量下发。详见 [communicator.md](docs/layers/communicator.md)。
+
+### Planner
+
+把一批 `CollTask` 排序（集合在前、P2P 按轮次在后）并规划为 `CollPlan`：集合按 chunk 切片分配到 channel，P2P 按轮次准备连接。排序与切片为独立函数，无回调、无 `std::function`。详见 [planner.md](docs/layers/planner.md)。
+
+### Topology
+
+拥有集合与 P2P 算法，把 `PlanTask.state` 当游标推进。通用三阶段接口（`CollectiveInit` / `CollectiveStep` / `CollectiveDone`），只做非阻塞事件处理。Ring 处理多数集合；Tree 仅处理小消息 AllReduce（机器内星型 + 机器间双二叉树）；P2P 处理 Send/Recv。详见 [topology.md](docs/layers/topology.md)。
+
+### Transport
+
+字节搬运 + 就绪可等待性。四种实现：TCP、共享内存、RDMA（`WRITE_WITH_IMM` 环形缓冲）、RDMA 零拷贝（阈值 256 KiB 以上注册用户 MR、独立 QP 直发）。TCP / SHM / RDMA 同构（listener + connection 双形态）。详见 [transport.md](docs/layers/transport.md)。
+
+### Executor
+
+决定「如何等待 transport 就绪」，驱动 topology，是 task 游标的唯一推进者。`Init` 时按全机在线核数与本地 rank 数在 **multi_thread**（忙等）与 **epoll**（事件驱动）之间运行时选定。详见 [executor.md](docs/layers/executor.md)。
 
 ## 构建
+
+### 依赖
+
+| 依赖 | 版本 | 说明 |
+| --- | --- | --- |
+| C++ | 17 | 编译标准 |
+| CMake | ≥ 3.10 | 构建 |
+| fmt | ≥ 9（已验证 10.2.1） | 日志 |
+| Threads | 系统库 | — |
+| Open MPI | 4.1.2 已验证 | 测试用，`mpirun` 启动 |
+| librdmacm / libibverbs | 含开发头 | **硬依赖**，缺失则 CMake 配置失败 |
+
+### 命令
 
 ```bash
 cmake -S . -B build
 cmake --build build -j"$(nproc)"
 ```
 
-## 运行测试
+## 测试结果
 
-多进程启动只支持 **Open MPI** 的 `mpirun`。rank / world size 都由 MPI 给出，bootstrap 地址也不再从环境变量读：rank0 调 `Communicator::GetUniqueId` 挑一个空闲端口、连同自己的 IP 生成 `UniqueId`，再用 `MPI_Bcast` 发给其余 rank，所以测试必须链接并启动 MPI（不依赖 MPICH、PMI 或 Slurm）。
+测试入口只有一个脚本 `scripts/run_tests.sh`（`-h` 有完整说明）。rank / world size 来自 MPI，bootstrap 地址由 rank0 的 `GetUniqueId` 生成后经 `MPI_Bcast` 分发。
 
-测试入口只有一个脚本，`-h` 有完整说明：
+等级决定进程布局与数据量：
+
+| 等级 | 单机 | 模拟多机 | 每 rank 的 count |
+| --- | --- | --- | --- |
+| 0 | 4 rank | 4 机 × 1 rank | 32768、131072 |
+| 1 | 8 rank | 4 机 × 2 rank | 65536、262144 |
+| 2 | 32 rank | 8 机 × 4 rank | 262144、1048576 |
 
 ```bash
-scripts/run_tests.sh -h
-# 本机可跑的最小档（单机 4 rank、模拟多机 4×1、四种传输、集合用例）：
 scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 ```
 
-等级决定进程布局与数据量。默认构建带 `-DOCCL_SMALL_TESTS=ON`，chunk 颗粒度与集合用例 count **等比缩小 256 倍**，让低配虚拟机也能跑完整矩阵；下表的 count 是生产值（`--full-data` 的取值，也是物理机验证使用的值）。
+退出码：`0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。无 RDMA 设备时 RDMA 与零拷贝档位记为 SKIP；可用 `scripts/setup_softroce.sh` 建软件 RoCE 让它们真正跑起来。七个回归测试入口在 `tests/regression/`，报告落在 `test-reports/`。
 
-| 等级 | 单机 | 模拟多机 | 每 rank 的 count | 组合强度 |
-| --- | --- | --- | --- | --- |
-| 0 | 4 rank | 4 机 × 1 rank | 32768、131072 | 每个接口遍历全部 dtype / op / count |
-| 1 | 8 rank | 4 机 × 2 rank | 65536、262144 | 补齐 dtype/op/count 两两组合 |
-| 2 | 32 rank | 8 机 × 4 rank | 262144、1048576 | 完整合法核心集 |
+### 性能基准（阿里云 ecs.g8y.4xlarge，eRDMA，2026-10）
 
-```bash
-# 需要足够核数，或加 --oversubscribe：
-scripts/run_tests.sh --level 1 -j 2 --oversubscribe
-scripts/run_tests.sh --level 2 -j 2 --oversubscribe
-```
+三个基准程序在 `tests/benchmark/`，手动 `mpirun` 运行。满双工聚合链路 ~6.4 GB/s（每方向 ~3.2 GB/s）。
 
-- **低配机器**：`run_tests.sh` 默认按小数据构建/运行（`-DOCCL_SMALL_TESTS=ON`，chunk 32 KiB→128 B，count 同时除 256），等价地覆盖同一批 planner 路径。物理机验证时加 `--full-data` 用生产规模：
-
-```bash
-scripts/run_tests.sh --level 0 -j 2 --oversubscribe --full-data
-```
-
-- 传输套件（`test_transport_*`）**不缩放**：其 5 MiB 边界与 8 MiB stall 必须超过 SHM 2 MiB / RDMA 1 MiB 环容量才能验证背压。除 TCP / SHM / RDMA 外还有零拷贝 RDMA 档位（`test_transport_rdma_zc`）：阈值 16 MiB 以上注册用户缓冲为 MR、用独立 RC QP 直接 SEND/RECV，以下完全走基类环形缓冲。
-- 只覆盖 **polling** 与 **epoll** 两个 executor，且不再由构建选择：库在 `Init` 时比较全机在线核数与本地 rank 数——每 rank 已绑核独占一核，核数 ≥ local rank 数用 `polling`（低延迟忙等），否则用 `epoll`（不忙等抢 CPU）。`multi_thread` / `reactor` 仍编译在库里，但已无选取路径，因此一次构建就覆盖全矩阵。
-- **多机是单机模拟**：通过 `CommConfig::get_hostname` 注入逻辑 hostname，验证分组与传输选择，不代表真实跨主机。
-- `OCCL_DISABLE_SHM` / `OCCL_DISABLE_RDMA` 不作矩阵维度；集合用例按自动选择走 SHM / RDMA / TCP，测试只做黑盒接口断言，不检查实际路径。
-- 无可用 RDMA 设备时 RDMA 与零拷贝 RDMA 档位记为 **SKIP**，不算通过；退出码 `0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。
-- **没有 RDMA 硬件时**，可用软件 RoCE 让 RDMA 与零拷贝档位真正跑起来——而不再只是 SKIP：
-
-```bash
-sudo scripts/setup_softroce.sh          # 交互式，逐阶段确认
-scripts/setup_softroce.sh --status      # 查看当前状态，不需要 root
-sudo scripts/setup_softroce.sh --down   # 拆除
-```
-
-  它加载 `ib_uverbs` / `rdma_cm` / `rdma_ucm` / `rdma_rxe`，建一个私有 dummy 网卡（`occl-rxe0`，`10.99.0.1/24`）并把 `rxe0` 挂上去，然后用 `ibv_rc_pingpong` 预检同机回环。**只建一个 rxe 设备**是刻意的：内核按 `skb->dev` 找设备，两个本地地址互发时 `skb->dev` 是 `lo`、报文会被丢掉；单设备时 `rxe_prepare()` 因目的 MAC 等于本机 MAC 而走 `rxe_loopback()` 直投，两个 rank 共用同一设备即可互通，这也正是库「取第一个 active 设备」的 `Probe()` 所期望的。装好后集合用例会自动选 RDMA，覆盖面比 SKIP 时更大。
-
-查看某一等级的完整用例矩阵（需先构建一次）：
-
-```bash
-scripts/run_tests.sh --level 0 --list-cases --no-build
-```
-
-`tests/regression/` 下七个功能回归测试入口：`test_single_machine`、`test_multi_machine`、`test_transport_tcp`、`test_transport_shm`、`test_transport_rdma`、`test_transport_rdma_zc`、`test_p2p`。用例生成与结果校验在 `tests/test_common.*`，传输套件共用 `tests/transport_check.*`。报告落在 `test-reports/`（`summary.txt` 汇总）。三个性能基准在 `tests/benchmark/`，不属回归矩阵，手动 `mpirun` 运行（二进制在 `build/tests/benchmark/`）。
-
-P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer)`，双方按顺序配对，不支持 tag、自发自收或同 communicator 并发调用。发送连接固定在 channel 0、接收连接固定在 channel 1，按需建立并复用，整段传输；同机优先 SHM，跨机必须 RDMA_ZC，无设备时非空操作失败，不回退 TCP。完整契约见 [Communicator 层文档](docs/layers/communicator.md)。
-
-`scripts/run_tests.sh --suite p2p --oversubscribe` 固定用四 rank，覆盖同机和模拟跨机、连接缓存与隔离、乱序接入、与集合操作交替、polling/epoll 及最大 48 MiB 数据。P2P 数据量不缩放；无 RDMA 时验证拒绝回退，再将跨机数据传输记为 SKIP。
-
-集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。
-
-## 性能基准结果（阿里云 ecs.g8y.4xlarge，2 节点，eRDMA，2026-10）
-
-环境：两台 `ecs.g8y.4xlarge`（aarch64，16 核，Ubuntu 22.04），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE），满双工聚合链路 ~6.4 GB/s（每方向 ~3.2 GB/s ≈ 25 Gbps 标称）。
-三个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun --allow-run-as-root --host <ip1>:<n1>,<ip2>:<n2>` 跨机启动（`<n>` 是每机 rank 数，每机 1 rank 时可省略写作 `<ip1>:1`）。
-
-### `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）
-
-每条消息各建两条单向连接（一收一发），单线程内两个方向各自推进：发送方向受有界 send-ahead 约束
-（`outgoing.messages < incoming.messages + kPipelineDepth`，深度 8），任一方向停滞即阻塞 `poll` 等待其就绪 fd。
-下表为跨机 N=2、`--bind-to none`、每档每方向 45 GB（十进制）计时；`GB/s` 是双向聚合值，折合每方向 ~3.2 GB/s：
+- `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）：≥512 KiB 起 ZC 稳定 ~6.4 GB/s，约 copy 路径的 2 倍：
 
 | size | copy | ZC |
 | --- | --- | --- |
@@ -110,156 +128,44 @@ P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer
 | 8 MiB | 5.21 | 6.39 |
 | 32 MiB | 4.48 | 6.43 |
 
-ZC 32 KiB 慢是延迟主导：signaled SEND 的完成要等对端 ACK，每条消息含一个完整 RTT，与循环结构无关；128 KiB 起追平，≥512 KiB 稳定 ~6.4 GB/s，是 copy 路径的约 2 倍。
+- `test_allreduce_benchmark`（N=2，`busbw == algbw`）：2–128 MiB 全档 ~3.14–3.20 GB/s，打平每方向链路上限。
+- `test_allreduce_benchmark`（N=8，2 机 × 4 rank）：小/中档 busbw ~3.16 GB/s，128 MiB 略降至 2.81 GB/s。
+- `test_allreduce_ompi_benchmark`：与 OriginCCL 逐行相同的 harness，后端切换为 `MPI_Allreduce`，供公平对照（eRDMA 上 OMPI 需自编带 rdmacm 的 `openib`，否则回退 TCP）。
 
-### `test_allreduce_benchmark`（N=2 时 `busbw == algbw`）
+### 全矩阵对照（4 × ecs.g8y.4xlarge，eRDMA / RDMA / TCP）
 
-`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。每档的计时窗按 `--target-bytes`（默认 40 GiB）反推调用次数 `calls = min(target_bytes / bytes, 16384)`，保证每档搬够数据量、避免小尺寸的突发假象（云主机突发带宽不稳）。跨机 eRDMA（N=2，每机 1 rank，channels=4，`--warmup 5 --repeats 10`）尺寸阶梯：
+四机（A、B 有 `erdma_0`，C、D 无设备），`algbw / busbw`（GB/s），`busbw = algbw × 2(N-1)/N`。三档布局：单机 4 rank、两机 2+2、四机 4×4（N=16）。
 
-```
-bytes=134217728  count=33554432  busGB/s=3.136  PASS
-```
-
-2 MiB 3.187 / 8 MiB 3.192 / 32 MiB 3.204 / 128 MiB 3.136 GB/s，全档打平每方向 ~3.2 GB/s 的链路可持续上限。
-
-### `test_allreduce_benchmark` 多机多 rank（N=8，2 机 × 4 rank）
-
-同样 4 channel、`--warmup 5 --repeats 10`，此时 `busbw = algbw × 2(N-1)/N = 1.75 × algbw`。小/中档 busbw（2–8 MiB ~3.16）与 N=2 持平，聚合带宽仍由跨机链路限制（环内其余跳走 SHM）；128 MiB 略降到 2.81：
-
-| bytes | algbw | busbw |
-| --- | --- | --- |
-| 2 MiB | 1.810 | 3.167 |
-| 8 MiB | 1.808 | 3.164 |
-| 32 MiB | 1.769 | 3.096 |
-| 128 MiB | 1.606 | 2.810 |
-
-### `test_allreduce_ompi_benchmark`（OriginCCL 的 OpenMPI 公平对照）
-
-复用与 `test_allreduce_benchmark` **逐行相同**的 harness（选项、尺寸阶梯、输入值、逐元素独立 oracle、`MPI_Wtime` 计时口径、`busbw` 公式与表格列）。两者由同一个 `tests/benchmark/test_allreduce_benchmark.cpp` 编译两次得到，唯一差别是 `OCCL_BENCH_OMPI` 宏切换 `BenchAllReduce` 的实现——OriginCCL 后端调 `comm.AllReduce(...)`，OpenMPI 后端调阻塞的 `MPI_Allreduce(..., MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD)` out-of-place；宏同时切换初始化（OriginCCL 建 communicator，MPI 用 `Utils::PinProcessToCpu(local_rank)` 绑到与 OriginCCL 相同的本机核）与元数据标签，其余完全一致，因此两边可逐档对读。
-
-`--channels` 为命令行兼容而被接受并忽略（MPI 后端无 channel 概念），其余选项默认值与 `test_allreduce_benchmark` 一致：
-
-```bash
-mpirun -np 2 --host <ip1>:1,<ip2>:1 build/tests/benchmark/test_allreduce_ompi_benchmark
-```
-
-两侧表格同为 `bytes / count / min_us / median_us / max_us / algGB/s / busGB/s / check`，直接并排比较即可。
-
-**注意传输层不对等**：本仓库验证过的 eRDMA(iWARP) 网卡上，OpenMPI 4.1.2 **无法**驱动该设备——`openib` BTL 只编了 `udcm`（iWARP 需要 `rdmacm`）直接禁用端口，`ucx` PML 初始化失败——因此 OMPI 回退到 `tcp` BTL，而 OriginCCL 直发 `erdma_0`。同机 eRDMA 实测（N=2，target 4 GiB）：OriginCCL RDMA 全档 ~3.19 GB/s，OMPI TCP 1.48–2.14 GB/s。要严格对等，可用 `OCCL_DISABLE_RDMA=1` 把 OriginCCL 也压到 TCP：256 MiB 时 OriginCCL TCP 2.28 GB/s vs OMPI TCP 1.52 GB/s（同传输层下 OriginCCL 仍快 ~1.5×）。
-
-
-## 性能基准结果（阿里云 4 × ecs.g8y.4xlarge 全矩阵，eRDMA / RDMA / TCP，2026-10-11）
-
-### 环境
-
-四台 `ecs.g8y.4xlarge`（aarch64，16 核，Ubuntu 22.04，内核 5.15，gcc 11.4，OpenMPI 4.1.2），私网同属 `172.18.0.0/20`，root 免密全互联。
-
-| 主机 | 公网 | 私网 | hostname | eRDMA |
+| 布局 | OCCL 自动 | OCCL TCP | OMPI RDMA | OMPI TCP |
 | --- | --- | --- | --- | --- |
-| A | 47.119.153.73 | 172.18.10.0 | iZwz9cyfv0a26qcmv0rv7iZ | `erdma_0` PORT_ACTIVE |
-| B | 47.119.141.32 | 172.18.9.255 | iZwz9cyfv0a26qcmv0rv7hZ | `erdma_0` PORT_ACTIVE |
-| C | 112.74.105.75 | 172.18.10.2 | iZwz9a0lhb3ppx88x73htgZ | **无设备**（驱动在，ENI 未开 eRDMA） |
-| D | 120.76.41.62 | 172.18.10.1 | iZwz9a0lhb3ppx88x73htfZ | **无设备**（同 C） |
+| 单机 4 rank（SHM） | ~7.2–12.0 | 同左 | ~1.6–3.5（vader） | ~1.4–2.1 |
+| 两机 2+2（eRDMA） | ~3.0–3.2 | ~3.0–3.2 | ~2.1–3.1（openib） | ~1.5–1.8 |
+| 四机 4×4（C/D 无 RDMA→TCP） | ~2.9–3.2 | 同左 | 不可用 † | ~1.2–1.6 |
 
-⚠️ **C / D 只有 `erdma` 驱动，没有 RDMA 设备**（`/sys/class/infiniband/` 为空、`ibv_devices` 为空，`modprobe legacy_mode=1` / `compat_mode=1` 均无效），需要在阿里云控制台给 ENI 开启 eRDMA 才能出现 `erdma_0`。因此**四机布局无法真正走 RDMA**：库的传输选择是全局决策（所有 rank 都 `rdma_port != 0` 才统一用 RDMA），2 台缺设备时跨机边整体回退 TCP；OMPI 的 `openib` BTL 在 C / D 上没有可用端口。下面的「四机 RDMA」两格据此标注。
+† 四机布局中 C/D 无 openib 端口，OMPI 强制 `openib` 时 `MPI_Init` 失败；混合 BTL（`openib,vader,tcp`）得 ~1.6–2.3，仍低于 OriginCCL。
 
-统一参数：`--min-bytes 2M --max-bytes 256M --factor 4 --warmup 5 --repeats 10 --channels 4`，即尺寸阶梯 **2 / 8 / 32 / 128 MiB**，`target_bytes` 默认 40 GiB/档。四机二进制同源（HEAD `ab7337f`，Release，`md5sum` 四机一致）。
+小结：同机 OriginCCL（SHM）领先 OMPI 数倍；跨机 eRDMA 下两种传输都能喂饱 25 Gbps 链路；OMPI 在 eRDMA(iWARP) 上要么用自编 `openib`、要么落到 TCP，其 `openib` 明显慢于 OriginCCL 直发 `erdma_0`。
 
-传输口径：
-
-- **OriginCCL 自动**：不设开关，按 hostname 自动分组——同机走 SHM，跨机走 RDMA（全局决策）。
-- **OriginCCL TCP**：`-x OCCL_DISABLE_RDMA=1`（跨机强制 TCP，同机仍是 SHM，因为开关只禁 RDMA）。
-- **OMPI RDMA**：`/opt/ompi-rdma/bin/mpirun` + `--mca pml ob1 --mca btl openib,vader,self --mca btl_openib_cpc_include rdmacm --mca btl_openib_receive_queues P,128,256,192,128 --mca btl_openib_max_inline_data 0`（`openib` 走 eRDMA，`vader` 负责节点内；自编 OMPI 无 `sm` BTL）。
-- **OMPI TCP**：`--mca pml ob1 --mca btl tcp,self`。
-
-数值为 `algbw / busbw`（GB/s），`busbw = algbw × 2(N-1)/N`。N=4（单机 4 rank、两机 2+2）系数 1.5；N=16（四机 4×4）系数 1.875。
-
-三种布局（`--host` 用私网 IP）：
-
-- 布局 1：`-np 4  --host 172.18.10.0:4`（A 单机）
-- 布局 2：`-np 4  --host 172.18.10.0:2,172.18.9.255:2`（A、B）
-- 布局 3：`-np 16 --host 172.18.10.0:4,172.18.9.255:4,172.18.10.2:4,172.18.10.1:4`（A、B、C、D）
-
-OriginCCL 侧用系统 `mpirun --allow-run-as-root --bind-to none`，二进制 `build/tests/benchmark/test_allreduce_benchmark`。
-
-### 布局 1：单机 4 rank（N=4）
-
-单机 cross-rank 全在本机，OriginCCL 自动选 SHM；OMPI RDMA 档的跨 rank 流量同样走节点内 `vader`（共享内存），`openib` 无跨机流量可走。
-
-| size | OCCL 自动(SHM) | OMPI RDMA(vader) | OCCL TCP(=SHM) | OMPI TCP |
-| --- | --- | --- | --- | --- |
-| 2 MiB | 7.99 / 11.98 | 2.36 / 3.54 | 7.92 / 11.88 | 1.41 / 2.11 |
-| 8 MiB | 6.61 / 9.92 | 2.29 / 3.43 | 6.47 / 9.71 | 1.43 / 2.15 |
-| 32 MiB | 4.83 / 7.24 | 1.69 / 2.54 | 4.85 / 7.28 | 1.07 / 1.60 |
-| 128 MiB | 5.01 / 7.52 | 1.75 / 2.63 | 4.98 / 7.47 | 1.07 / 1.60 |
-
-单机上 OriginCCL（SHM）约为 OMPI 的 3–5 倍：对 OMPI `vader` 约 2.9×，对 OMPI TCP 约 4.5–5.7×。`OCCL_DISABLE_RDMA=1` 在单机上不改变任何东西（本就无跨机边），故「OCCL TCP」与「OCCL 自动」逐位相同。
-
-### 布局 2：两机 × 2 rank（N=4）
-
-跨机边在 A↔B 之间（都有 eRDMA）。
-
-| size | OCCL 自动(RDMA) | OMPI RDMA(openib) | OCCL TCP | OMPI TCP |
-| --- | --- | --- | --- | --- |
-| 2 MiB | 2.13 / 3.19 | 1.75 / 2.63 | 2.16 / 3.24 | 1.08 / 1.62 |
-| 8 MiB | 2.14 / 3.21 | 2.09 / 3.13 | 2.16 / 3.24 | 1.20 / 1.80 |
-| 32 MiB | 2.11 / 3.17 | 1.38 / 2.07 | 2.10 / 3.15 | 0.99 / 1.49 |
-| 128 MiB | 2.05 / 3.07 | 1.59 / 2.39 | 2.00 / 3.00 | 0.97 / 1.46 |
-
-### 布局 3：四机 × 4 rank（N=16）
-
-跨机边在 4 台之间；C / D 无 eRDMA，故 OriginCCL 的跨机边整体走 TCP（与「OCCL TCP」档数值一致，互为印证），OMPI 的强制 `openib` 直接启动失败。
-
-| size | OCCL 自动(→TCP) | OMPI RDMA | OCCL TCP | OMPI TCP |
-| --- | --- | --- | --- | --- |
-| 2 MiB | 1.72 / 3.22 | 不可用 † | 1.72 / 3.22 | 0.70 / 1.32 |
-| 8 MiB | 1.72 / 3.22 | 不可用 † | 1.72 / 3.22 | 0.85 / 1.60 |
-| 32 MiB | 1.58 / 2.96 | 不可用 † | 1.59 / 2.99 | 0.69 / 1.28 |
-| 128 MiB | 1.54 / 2.88 | 不可用 † | 1.55 / 2.91 | 0.66 / 1.23 |
-
-† OMPI 强制 `openib` 时进程对不可达（`172.18.10.2` / `172.18.10.1` 无 openib 端口），`MPI_Init` 失败（exit 17）。作为参考，把 `tcp` 也加进 BTL（`openib,vader,tcp`，即有 RDMA 走 RDMA、没有走 TCP 的混合模式）得到 algbw/busbw 2M `0.87 / 1.64`、8M `1.22 / 2.29`、32M `0.89 / 1.67`、128M `0.96 / 1.81`，高于纯 TCP 档但远低于 OriginCCL 的 ~2.9。
-
-### 小结
-
-- **同机（SHM）**：OriginCCL ~7.2–12.0 GB/s busbw，OMPI 仅 ~1.6–3.5，同机路径 OriginCCL 领先数倍。
-- **跨机（A↔B eRDMA）**：OriginCCL 自动(RDMA) 与强制 TCP 几乎相同（~3.0–3.2 busbw）——N=4 环只用到跨机边的一部分，25 Gbps 链路在两种传输下都能喂饱；OMPI 明显更低（RDMA ~2.1–3.1，TCP ~1.5–1.8）。
-- **四机（N=16）**：OriginCCL 受跨机链路限制，busbw 稳定在 ~2.9–3.2；OMPI TCP 只有 ~1.2–1.6。
-- OMPI 在 eRDMA(iWARP) 上要么用 `openib`（需自编带 rdmacm 的 OpenMPI），要么落到 `tcp`；其 `openib` 实测明显慢于 OriginCCL 直发 `erdma_0`。
-
-
-## 案例：copy 路径双向吞吐「一个方向被饿死」的定位（2026-10-11，已坐实）
+## 案例：copy 路径双向吞吐「一个方向被饿死」
 
 ### 现象
 
-`test_rdma_zc_benchmark` 双向跑时，`rdmatop` 观察到 copy 路径的 TX / RX 不是同时打满，而是一侧 ~26 Gb/s、另一侧 ~1.7 Gb/s，持续数秒后**翻面**；整体停在 ~3.3 GB/s（半双工）。ZC 路径无此现象：两向各 ~26 Gb/s，满双工 ~6.4 GB/s。用户原问「为什么一个方向的吞吐被饿死、另一个方向起不来」，本节记录完整的定位链。
+`test_rdma_zc_benchmark` 双向跑时，copy 路径 TX / RX 一侧 ~26 Gb/s、另一侧 ~1.7 Gb/s，数秒后**翻面**，整体 ~3.3 GB/s（半双工）。ZC 路径无此现象（满双工 ~6.4 GB/s）。
 
-### 前因：copy 的发送被 credit 门控，不是 CPU
+### 定位
 
-copy 路径发送由 credit 窗口门控：`TrySend` 里 `limit = CreditsReceived() + kRdmaSlotCount`，`CreditsReceived()` 读的是本端注册内存里一个 8 字节计数器——对端用一条 8 字节 signaled RDMA_WRITE 直接改写它。发送端的命根子就是这一个数：它涨就发得动，它停住则 `available=0`、一条 WRITE 都发不出，只能空转。因此「给再多 CPU 轮询也没用」——瓶颈是 credit 回不来，不是缺时间片。ZC 用 SEND/RECV、无 credit 环，所以免疫。
-
-### 决定性实验：`credit_probe` 逐拍时间戳（`tests/benchmark/credit_probe.cpp`）
-
-子类化 `TransportRDMA`（不改传输层），在两处挂钩：① `HandleCompletion` 识别 credit 帧的 CQE（credit 用 `wr_id=0`，数据帧 `wr_id=slot+1`，天然可区分），测 credit 帧 `ibv_post_send → CQE`（signaled WRITE，CQE 在对端 ACK 后产生）的完整往返；② `TrySend` 覆盖测发送端「credit 耗尽到重新到账」的 stall 时长。**同一条连接先跑单向（反向线空闲）再跑双向**，唯一变量是「有没有反向满速流量」。
-
-结果（两台 eRDMA，12 GB/方向/阶段，两次运行完全一致）：
+copy 发送由 credit 窗口门控（对端用 signaled RDMA_WRITE 改写本端计数器），瓶颈是 credit 回不来，不是 CPU。`credit_probe` 逐拍时间戳（同一条连接先跑单向再跑双向）证实：
 
 | credit 帧往返 | 单向 | 双向 rank0 | 双向 rank1 |
 | --- | --- | --- | --- |
 | mean | 37.9 µs | **360.2 µs** | 38.7 µs |
-| p50 | 37.7 µs | 38.0 µs | 38.2 µs |
 | p99 | 50.9 µs | **2951 µs** | 52.7 µs |
 | max | 636 µs | **7020 µs** | 592 µs |
 
-铁证：双向下 rank0 回传的 credit 帧往返尾部炸到 **p99≈3 ms、max≈7 ms（≈200× 基线）**，rank1 的 credit 往返干净如单向。credit 帧的「post→CQE」往返确实被拖到毫秒级，且**只发生在占优方向**。
+### 机制
 
-### 机制（精确定位）
+credit 帧被**自己同方向 egress 上满速的 outgoing 数据**堵住（回传 credit 与发数据走同一条物理线）→ 占优方 egress 满载 → 对端等 credit 被饿 → 双向正反馈自增强。p50 快 / p99 慢 正是「占优期被堵 / 让出线路期畅通」的翻面形态。
 
-credit 帧不是被**对向**数据堵，是被**自己同方向 egress 上满速的 outgoing 数据**堵：每个 rank 的 NIC 物理 egress 同时承载两样东西——①本方向 outgoing 数据、②本方向回传的 credit 帧（receiver→sender 走同一条物理线）。占优方满速发数据 → 它的 egress 满载 → 它回传的 credit 帧排在数据后 → 对端等 credit → 对端被饿 → 对端 egress 空出来 → 对端 credit 畅通 → 占优方保持满速。**双向正反馈自增强**；p50 快 / p99 慢 的不对称正是「占优期 credit 被堵 / 让出线路期 credit 畅通」的翻面形态。
+## License
 
-### 为什么 `rdma_write_lat.cpp` 复现不出
-
-它是单向单条、对端 rank1 只 park 保活 QP 不回任何软件，`RDMA_WRITE` 的 ACK 由 NIC 硬件自动回、不经过 credit 反馈环，且 4 KiB / 17.6 µs ≈ 0.23 GB/s 远低于满速，无法占道也无对向流量。真正暴露 3.4× 的是双向软件往返的 `rdma_pingpong.cpp`。
-
-### 附带：512 槽死锁的根因
-
-`TrySend` 里 `send_seq += count` 在 `ibv_post_send` 成功**立即**加，而 credit 是接收端**消费后**才回的真实计数。当窗口 `kRdmaSlotCount` 512 > recv pool 64 时，`WRITE_WITH_IMM` 超出可匹配 WQE → RNR NACK → 该 WRITE 不写数据、不产生 IMM CQE、也不为它回 credit，但 `send_seq` 已虚增 → `send_seq - credits = 512`（窗口打满）→ 停发；接收端环空等数据。**双方都等对方 → 永久死锁**。32 槽（≤64）不死锁；128 槽虚增有限、credit 追平 → 慢但推进。不变量：**`kRdmaSlotCount ≤ kRdmaRecvPool`**。
+本仓库尚未包含 LICENSE 文件，许可条款待定。
