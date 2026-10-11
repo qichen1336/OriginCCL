@@ -131,6 +131,17 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 - `test_allreduce_benchmark`（N=2，`busbw == algbw`）：2–128 MiB 全档 ~3.14–3.20 GB/s，打平每方向链路上限。
 - `test_allreduce_benchmark`（N=8，2 机 × 4 rank）：小/中档 busbw ~3.16 GB/s，128 MiB 略降至 2.81 GB/s。
 - `test_allreduce_ompi_benchmark`：与 OriginCCL 逐行相同的 harness，后端切换为 `MPI_Allreduce`，供公平对照（eRDMA 上 OMPI 需自编带 rdmacm 的 `openib`，否则回退 TCP）。
+- **tree / ring 分界（`kTreeThresholdChunks`）**：`AllReduce` 的每 rank 字节数低于 `kTreeThresholdChunks × kChunkBytes`（chunk = 32 KiB）时走 tree，否则 ring。方法：在 4 × ecs.g8y.4xlarge（4 机 × 4 rank = N=16，全 eRDMA，`--channels 4`）上分别编译 `kTreeThresholdChunks = 0`（纯 ring）与 `1e9`（纯 tree）两个版本，用同一条 factor-2 sweep 各跑一次，逐档比较 `median_us`（同一字节数、同一计时口径，可直接对比）：
+
+| 每 rank size | ring µs | tree µs | 更快 |
+| --- | --- | --- | --- |
+| 16 KiB | 160.2 | 139.4 | tree 13% |
+| 32 KiB | 206.4 | 156.8 | tree 24% |
+| 64 KiB | 212.4 | 195.5 | tree 8% |
+| 128 KiB | 278.2 | 287.3 | ring 3% |
+| 256 KiB | 325.3 | 429.4 | ring 32% |
+| 512 KiB | 369.0 | 747.5 | ring 103% |
+| 1 MiB | 790.0 | 1180.4 | ring 49% |
 
 ### 全矩阵对照（4 × ecs.g8y.4xlarge，eRDMA / RDMA / TCP）
 
