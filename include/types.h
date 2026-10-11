@@ -136,4 +136,9 @@ struct CollPlan {
     }
 
     std::vector<ChannelPlan> channels;
+
+    // Flat, cross-rank-identical list of unbound collective slices. Only populated for
+    // all-collective batches; each slice has channel_id == -1 and empty transports, and is
+    // bound to a channel by the dynamic executor at execution time.
+    std::vector<PlanTask> slices;
 };

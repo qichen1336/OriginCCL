@@ -118,6 +118,7 @@ struct Options {
     int warmup = 5;
     int repeats = 1;
     int channels = 4;
+    int group_small = 0;
 };
 
 // The timed window moves at least target_bytes, so small messages are bounded by a call cap
@@ -187,7 +188,7 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
         const std::string value = argv[++i];
         uint64_t parsed = 0;
         if (key == "--min-bytes" || key == "--max-bytes" || key == "--factor" || key == "--target-bytes" ||
-            key == "--warmup" || key == "--repeats" || key == "--channels") {
+            key == "--warmup" || key == "--repeats" || key == "--channels" || key == "--group-small") {
             if (!ParseUnsigned(value, parsed)) {
                 error = fmt::format("invalid value '{}' for {}", value, key);
                 return false;
@@ -212,6 +213,12 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
                     return false;
                 }
                 options.repeats = static_cast<int>(parsed);
+            } else if (key == "--group-small") {
+                if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                    error = "--group-small is too large";
+                    return false;
+                }
+                options.group_small = static_cast<int>(parsed);
             } else {
                 if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
                     error = "--channels is too large";
@@ -242,6 +249,7 @@ void PrintUsage(const char* program) {
                "  --target-bytes N  payload bytes moved per size, sets the call count (default 4G)\n"
                "  --warmup N      untimed warmup calls (default 5)\n"
                "  --repeats N     timed batches per size (default 1)\n"
+               "  --group-small N run a Group of N small allreduces (256 KiB) per timed batch\n"
 #ifdef OCCL_BENCH_OMPI
                "  --channels N    accepted and ignored (MPI backend has no channels)\n"
 #else
@@ -411,6 +419,75 @@ void RunSize(Communicator& comm, const Options& options, uint64_t bytes, int ran
                    median_us, max_us, algbw, busbw, "PASS");
     }
 }
+
+void RunGroupSmall(Communicator& comm, const Options& options, int rank, int world_size) {
+#ifndef OCCL_BENCH_OMPI
+    constexpr size_t kMsgBytes = 256ULL * 1024;
+    const size_t count = kMsgBytes / sizeof(float);
+    const int n = options.group_small;
+
+    std::vector<float> input(count);
+    std::vector<std::vector<float>> outputs(static_cast<size_t>(n));
+    int allocated = 1;
+    try {
+        for (size_t i = 0; i < count; ++i) {
+            input[i] = InputValue(rank, i);
+        }
+        for (auto& out : outputs) {
+            out.resize(count, std::numeric_limits<float>::quiet_NaN());
+        }
+    } catch (const std::exception&) {
+        allocated = 0;
+    }
+    int all_allocated = 0;
+    MPI_Allreduce(&allocated, &all_allocated, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    if (!all_allocated) {
+        AbortAll(rank, "unable to allocate group buffers on every rank");
+    }
+
+    auto run_group = [&]() {
+        comm.GroupStart();
+        for (int i = 0; i < n; ++i) {
+            if (!comm.AllReduce(input.data(), outputs[static_cast<size_t>(i)].data(), count, DataType::FLOAT32,
+                                ReduceOp::SUM)) {
+                return false;
+            }
+        }
+        return comm.GroupEnd();
+    };
+
+    if (!run_group()) {
+        AbortAll(rank, "group allreduce failed during validation preflight");
+    }
+    ValidateOnAllRanks(outputs[0], count, world_size, rank);
+
+    if (rank == 0) {
+        fmt::print("=== group-small: {} x 256 KiB allreduces per Group ===\n", n);
+        fmt::print("{:>8} {:>9} {:>9} {:>9}\n", "msgs", "us/msg", "msg/s", "GB/s");
+    }
+    for (int repeat = 0; repeat < options.repeats; ++repeat) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        const double start = MPI_Wtime();
+        if (!run_group()) {
+            AbortAll(rank, "group allreduce failed during timed measurement");
+        }
+        const double elapsed = MPI_Wtime() - start;
+        double slowest_elapsed = 0.0;
+        MPI_Reduce(&elapsed, &slowest_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            const double per_msg = slowest_elapsed / n;
+            const double msg_per_s = n / slowest_elapsed;
+            const double bytes_per_s = static_cast<double>(kMsgBytes) * n / slowest_elapsed;
+            fmt::print("{:>8} {:>9.1f} {:>9.0f} {:>9.3f}\n", n, per_msg * 1e6, msg_per_s, bytes_per_s / 1e9);
+        }
+    }
+#else
+    (void)comm;
+    (void)options;
+    (void)rank;
+    (void)world_size;
+#endif
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -448,8 +525,9 @@ int main(int argc, char** argv) {
                                options.target_bytes,
                                static_cast<uint64_t>(options.warmup),
                                static_cast<uint64_t>(options.repeats),
-                               static_cast<uint64_t>(options.channels)};
-    MPI_Bcast(wire_options, 7, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+                               static_cast<uint64_t>(options.channels),
+                               static_cast<uint64_t>(options.group_small)};
+    MPI_Bcast(wire_options, 8, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     options.min_bytes = wire_options[0];
     options.max_bytes = wire_options[1];
     options.factor = wire_options[2];
@@ -457,6 +535,7 @@ int main(int argc, char** argv) {
     options.warmup = static_cast<int>(wire_options[4]);
     options.repeats = static_cast<int>(wire_options[5]);
     options.channels = static_cast<int>(wire_options[6]);
+    options.group_small = static_cast<int>(wire_options[7]);
 
     if (world_size < 2) {
         if (rank == 0) {
@@ -491,8 +570,12 @@ int main(int argc, char** argv) {
     if (rank == 0) {
         PrintMetadata(options, comm, world_size, nodes);
     }
-    for (const uint64_t bytes : MakeSizes(options)) {
-        RunSize(comm, options, bytes, rank, world_size);
+    if (options.group_small > 0) {
+        RunGroupSmall(comm, options, rank, world_size);
+    } else {
+        for (const uint64_t bytes : MakeSizes(options)) {
+            RunSize(comm, options, bytes, rank, world_size);
+        }
     }
 #ifndef OCCL_BENCH_OMPI
     comm.Finalize();

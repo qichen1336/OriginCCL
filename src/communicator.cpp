@@ -22,6 +22,7 @@
 #include "topology/topology_p2p.h"
 #include "executor/epoll_executor.h"
 #include "executor/multi_thread_executor.h"
+#include "executor/dynamic_multi_thread_executor.h"
 
 namespace {
 constexpr int kDefaultChannelCount = 4;
@@ -50,6 +51,11 @@ bool SharedMemoryEnabled() {
 
 bool RdmaEnabled() {
     const char* value = std::getenv("OCCL_DISABLE_RDMA");
+    return value == nullptr || std::strcmp(value, "1") != 0;
+}
+
+bool DynamicExecutorEnabled() {
+    const char* value = std::getenv("OCCL_DISABLE_DYNAMIC");
     return value == nullptr || std::strcmp(value, "1") != 0;
 }
 
@@ -272,6 +278,11 @@ bool Communicator::Init(const CommConfig& cfg) {
     executor = MakeExecutor(local_size, local_rank, n_channels);
     Utils::PinProcessToCpu(local_rank);
 
+    if (DynamicExecutorEnabled()) {
+        dynamic_executor = std::make_unique<DynamicMultiThreadExecutor>(*this, local_rank * n_channels);
+        dynamic_available_ = true;
+    }
+
     if (!InitChannels(all_nodes, listeners, use_shm, rdma_ready)) {
         LOG_ERROR("Rank {}: Failed to init channel connections", config.rank);
         return false;
@@ -281,6 +292,11 @@ bool Communicator::Init(const CommConfig& cfg) {
     return true;
 }
 void Communicator::Finalize() {
+    if (dynamic_executor) {
+        dynamic_executor->Shutdown();
+        dynamic_executor.reset();
+        dynamic_available_ = false;
+    }
     if (executor) {
         executor->Shutdown();
     }
@@ -365,8 +381,23 @@ bool Communicator::Flush() {
         return false;
     }
 
+    const bool want_dynamic = dynamic_available_ && planner.IsCollectiveBatch(tasks);
+
     CollPlan plan;
-    return planner.Plan(*this, tasks, plan) && executor->Run(plan);
+    if (!planner.Plan(*this, tasks, plan, want_dynamic)) {
+        return false;
+    }
+    if (want_dynamic) {
+        // A balanced slice set (at most one slice per channel) gains nothing from dynamic
+        // scheduling, only the control-broadcast overhead, so fall back to the static path.
+        if (plan.slices.size() > static_cast<size_t>(config.n_channels)) {
+            return dynamic_executor->Run(plan);
+        }
+        if (!planner.Plan(*this, tasks, plan, false)) {
+            return false;
+        }
+    }
+    return executor->Run(plan);
 }
 
 bool Communicator::AllReduce(const void* send_buf, void* recv_buf, size_t count, DataType dtype, ReduceOp op) {

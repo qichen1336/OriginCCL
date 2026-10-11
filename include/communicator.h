@@ -112,6 +112,8 @@ private:
     std::vector<Channel> channels;
     Planner planner;
     std::unique_ptr<Executor> executor;
+    std::unique_ptr<Executor> dynamic_executor;
+    bool dynamic_available_ = false;
     int group_depth = 0;
     std::vector<CollTask> pending_tasks;
     int bootstrap_listen_fd = -1;
