@@ -144,7 +144,7 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 | 64 | 214 | 111 | 1.93× |
 | 128 | 216 | 110 | 1.96× |
 
-跨机 2×2（eRDMA）上旧执行器在 `--group-small ≥8` 时死锁（ring credit 反馈环），动态执行器能稳定跑通；吞吐受 RDMA credit 双稳态支配、噪声大，故收益以单机 SHM 的干净 A/B 为准。
+跨机 2×2（eRDMA，25 Gbps，`112.74.105.75` + `47.119.141.32`）上旧执行器在 `--group-small ≥8` 时死锁（ring credit 反馈环），动态执行器稳定跑通，快态吞吐约 11–14k msg/s（256 KiB，≈3.5 GB/s）；吞吐受 RDMA credit 双稳态支配、快慢态跳变，故收益倍数以单机 SHM 的干净 A/B（~2×）为准。运行命令：`mpirun -np 4 --allow-run-as-root --bind-to none --host <ip1>:2,<ip2>:2 ./build/tests/benchmark/test_allreduce_benchmark --group-small 64`（`--bind-to none` 必带，库里 worker 自行绑核）。
 
 - **tree / ring 分界（`kTreeThresholdChunks`）**：`AllReduce` 的每 rank 字节数低于 `kTreeThresholdChunks × kChunkBytes`（chunk = 32 KiB）时走 tree，否则 ring。方法：在 4 × ecs.g8y.4xlarge（4 机 × 4 rank = N=16，全 eRDMA，`--channels 4`）上分别编译 `kTreeThresholdChunks = 0`（纯 ring）与 `1e9`（纯 tree）两个版本，用同一条 factor-2 sweep 各跑一次，逐档比较 `median_us`（同一字节数、同一计时口径，可直接对比）：
 
