@@ -79,7 +79,16 @@ scripts/run_tests.sh --level 0 --list-cases --no-build
   - `test_transport_tcp` / `test_transport_shm` / `test_transport_rdma` / `test_transport_rdma_zc`：四种传输的接口语义套件（建连、握手、阻塞与非阻塞收发、progress/done 单调、零长度、边界尺寸到 5 MiB、背压与恢复、就绪与方向约束、关闭语义）。TCP 与 SHM 只需两个进程，RDMA 与零拷贝 RDMA 需设备。零拷贝档位额外覆盖阈值前后、多 chunk 与两条路径交替，并断言 `progress` 全有或全无。
   - 用例生成、独立期望值与结果上报都在 `tests/test_common.*`；传输套件共用 `tests/transport_check.*`。
   - `test_p2p`：`--suite p2p` 固定四 rank 跑同机和模拟跨机，验证懒建连、乱序来源缓存、连接隔离与复用、边界契约、集合交替、嵌套 Group 批处理（冷建连整轮全互联、同 peer 重复消息 FIFO），以及 polling/epoll 下阈值前后到 48 MiB 的完整数据。无 RDMA 时验证跨机拒绝回退，再将跨机传输记为 SKIP；不缩放数据量。
-- 两个性能基准在 `tests/benchmark/`，不属 `run_tests.sh` 回归矩阵，手动 `mpirun` 运行，复用同一 `build/`（二进制在 `build/tests/benchmark/`）：`test_allreduce_benchmark`、`test_rdma_zc_benchmark`。
+- 性能基准在 `tests/benchmark/`，不属 `run_tests.sh` 回归矩阵，手动 `mpirun` 运行，复用同一 `build/`（二进制在 `build/tests/benchmark/`）：`test_allreduce_benchmark`、`test_allreduce_ompi_benchmark`（同一源文件、`OCCL_BENCH_OMPI` 后端）、`test_rdma_zc_benchmark`。
+- **远端跑 OpenMPI 对照基准**：两机放同一路径的 `test_allreduce_ompi_benchmark`，从一机发起，`mpirun` 用带 `rdmacm` CPC 的 OpenMPI（`/opt/ompi-rdma/bin/mpirun`）：
+  ```bash
+  /opt/ompi-rdma/bin/mpirun -np 2 --allow-run-as-root -x LD_LIBRARY_PATH \
+    --host <ip1>:1,<ip2>:1 \
+    --mca pml ob1 --mca btl openib,self --mca btl_openib_cpc_include rdmacm \
+    --mca btl_openib_receive_queues P,128,256,192,128 --mca btl_openib_max_inline_data 0 \
+    ./build-rdma/tests/benchmark/test_allreduce_ompi_benchmark --min-bytes 1M --max-bytes 256M --factor 4 --target-bytes 4G
+  ```
+  四个 `--mca` 必带（缺则回退 tcp / CPC 被跳过 / `rdma_create_qp` EINVAL）。OriginCCL 侧对照换二进制名为 `test_allreduce_benchmark`；单机跑去掉 `--host` 与四个 `--mca`。
 - **P2P 契约与建连**：改 Send/Recv、`Channel.send_p2p/recv_p2p`、Group 批处理或懒建连时读 `docs/layers/communicator.md`、`planner.md`、`topology.md`。发送固定用 channel 0、接收固定用 channel 1（要求 `n_channels >= 2`），方向连接与集合隔离；跨机强制 RDMA_ZC；同 communicator 禁止并发，调用方保证配对顺序。planner 每轮用两个短生命周期线程分别 Connect 与 Accept、join 后执行，无长驻后台线程。
 - **Group 批量下发**：`GroupStart`/`GroupEnd` 支持嵌套，只有深度归零的最外层 End 排序后执行。集合按 `(func, 字节量, dtype, 有效 op, 有效 root)` 稳定升序，P2P 一律排在最后并按轮次升序（`Send` 到 `(rank-i+N)%N`、`Recv` 自 `(rank+i)%N`，轮次由 planner 推导、调用方不传）。组内操作彼此独立（可共享只读输入），不支持同组内前操输出作为后操输入，依赖用 Group 边界表达；同轮的 Send 放 channel 0、Recv 放 channel 1，由 executor 并发推进。
 - **回归只看摘要，不读 `.out`**：`run_tests.sh` 已把结果既打到 stdout 又写进 `test-reports/summary.txt`。摘要非 PASS 时才用 `grep -n` 在对应 `.out` 里定位。`single.out` / `multi.out` 每个约 29k token、等级 2 更大，一旦读进上下文会随每轮重发，是主要的 token 开销来源。

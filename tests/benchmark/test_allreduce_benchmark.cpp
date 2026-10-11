@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <cerrno>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -12,23 +11,37 @@
 #include <mpi.h>
 #include "communicator.h"
 #include "logger.h"
+#ifdef OCCL_BENCH_OMPI
+#include "utils.h"
+#else
 #include "occl_config.h"
 #include "test_common.h"
+#endif
 
 #ifndef OCCL_BENCH_BUILD_TYPE
 #define OCCL_BENCH_BUILD_TYPE "unknown"
 #endif
 
 namespace {
+#ifdef OCCL_BENCH_OMPI
+constexpr const char* kBenchName = "allreduce_ompi_benchmark";
+#else
+constexpr const char* kBenchName = "allreduce_benchmark";
+#endif
+
 struct Options {
     uint64_t min_bytes = 256ULL * 1024 * 1024;
     uint64_t max_bytes = 256ULL * 1024 * 1024;
     uint64_t factor = 2;
+    uint64_t target_bytes = 40ULL * 1024 * 1024 * 1024;
     int warmup = 5;
-    int iterations = 100;
     int repeats = 1;
     int channels = 4;
 };
+
+// The timed window moves at least target_bytes, so small messages are bounded by a call cap
+// rather than a fixed count: the point is to avoid a burst-sized window on the cloud NIC.
+constexpr uint64_t kMaxCallsPerBatch = 16384;
 
 enum class ParseResult : int {
     Error = -1,
@@ -92,8 +105,8 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
         }
         const std::string value = argv[++i];
         uint64_t parsed = 0;
-        if (key == "--min-bytes" || key == "--max-bytes" || key == "--factor" || key == "--warmup" ||
-            key == "--iters" || key == "--repeats" || key == "--channels") {
+        if (key == "--min-bytes" || key == "--max-bytes" || key == "--factor" || key == "--target-bytes" ||
+            key == "--warmup" || key == "--repeats" || key == "--channels") {
             if (!ParseUnsigned(value, parsed)) {
                 error = fmt::format("invalid value '{}' for {}", value, key);
                 return false;
@@ -104,18 +117,14 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
                 options.max_bytes = parsed;
             } else if (key == "--factor") {
                 options.factor = parsed;
+            } else if (key == "--target-bytes") {
+                options.target_bytes = parsed;
             } else if (key == "--warmup") {
                 if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
                     error = "--warmup is too large";
                     return false;
                 }
                 options.warmup = static_cast<int>(parsed);
-            } else if (key == "--iters") {
-                if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
-                    error = "--iters is too large";
-                    return false;
-                }
-                options.iterations = static_cast<int>(parsed);
             } else if (key == "--repeats") {
                 if (parsed > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
                     error = "--repeats is too large";
@@ -135,9 +144,9 @@ bool ParseOptions(int argc, char** argv, Options& options, ParseResult& result, 
         }
     }
     if (options.min_bytes == 0 || options.max_bytes < options.min_bytes || options.factor < 2 ||
-        options.min_bytes % sizeof(float) != 0 || options.max_bytes % sizeof(float) != 0 || options.iterations <= 0 ||
-        options.repeats <= 0 || options.channels <= 0) {
-        error = "require positive 4-byte-aligned sizes, max >= min, factor >= 2, iters/repeats/channels > 0";
+        options.target_bytes == 0 || options.min_bytes % sizeof(float) != 0 ||
+        options.max_bytes % sizeof(float) != 0 || options.repeats <= 0 || options.channels <= 0) {
+        error = "require positive 4-byte-aligned sizes, max >= min, factor >= 2, target-bytes/repeats/channels > 0";
         return false;
     }
     result = ParseResult::Run;
@@ -149,10 +158,14 @@ void PrintUsage(const char* program) {
                "  --min-bytes N   first per-rank message size (default 256M)\n"
                "  --max-bytes N   maximum per-rank message size (default 256M)\n"
                "  --factor N      size multiplier, integer >= 2 (default 2)\n"
+               "  --target-bytes N  payload bytes moved per size, sets the call count (default 4G)\n"
                "  --warmup N      untimed warmup calls (default 5)\n"
-               "  --iters N       AllReduce calls per timed batch (default 100)\n"
                "  --repeats N     timed batches per size (default 1)\n"
+#ifdef OCCL_BENCH_OMPI
+               "  --channels N    accepted and ignored (MPI backend has no channels)\n"
+#else
                "  --channels N    communicator channel count (default 4)\n"
+#endif
                "Sizes accept B (omitted), K, M, or G binary units.\n",
                program);
 }
@@ -192,9 +205,21 @@ bool ValidateOutput(const std::vector<float>& output, size_t count, int world_si
 }
 
 [[noreturn]] void AbortAll(int rank, const std::string& error) {
-    LOG_ERROR("allreduce_benchmark rank {}: {}", rank, error);
+    LOG_ERROR("{} rank {}: {}", kBenchName, rank, error);
     MPI_Abort(MPI_COMM_WORLD, 1);
     std::abort();
+}
+
+bool BenchAllReduce(Communicator& comm, const float* input, float* output, size_t count) {
+#ifdef OCCL_BENCH_OMPI
+    (void)comm;
+    if (count > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return false;
+    }
+    return MPI_Allreduce(input, output, static_cast<int>(count), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD) == MPI_SUCCESS;
+#else
+    return comm.AllReduce(input, output, count, DataType::FLOAT32, ReduceOp::SUM);
+#endif
 }
 
 bool ValidateOnAllRanks(const std::vector<float>& output, size_t count, int world_size, int rank) {
@@ -208,21 +233,17 @@ bool ValidateOnAllRanks(const std::vector<float>& output, size_t count, int worl
     return true;
 }
 
-void PrintMetadata(const Options& options, const Communicator& comm, int world_size) {
-    fmt::print("OriginCCL AllReduce benchmark | ranks={} machines={} channels={} (actual={})\n", world_size,
-               comm.GetMachineCount(), options.channels, comm.GetNChannels());
-    fmt::print(
-        "dtype=float32 op=sum mode=out-of-place warmup={} iters={} repeats={} build={} small_tests={} chunk_bytes={}\n",
-        options.warmup, options.iterations, options.repeats, OCCL_BENCH_BUILD_TYPE,
-#ifdef OCCL_SMALL_TESTS
-        "ON", OcclConfig::kChunkBytes
+void PrintMetadata(const Options& options, const Communicator& comm, int world_size, int nodes) {
+#ifndef OCCL_BENCH_OMPI
+    fmt::print("OriginCCL AllReduce benchmark | ranks={} machines={} channels={} (actual={})\n", world_size, nodes,
+               options.channels, comm.GetNChannels());
+    fmt::print("dtype=float32 op=sum mode=out-of-place warmup={} repeats={} target_bytes={} build={} chunk_bytes={}\n",
+               options.warmup, options.repeats, options.target_bytes, OCCL_BENCH_BUILD_TYPE, OcclConfig::kChunkBytes);
 #else
-        "OFF", OcclConfig::kChunkBytes
-#endif
-    );
-#ifdef OCCL_SMALL_TESTS
-    fmt::print("WARNING: OCCL_SMALL_TESTS is enabled; treat results as a functional smoke test, not production "
-               "performance.\n");
+    (void)comm;
+    fmt::print("OpenMPI AllReduce benchmark | ranks={} nodes={} impl=MPI_Allreduce\n", world_size, nodes);
+    fmt::print("dtype=float32 op=sum mode=out-of-place warmup={} repeats={} target_bytes={} build={}\n", options.warmup,
+               options.repeats, options.target_bytes, OCCL_BENCH_BUILD_TYPE);
 #endif
     fmt::print("{:>10} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>5}\n", "bytes", "count", "min_us", "median_us", "max_us",
                "algGB/s", "busGB/s", "check");
@@ -230,6 +251,10 @@ void PrintMetadata(const Options& options, const Communicator& comm, int world_s
 
 void RunSize(Communicator& comm, const Options& options, uint64_t bytes, int rank, int world_size) {
     const size_t count = static_cast<size_t>(bytes / sizeof(float));
+    const uint64_t per_repeat_target = options.target_bytes / static_cast<uint64_t>(options.repeats);
+    uint64_t calls = (per_repeat_target + bytes - 1) / bytes;
+    calls = std::min(std::max(calls, static_cast<uint64_t>(1)), kMaxCallsPerBatch);
+    const int iterations = static_cast<int>(calls);
     std::vector<float> input;
     std::vector<float> output;
     int local_allocated = 1;
@@ -248,12 +273,12 @@ void RunSize(Communicator& comm, const Options& options, uint64_t bytes, int ran
         input[i] = InputValue(rank, i);
     }
 
-    if (!comm.AllReduce(input.data(), output.data(), count, DataType::FLOAT32, ReduceOp::SUM)) {
+    if (!BenchAllReduce(comm, input.data(), output.data(), count)) {
         AbortAll(rank, "AllReduce failed during validation preflight");
     }
     ValidateOnAllRanks(output, count, world_size, rank);
     for (int i = 0; i < options.warmup; ++i) {
-        if (!comm.AllReduce(input.data(), output.data(), count, DataType::FLOAT32, ReduceOp::SUM)) {
+        if (!BenchAllReduce(comm, input.data(), output.data(), count)) {
             AbortAll(rank, "AllReduce failed during warmup");
         }
     }
@@ -276,8 +301,8 @@ void RunSize(Communicator& comm, const Options& options, uint64_t bytes, int ran
     for (int repeat = 0; repeat < options.repeats; ++repeat) {
         MPI_Barrier(MPI_COMM_WORLD);
         const double start = MPI_Wtime();
-        for (int iteration = 0; iteration < options.iterations; ++iteration) {
-            if (!comm.AllReduce(input.data(), output.data(), count, DataType::FLOAT32, ReduceOp::SUM)) {
+        for (int iteration = 0; iteration < iterations; ++iteration) {
+            if (!BenchAllReduce(comm, input.data(), output.data(), count)) {
                 AbortAll(rank, "AllReduce failed during timed measurement");
             }
         }
@@ -285,7 +310,7 @@ void RunSize(Communicator& comm, const Options& options, uint64_t bytes, int ran
         double slowest_elapsed = 0.0;
         MPI_Reduce(&elapsed, &slowest_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
         if (rank == 0) {
-            batch_seconds[static_cast<size_t>(repeat)] = slowest_elapsed / options.iterations;
+            batch_seconds[static_cast<size_t>(repeat)] = slowest_elapsed / iterations;
         }
         ValidateOnAllRanks(output, count, world_size, rank);
     }
@@ -328,7 +353,7 @@ int main(int argc, char** argv) {
             if (parse_status == static_cast<int>(ParseResult::Help)) {
                 PrintUsage(argv[0]);
             } else {
-                LOG_ERROR("allreduce_benchmark: {}", parse_error);
+                LOG_ERROR("{}: {}", kBenchName, parse_error);
                 PrintUsage(argv[0]);
             }
         }
@@ -339,28 +364,30 @@ int main(int argc, char** argv) {
     uint64_t wire_options[] = {options.min_bytes,
                                options.max_bytes,
                                options.factor,
+                               options.target_bytes,
                                static_cast<uint64_t>(options.warmup),
-                               static_cast<uint64_t>(options.iterations),
                                static_cast<uint64_t>(options.repeats),
                                static_cast<uint64_t>(options.channels)};
     MPI_Bcast(wire_options, 7, MPI_UINT64_T, 0, MPI_COMM_WORLD);
     options.min_bytes = wire_options[0];
     options.max_bytes = wire_options[1];
     options.factor = wire_options[2];
-    options.warmup = static_cast<int>(wire_options[3]);
-    options.iterations = static_cast<int>(wire_options[4]);
+    options.target_bytes = wire_options[3];
+    options.warmup = static_cast<int>(wire_options[4]);
     options.repeats = static_cast<int>(wire_options[5]);
     options.channels = static_cast<int>(wire_options[6]);
 
     if (world_size < 2) {
         if (rank == 0) {
-            LOG_ERROR("allreduce_benchmark requires at least 2 MPI ranks; use mpirun -np N");
+            LOG_ERROR("{} requires at least 2 MPI ranks; use mpirun -np N", kBenchName);
         }
         MPI_Finalize();
         return 4;
     }
 
     Communicator comm;
+    int nodes = 1;
+#ifndef OCCL_BENCH_OMPI
     CommConfig config;
     config.rank = rank;
     config.world_size = world_size;
@@ -368,14 +395,31 @@ int main(int argc, char** argv) {
     if (!TestCommon::InitCommunicator(comm, config, rank, world_size)) {
         AbortAll(rank, "communicator initialization failed");
     }
+    nodes = comm.GetMachineCount();
+#else
+    int local_rank = 0;
+    MPI_Comm node_comm = MPI_COMM_NULL;
+    if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node_comm) == MPI_SUCCESS) {
+        MPI_Comm_rank(node_comm, &local_rank);
+    }
+    int node_leaders = local_rank == 0 ? 1 : 0;
+    MPI_Allreduce(&node_leaders, &nodes, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    Utils::PinProcessToCpu(local_rank);
+#endif
 
     if (rank == 0) {
-        PrintMetadata(options, comm, world_size);
+        PrintMetadata(options, comm, world_size, nodes);
     }
     for (const uint64_t bytes : MakeSizes(options)) {
         RunSize(comm, options, bytes, rank, world_size);
     }
+#ifndef OCCL_BENCH_OMPI
     comm.Finalize();
+#else
+    if (node_comm != MPI_COMM_NULL) {
+        MPI_Comm_free(&node_comm);
+    }
+#endif
     MPI_Finalize();
     return 0;
 }

@@ -21,12 +21,10 @@ target_link_libraries(rdma_write_lat originccl fmt::fmt MPI::MPI_CXX ${OCCL_IBVE
 add_executable(test_allreduce_benchmark test_allreduce_benchmark.cpp)
 target_link_libraries(test_allreduce_benchmark occl_test_support)
 target_compile_definitions(test_allreduce_benchmark PRIVATE "OCCL_BENCH_BUILD_TYPE=\"$<CONFIG>\"")
-if(OCCL_SMALL_TESTS)
-    target_compile_definitions(test_allreduce_benchmark PRIVATE OCCL_SMALL_TESTS)
-endif()
 
 # Baseline: the same harness driving MPI_Allreduce instead of the OriginCCL communicator, so the
-# two tables are directly comparable.
-add_executable(test_allreduce_ompi_benchmark test_allreduce_ompi_benchmark.cpp)
+# two tables are directly comparable. Both binaries are the one source, split by OCCL_BENCH_OMPI.
+add_executable(test_allreduce_ompi_benchmark test_allreduce_benchmark.cpp)
 target_link_libraries(test_allreduce_ompi_benchmark originccl fmt::fmt MPI::MPI_CXX)
-target_compile_definitions(test_allreduce_ompi_benchmark PRIVATE "OCCL_BENCH_BUILD_TYPE=\"$<CONFIG>\"")
+target_compile_definitions(test_allreduce_ompi_benchmark PRIVATE "OCCL_BENCH_BUILD_TYPE=\"$<CONFIG>\""
+                                                               OCCL_BENCH_OMPI)

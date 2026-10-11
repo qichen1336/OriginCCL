@@ -115,18 +115,17 @@ ZC 小尺寸（<512 KiB）慢是延迟主导：signaled SEND 的完成要等对�
 
 ### `test_allreduce_benchmark`（N=2 时 `busbw == algbw`）
 
-`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。默认 256 MiB / 100 次迭代：
+`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。每档的计时窗按 `--target-bytes`（默认 4 GiB）反推调用次数 `calls = min(target_bytes / bytes, 16384)`，保证每档搬够数据量、避免小尺寸的突发假象（云主机突发带宽不稳）。默认单档 256 MiB：
 
 ```
-bytes=268435456  count=67108864  busGB/s=2.92  PASS
+bytes=268435456  count=67108864  busGB/s=3.19  PASS
 ```
 
-2.92 GB/s 已打满每方向 ~2.9 GB/s 的链路可持续上限，与 perftest 单向一致。尺寸阶梯（短窗，偏高）：
-1 MiB 3.56 / 4 MiB 6.17 / 16 MiB 7.08 / 64 MiB 5.95 / 128 MiB 3.70 / 256 MiB 2.92 GB/s。
+跨机 eRDMA（occ209↔occ11，N=2）尺寸阶梯（target 4 GiB，稳态）：1 MiB 3.28 / 4 MiB 3.19 / 16 MiB 3.22 / 64 MiB 3.19 / 256 MiB 3.19 GB/s，全档打平每方向 ~2.9 GB/s 的链路可持续上限。
 
 ### `test_allreduce_ompi_benchmark`（OriginCCL 的 OpenMPI 公平对照）
 
-复用与 `test_allreduce_benchmark` **逐行相同**的 harness（选项、尺寸阶梯、输入值、逐元素独立 oracle、`MPI_Wtime` 计时口径、`busbw` 公式与表格列），唯一差别是把 `comm.AllReduce(...)` 换成阻塞的 `MPI_Allreduce(..., MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD)` out-of-place；调用前用 `Utils::PinProcessToCpu(local_rank)` 绑到与 OriginCCL 相同的本机核，因此两边可逐档对读。
+复用与 `test_allreduce_benchmark` **逐行相同**的 harness（选项、尺寸阶梯、输入值、逐元素独立 oracle、`MPI_Wtime` 计时口径、`busbw` 公式与表格列）。两者由同一个 `tests/benchmark/test_allreduce_benchmark.cpp` 编译两次得到，唯一差别是 `OCCL_BENCH_OMPI` 宏切换 `BenchAllReduce` 的实现——OriginCCL 后端调 `comm.AllReduce(...)`，OpenMPI 后端调阻塞的 `MPI_Allreduce(..., MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD)` out-of-place；宏同时切换初始化（OriginCCL 建 communicator，MPI 用 `Utils::PinProcessToCpu(local_rank)` 绑到与 OriginCCL 相同的本机核）与元数据标签，其余完全一致，因此两边可逐档对读。
 
 `--channels` 为命令行兼容而被接受并忽略（MPI 后端无 channel 概念），其余选项默认值与 `test_allreduce_benchmark` 一致：
 
@@ -135,6 +134,9 @@ mpirun -np 2 --host <ip1>:1,<ip2>:1 build/tests/benchmark/test_allreduce_ompi_be
 ```
 
 两侧表格同为 `bytes / count / min_us / median_us / max_us / algGB/s / busGB/s / check`，直接并排比较即可。
+
+**注意传输层不对等**：本仓库验证过的 eRDMA(iWARP) 网卡上，OpenMPI 4.1.2 **无法**驱动该设备——`openib` BTL 只编了 `udcm`（iWARP 需要 `rdmacm`）直接禁用端口，`ucx` PML 初始化失败——因此 OMPI 回退到 `tcp` BTL，而 OriginCCL 直发 `erdma_0`。同机 eRDMA 实测（N=2，target 4 GiB）：OriginCCL RDMA 全档 ~3.19 GB/s，OMPI TCP 1.48–2.14 GB/s。要严格对等，可用 `OCCL_DISABLE_RDMA=1` 把 OriginCCL 也压到 TCP：256 MiB 时 OriginCCL TCP 2.28 GB/s vs OMPI TCP 1.52 GB/s（同传输层下 OriginCCL 仍快 ~1.5×）。
+
 
 ## 案例：copy 路径双向吞吐「一个方向被饿死」的定位（2026-10-11，已坐实）
 
