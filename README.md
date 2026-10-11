@@ -148,6 +148,85 @@ mpirun -np 2 --host <ip1>:1,<ip2>:1 build/tests/benchmark/test_allreduce_ompi_be
 **注意传输层不对等**：本仓库验证过的 eRDMA(iWARP) 网卡上，OpenMPI 4.1.2 **无法**驱动该设备——`openib` BTL 只编了 `udcm`（iWARP 需要 `rdmacm`）直接禁用端口，`ucx` PML 初始化失败——因此 OMPI 回退到 `tcp` BTL，而 OriginCCL 直发 `erdma_0`。同机 eRDMA 实测（N=2，target 4 GiB）：OriginCCL RDMA 全档 ~3.19 GB/s，OMPI TCP 1.48–2.14 GB/s。要严格对等，可用 `OCCL_DISABLE_RDMA=1` 把 OriginCCL 也压到 TCP：256 MiB 时 OriginCCL TCP 2.28 GB/s vs OMPI TCP 1.52 GB/s（同传输层下 OriginCCL 仍快 ~1.5×）。
 
 
+## 性能基准结果（阿里云 4 × ecs.g8y.4xlarge 全矩阵，eRDMA / RDMA / TCP，2026-10-11）
+
+### 环境
+
+四台 `ecs.g8y.4xlarge`（aarch64，16 核，Ubuntu 22.04，内核 5.15，gcc 11.4，OpenMPI 4.1.2），私网同属 `172.18.0.0/20`，root 免密全互联。
+
+| 主机 | 公网 | 私网 | hostname | eRDMA |
+| --- | --- | --- | --- | --- |
+| A | 47.119.153.73 | 172.18.10.0 | iZwz9cyfv0a26qcmv0rv7iZ | `erdma_0` PORT_ACTIVE |
+| B | 47.119.141.32 | 172.18.9.255 | iZwz9cyfv0a26qcmv0rv7hZ | `erdma_0` PORT_ACTIVE |
+| C | 112.74.105.75 | 172.18.10.2 | iZwz9a0lhb3ppx88x73htgZ | **无设备**（驱动在，ENI 未开 eRDMA） |
+| D | 120.76.41.62 | 172.18.10.1 | iZwz9a0lhb3ppx88x73htfZ | **无设备**（同 C） |
+
+⚠️ **C / D 只有 `erdma` 驱动，没有 RDMA 设备**（`/sys/class/infiniband/` 为空、`ibv_devices` 为空，`modprobe legacy_mode=1` / `compat_mode=1` 均无效），需要在阿里云控制台给 ENI 开启 eRDMA 才能出现 `erdma_0`。因此**四机布局无法真正走 RDMA**：库的传输选择是全局决策（所有 rank 都 `rdma_port != 0` 才统一用 RDMA），2 台缺设备时跨机边整体回退 TCP；OMPI 的 `openib` BTL 在 C / D 上没有可用端口。下面的「四机 RDMA」两格据此标注。
+
+统一参数：`--min-bytes 2M --max-bytes 256M --factor 4 --warmup 5 --repeats 10 --channels 4`，即尺寸阶梯 **2 / 8 / 32 / 128 MiB**，`target_bytes` 默认 40 GiB/档。四机二进制同源（HEAD `ab7337f`，Release，`md5sum` 四机一致）。
+
+传输口径：
+
+- **OriginCCL 自动**：不设开关，按 hostname 自动分组——同机走 SHM，跨机走 RDMA（全局决策）。
+- **OriginCCL TCP**：`-x OCCL_DISABLE_RDMA=1`（跨机强制 TCP，同机仍是 SHM，因为开关只禁 RDMA）。
+- **OMPI RDMA**：`/opt/ompi-rdma/bin/mpirun` + `--mca pml ob1 --mca btl openib,vader,self --mca btl_openib_cpc_include rdmacm --mca btl_openib_receive_queues P,128,256,192,128 --mca btl_openib_max_inline_data 0`（`openib` 走 eRDMA，`vader` 负责节点内；自编 OMPI 无 `sm` BTL）。
+- **OMPI TCP**：`--mca pml ob1 --mca btl tcp,self`。
+
+数值为 `algbw / busbw`（GB/s），`busbw = algbw × 2(N-1)/N`。N=4（单机 4 rank、两机 2+2）系数 1.5；N=16（四机 4×4）系数 1.875。
+
+三种布局（`--host` 用私网 IP）：
+
+- 布局 1：`-np 4  --host 172.18.10.0:4`（A 单机）
+- 布局 2：`-np 4  --host 172.18.10.0:2,172.18.9.255:2`（A、B）
+- 布局 3：`-np 16 --host 172.18.10.0:4,172.18.9.255:4,172.18.10.2:4,172.18.10.1:4`（A、B、C、D）
+
+OriginCCL 侧用系统 `mpirun --allow-run-as-root --bind-to none`，二进制 `build/tests/benchmark/test_allreduce_benchmark`。
+
+### 布局 1：单机 4 rank（N=4）
+
+单机 cross-rank 全在本机，OriginCCL 自动选 SHM；OMPI RDMA 档的跨 rank 流量同样走节点内 `vader`（共享内存），`openib` 无跨机流量可走。
+
+| size | OCCL 自动(SHM) | OMPI RDMA(vader) | OCCL TCP(=SHM) | OMPI TCP |
+| --- | --- | --- | --- | --- |
+| 2 MiB | 7.99 / 11.98 | 2.36 / 3.54 | 7.92 / 11.88 | 1.41 / 2.11 |
+| 8 MiB | 6.61 / 9.92 | 2.29 / 3.43 | 6.47 / 9.71 | 1.43 / 2.15 |
+| 32 MiB | 4.83 / 7.24 | 1.69 / 2.54 | 4.85 / 7.28 | 1.07 / 1.60 |
+| 128 MiB | 5.01 / 7.52 | 1.75 / 2.63 | 4.98 / 7.47 | 1.07 / 1.60 |
+
+单机上 OriginCCL（SHM）约为 OMPI 的 3–5 倍：对 OMPI `vader` 约 2.9×，对 OMPI TCP 约 4.5–5.7×。`OCCL_DISABLE_RDMA=1` 在单机上不改变任何东西（本就无跨机边），故「OCCL TCP」与「OCCL 自动」逐位相同。
+
+### 布局 2：两机 × 2 rank（N=4）
+
+跨机边在 A↔B 之间（都有 eRDMA）。
+
+| size | OCCL 自动(RDMA) | OMPI RDMA(openib) | OCCL TCP | OMPI TCP |
+| --- | --- | --- | --- | --- |
+| 2 MiB | 2.13 / 3.19 | 1.75 / 2.63 | 2.16 / 3.24 | 1.08 / 1.62 |
+| 8 MiB | 2.14 / 3.21 | 2.09 / 3.13 | 2.16 / 3.24 | 1.20 / 1.80 |
+| 32 MiB | 2.11 / 3.17 | 1.38 / 2.07 | 2.10 / 3.15 | 0.99 / 1.49 |
+| 128 MiB | 2.05 / 3.07 | 1.59 / 2.39 | 2.00 / 3.00 | 0.97 / 1.46 |
+
+### 布局 3：四机 × 4 rank（N=16）
+
+跨机边在 4 台之间；C / D 无 eRDMA，故 OriginCCL 的跨机边整体走 TCP（与「OCCL TCP」档数值一致，互为印证），OMPI 的强制 `openib` 直接启动失败。
+
+| size | OCCL 自动(→TCP) | OMPI RDMA | OCCL TCP | OMPI TCP |
+| --- | --- | --- | --- | --- |
+| 2 MiB | 1.72 / 3.22 | 不可用 † | 1.72 / 3.22 | 0.70 / 1.32 |
+| 8 MiB | 1.72 / 3.22 | 不可用 † | 1.72 / 3.22 | 0.85 / 1.60 |
+| 32 MiB | 1.58 / 2.96 | 不可用 † | 1.59 / 2.99 | 0.69 / 1.28 |
+| 128 MiB | 1.54 / 2.88 | 不可用 † | 1.55 / 2.91 | 0.66 / 1.23 |
+
+† OMPI 强制 `openib` 时进程对不可达（`172.18.10.2` / `172.18.10.1` 无 openib 端口），`MPI_Init` 失败（exit 17）。作为参考，把 `tcp` 也加进 BTL（`openib,vader,tcp`，即有 RDMA 走 RDMA、没有走 TCP 的混合模式）得到 algbw/busbw 2M `0.87 / 1.64`、8M `1.22 / 2.29`、32M `0.89 / 1.67`、128M `0.96 / 1.81`，高于纯 TCP 档但远低于 OriginCCL 的 ~2.9。
+
+### 小结
+
+- **同机（SHM）**：OriginCCL ~7.2–12.0 GB/s busbw，OMPI 仅 ~1.6–3.5，同机路径 OriginCCL 领先数倍。
+- **跨机（A↔B eRDMA）**：OriginCCL 自动(RDMA) 与强制 TCP 几乎相同（~3.0–3.2 busbw）——N=4 环只用到跨机边的一部分，25 Gbps 链路在两种传输下都能喂饱；OMPI 明显更低（RDMA ~2.1–3.1，TCP ~1.5–1.8）。
+- **四机（N=16）**：OriginCCL 受跨机链路限制，busbw 稳定在 ~2.9–3.2；OMPI TCP 只有 ~1.2–1.6。
+- OMPI 在 eRDMA(iWARP) 上要么用 `openib`（需自编带 rdmacm 的 OpenMPI），要么落到 `tcp`；其 `openib` 实测明显慢于 OriginCCL 直发 `erdma_0`。
+
+
 ## 案例：copy 路径双向吞吐「一个方向被饿死」的定位（2026-10-11，已坐实）
 
 ### 现象
