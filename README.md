@@ -131,6 +131,21 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 - `test_allreduce_benchmark`（N=2，`busbw == algbw`）：2–128 MiB 全档 ~3.14–3.20 GB/s，打平每方向链路上限。
 - `test_allreduce_benchmark`（N=8，2 机 × 4 rank）：小/中档 busbw ~3.16 GB/s，128 MiB 略降至 2.81 GB/s。
 - `test_allreduce_ompi_benchmark`：与 OriginCCL 逐行相同的 harness，后端切换为 `MPI_Allreduce`，供公平对照（eRDMA 上 OMPI 需自编带 rdmacm 的 `openib`，否则回退 TCP）。
+
+#### 动态多线程执行器（`--group-small`，2026-10）
+
+当一批任务全是集合通信时，planner 把切片平铺进公共队列，交给 `DynamicMultiThreadExecutor` 动态调度：每个 channel 空闲时由 rank0 从队列抓一小批（默认 2 个）切片，用 ring Broadcast 原语（`kControlMagic` 打头的控制消息）in-band 广播给所有 rank，再就地绑定 channel 执行。这样空闲的 channel 能承接别的 channel 排队中的切片，消除「快 channel 先跑完、worker 闲置」的负载不均；切片数 ≤ channel 数（均衡）时自动回退原 `MultiThreadExecutor`。`OCCL_DISABLE_DYNAMIC=1` 强制回退，`OCCL_DYNAMIC_BATCH=N` 调批大小。
+
+`test_allreduce_benchmark --group-small N` 把 N 个 256 KiB AllReduce 打包成一个 Group 计吞吐。单机 4 rank（SHM，channels=4）A/B 对比（动态 vs `OCCL_DISABLE_DYNAMIC=1`）：
+
+| group 大小 | 动态 msg/s | 旧 msg/s | 提升 |
+| --- | --- | --- | --- |
+| 32 | 206 | 109 | 1.89× |
+| 64 | 214 | 111 | 1.93× |
+| 128 | 216 | 110 | 1.96× |
+
+跨机 2×2（eRDMA）上旧执行器在 `--group-small ≥8` 时死锁（ring credit 反馈环），动态执行器能稳定跑通；吞吐受 RDMA credit 双稳态支配、噪声大，故收益以单机 SHM 的干净 A/B 为准。
+
 - **tree / ring 分界（`kTreeThresholdChunks`）**：`AllReduce` 的每 rank 字节数低于 `kTreeThresholdChunks × kChunkBytes`（chunk = 32 KiB）时走 tree，否则 ring。方法：在 4 × ecs.g8y.4xlarge（4 机 × 4 rank = N=16，全 eRDMA，`--channels 4`）上分别编译 `kTreeThresholdChunks = 0`（纯 ring）与 `1e9`（纯 tree）两个版本，用同一条 factor-2 sweep 各跑一次，逐档比较 `median_us`（同一字节数、同一计时口径，可直接对比）：
 
 | 每 rank size | ring µs | tree µs | 更快 |

@@ -5,7 +5,8 @@
 # 核心职责边界
 
 - `CollTask` 表达五种 collective 与 Send/Recv 的 API 语义：`func`、`send_buf`/`recv_buf`、`count`/`dtype`、`ReduceOp`、`root`、`peer`。peer 仅用于 P2P，无根操作忽略 root，非归约操作忽略 op。
-- `Planner::SortTasks` 与 `Planner::Plan(comm, tasks, plan)` 分别对一个任务批次稳定排序、将批次中全部集合与 P2P 任务组装到一个 `CollPlan`。Plan 先切片集合任务，再按轮次准备 P2P 连接并把任务追加到固定方向 channel。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
+- `Planner::SortTasks` 与 `Planner::Plan(comm, tasks, plan, dynamic)` 分别对一个任务批次稳定排序、将批次中全部集合与 P2P 任务组装到一个 `CollPlan`。Plan 先切片集合任务，再按轮次准备 P2P 连接并把任务追加到固定方向 channel。集合操作按 count 代表的元素区间切片。多 rank 块布局下，每个 channel 处理每个块的相同子区间，而非切整个 `count*world_size` 缓冲区。
+- **动态切片（`dynamic=true`）**：`IsCollectiveBatch` 判全集合批次后，`Plan` 走 `EmitCollectiveSlices(..., bind=false)`——切片照常生成（同样的 unit/`n_used`/每 channel 字节切分），但 `channel_id == -1`、不调 `FillTransports`，切片平铺进 `CollPlan::slices`（跨 rank 一致，因切分只依赖 `CollTask` 与 world size，与 rank 无关）。P2P 批次或均衡切片（`slices.size() ≤ n_channels`）时由 communicator 回退 `bind=true` 的常规路径。
 - **排序规则**：集合在前，按 `(CollFunc, count*type_size, dtype, 有效 op, 有效 root)` 稳定升序（无效维度取 0）；P2P 在后，按轮次升序。轮次由 planner 推导：`Send` 到 `p` 的轮次是 `world_size - (p-rank+world_size)%world_size`，`Recv` 自 `p` 的轮次是 `world_size - (rank-p+world_size)%world_size`，两端对同一消息得到同一轮次编号。同轮内 `Send` 先于 `Recv`、同方向按 peer 稳定排序。
 - **channel 分配**：每个集合任务都从 channel 0 开始，用 `n_used` 个连续环绕物理 channel；多个任务可排入同一 channel 的 FIFO 队列。P2P 固定 `Send`→channel 0、`Recv`→channel 1。
 - **拓扑选择**：planner 每次调用按 `func` + 数据量选拓扑挂到 `PlanTask.topology`。Broadcast / Reduce / ReduceScatter / AllGather 永远 ring；只有 AllReduce 在 `count * type_size / kChunkBytes < kTreeThresholdChunks` 时走 tree，否则 ring（见 [occl_config.h](../../include/occl_config.h) 的 `kTreeThresholdChunks`）。阈值以 chunk 为单位，`OCCL_SMALL_TESTS` 同除 256 后选择不变。tree 仅实现 AllReduce（见 [topology.md](topology.md)）。当前值 **4**（每 rank < 128 KiB 走 tree），由 4 × ecs.g8y.4xlarge（4 机 4×4，N=16，eRDMA）实测确定：交叉点在 64 KiB 与 128 KiB 之间，详见 README 性能基准。

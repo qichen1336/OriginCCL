@@ -19,6 +19,7 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 |------|------|
 | `include/executor/executor.h` | `Executor` 抽象基类（`Run`/`Shutdown`） |
 | `include/executor/multi_thread_executor.h` / `src/executor/multi_thread_executor.cpp` | 懒加载 worker（channel `i` 由 worker `i` 执行），每 worker 忙轮询推进本 channel，无进展 `sched_yield()`；worker 钉 `base_cpu+channel_id` 号核（对总核数取模），批次同步与错误汇总 |
+| `include/executor/dynamic_multi_thread_executor.h` / `src/executor/dynamic_multi_thread_executor.cpp` | 全集合批次的动态调度：切片进公共队列，rank0 空闲时抓一小批（默认 2 个）用 ring Broadcast in-band 广播，其余 rank 就地绑定 channel 执行；切片数 ≤ channel 数时由 communicator 回退 `MultiThreadExecutor` |
 | `include/executor/epoll_executor.h` / `src/executor/epoll_executor.cpp` | 单线程 epoll，就绪喂 Step，task 完成 `EPOLL_CTL_DEL` |
 | `include/executor/polling_executor.h` / `src/executor/polling_executor.cpp` | 单线程轮询，对未完成 send/recv 分别喂 Step，无进展 `sched_yield()` |
 | `include/executor/reactor_executor.h` / `src/executor/reactor_executor.cpp` | epoll 主线程 + worker 池：FIFO 队列下发 init/step job，eventfd 回收 completion |
@@ -30,7 +31,8 @@ executor、transport 与 topology 单独成目录，其余层仍平铺。头文�
 - **PollingExecutor**：单线程不监听任何 fd，循环对所有未完成 task 的未完成 send/recv 分别喂事件，一轮无进展 `sched_yield()`。
 - **ReactorExecutor**：调用线程只跑 epoll，全部 `Collective*` 调用在 worker 池执行；主线程用 mutex + condition_variable 的 FIFO 队列下发 job（job 带逻辑 step 位，不带原始 epoll 位），worker 用 mutex + completion 队列 + eventfd 回报结果；eventfd 与 transport fd 注册在同一个 epoll 里。
 - task 的就绪注册由各 executor 遍历 `send_transports`/`recv_transports`、用 `GetFd()` + `GetPollEvents()` 逐条拼出；epoll/reactor 的事件 tag 为 `slot * 2 + side`（side 0 = recv、side 1 = send），同一 side 的多个连接共用 tag，分发时遍历该侧 transport 用 `GetPollEvents()` 复核。
-- 新增 executor 须在 `Communicator` 的选取处（`MakeExecutor`）注册；只实现 `Run`/`Shutdown`，只推进 `CollectiveStep`，不改 `PlanTask` 算法语义字段（只推进 `state`）。
+- **DynamicMultiThreadExecutor**：针对全集合批次。planner 把切片平铺进 `CollPlan::slices`（`channel_id == -1`、transport 未绑）；worker 结构与 `MultiThreadExecutor` 相同（channel `i` 由 worker `i` 执行），但 worker 循环改为「控制广播 → 执行一批 → 控制广播」。控制广播复用 ring Broadcast 原语：rank0 的 worker 空闲时用锁从 `slices` 抓一小批切片索引（`OCCL_DYNAMIC_BATCH`，默认 2），把 `{magic, type, start, count}` 写进 Broadcast 的 `recv_buf` 广播出去；所有 rank 收到后按索引取自己那份 `slices` 副本，就地写 `channel_id`、`FillTransports` 再执行。队列空时广播 END 标记让 worker 退出。切片被「谁广播谁执行」，故批大小必须小到切片能分散到多个 channel（批太大会让单个 channel 独占、负载重新集中）。
+- 新增 executor 须在 `Communicator` 的选取处注册；只实现 `Run`/`Shutdown`，只推进 `CollectiveStep`，不改 `PlanTask` 算法语义字段（只推进 `state`）。
 
 # 隐含约定
 
