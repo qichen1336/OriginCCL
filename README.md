@@ -143,19 +143,17 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 | 512 KiB | 369.0 | 747.5 | ring 103% |
 | 1 MiB | 790.0 | 1180.4 | ring 49% |
 
-### 全矩阵对照（4 × ecs.g8y.4xlarge，eRDMA / RDMA / TCP）
+### 全矩阵对照（4 × ecs.g8y.4xlarge，全部 eRDMA）
 
-四机（A、B 有 `erdma_0`，C、D 无设备），`algbw / busbw`（GB/s），`busbw = algbw × 2(N-1)/N`。三档布局：单机 4 rank、两机 2+2、四机 4×4（N=16）。
+四机 A/B/C/D 全部 `erdma_0` PORT_ACTIVE，`busbw = algbw × 2(N-1)/N`。三档布局：单机 4 rank、两机 2+2、四机 4×4（N=16）；每格为 2/8/32/128 MiB 的 busGB/s（各档完整原始数据见 `tests/benchmark/test_allreduce_benchmark.cpp` 顶部注释）。
 
 | 布局 | OCCL 自动 | OCCL TCP | OMPI RDMA | OMPI TCP |
 | --- | --- | --- | --- | --- |
-| 单机 4 rank（SHM） | ~7.2–12.0 | 同左 | ~1.6–3.5（vader） | ~1.4–2.1 |
-| 两机 2+2（eRDMA） | ~3.0–3.2 | ~3.0–3.2 | ~2.1–3.1（openib） | ~1.5–1.8 |
-| 四机 4×4（C/D 无 RDMA→TCP） | ~2.9–3.2 | 同左 | 不可用 † | ~1.2–1.6 |
+| 单机 4 rank（SHM） | 11.98 / 9.92 / 7.24 / 7.52 | 11.88 / 9.71 / 7.28 / 7.47 | 3.54 / 3.43 / 2.54 / 2.63 | 2.11 / 2.15 / 1.60 / 1.60 |
+| 两机 2+2（eRDMA） | 3.19 / 3.21 / 3.17 / 3.07 | 3.24 / 3.24 / 3.15 / 3.00 | 2.63 / 3.13 / 2.07 / 2.39 | 1.62 / 1.80 / 1.49 / 1.46 |
+| 四机 4×4（N=16） | 1.98 / 1.60 / 1.89 / 1.96 | 3.17 / 2.95 / 2.41 / 2.71 | 0.90 / 1.73 / 1.70 / 1.97 | 1.32 / 1.60 / 1.28 / 1.23 |
 
-† 四机布局中 C/D 无 openib 端口，OMPI 强制 `openib` 时 `MPI_Init` 失败；混合 BTL（`openib,vader,tcp`）得 ~1.6–2.3，仍低于 OriginCCL。
-
-小结：同机 OriginCCL（SHM）领先 OMPI 数倍；跨机 eRDMA 下两种传输都能喂饱 25 Gbps 链路；OMPI 在 eRDMA(iWARP) 上要么用自编 `openib`、要么落到 TCP，其 `openib` 明显慢于 OriginCCL 直发 `erdma_0`。
+小结：同机 OriginCCL（SHM）领先 OMPI 数倍；跨机 eRDMA 下两种传输都能喂饱 25 Gbps 链路；OMPI 在 eRDMA(iWARP) 上要么用自编 `openib`、要么落到 TCP，其 `openib` 明显慢于 OriginCCL 直发 `erdma_0`。四机 N=16 时 OCCL 自动(RDMA) 反而不如强制 TCP（环跨机边多且双向，RDMA copy 路径的 credit 反馈环退化，见下文案例）。
 
 ## 案例：copy 路径双向吞吐「一个方向被饿死」
 
