@@ -90,38 +90,48 @@ P2P 使用 `Send(buffer, count, dtype, peer)` / `Recv(buffer, count, dtype, peer
 
 集合用例的 payload 会逐元素精确比对，传输用例覆盖边界尺寸与就绪活性；这些比对无法被任何单一动态检查替代，因此始终是必跑项。
 
-## 性能基准结果（阿里云 ecs.g8y.8xlarge，2 节点，eRDMA，2026-10）
+## 性能基准结果（阿里云 ecs.g8y.4xlarge，2 节点，eRDMA，2026-10）
 
-环境：两台 `ecs.g8y.8xlarge`（aarch64，32 核），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE）。
-perftest 实测链路：单向 ~2.9 GB/s、双向合计 ~5.6–5.8 GB/s（每方向 ~2.9 GB/s）。
-三个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun -np 2 --host <ip1>:1,<ip2>:1` 跨机启动。
+环境：两台 `ecs.g8y.4xlarge`（aarch64，16 核，Ubuntu 22.04），跨机 eRDMA（iWARP，`erdma_0` PORT_ACTIVE），满双工聚合链路 ~6.4 GB/s（每方向 ~3.2 GB/s ≈ 25 Gbps 标称）。
+三个性能程序（源码在 `tests/benchmark/`，二进制在 `build/tests/benchmark/`）都用 `mpirun --allow-run-as-root --host <ip1>:<n1>,<ip2>:<n2>` 跨机启动（`<n>` 是每机 rank 数，每机 1 rank 时可省略写作 `<ip1>:1`）。
 
 ### `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）
 
-每条消息各建两条单向连接（一收一发），单线程内 `if` 交错推进两方向；连接建立后 `SetWaitMode(Polling)`，
-与忙轮询驱动对齐（否则每个 `Try*` 都付一次 EventDriven 的 `poll(fd,0)` syscall，吞吐掉到 ~3.5 GB/s）。
-表格 `GB/s` 是双向聚合值，折合每方向 ~3 GB/s，与 perftest 单向一致：
+每条消息各建两条单向连接（一收一发），单线程内两个方向各自推进：发送方向受有界 send-ahead 约束
+（`outgoing.messages < incoming.messages + kPipelineDepth`，深度 8），任一方向停滞即阻塞 `poll` 等待其就绪 fd。
+下表为跨机 N=2、`--bind-to none`、每档每方向 45 GB（十进制）计时；`GB/s` 是双向聚合值，折合每方向 ~3.2 GB/s：
 
 | size | copy | ZC |
 | --- | --- | --- |
-| 32 KiB | 5.59 | 1.68 |
-| 128 KiB | 5.96 | 5.19 |
-| 512 KiB | 5.54 | 6.07 |
-| 2 MiB | 5.47 | 6.02 |
-| 8 MiB | 5.30 | 6.02 |
-| 32 MiB | 5.64 | 6.06 |
+| 32 KiB | 6.43 | 1.70 |
+| 128 KiB | 5.00 | 5.42 |
+| 512 KiB | 5.14 | 6.40 |
+| 2 MiB | 5.30 | 6.39 |
+| 8 MiB | 5.21 | 6.39 |
+| 32 MiB | 4.48 | 6.43 |
 
-ZC 小尺寸（<512 KiB）慢是延迟主导：signaled SEND 的完成要等对端 ACK，每条消息含一个完整 RTT，与循环结构无关。
+ZC 32 KiB 慢是延迟主导：signaled SEND 的完成要等对端 ACK，每条消息含一个完整 RTT，与循环结构无关；128 KiB 起追平，≥512 KiB 稳定 ~6.4 GB/s，是 copy 路径的约 2 倍。
 
 ### `test_allreduce_benchmark`（N=2 时 `busbw == algbw`）
 
-`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。每档的计时窗按 `--target-bytes`（默认 4 GiB）反推调用次数 `calls = min(target_bytes / bytes, 16384)`，保证每档搬够数据量、避免小尺寸的突发假象（云主机突发带宽不稳）。默认单档 256 MiB：
+`busbw = algbw × 2(N-1)/N`，N=2 时系数 = 1，即**每方向在网速率**。每档的计时窗按 `--target-bytes`（默认 40 GiB）反推调用次数 `calls = min(target_bytes / bytes, 16384)`，保证每档搬够数据量、避免小尺寸的突发假象（云主机突发带宽不稳）。跨机 eRDMA（N=2，每机 1 rank，channels=4，`--warmup 5 --repeats 10`）尺寸阶梯：
 
 ```
-bytes=268435456  count=67108864  busGB/s=3.19  PASS
+bytes=134217728  count=33554432  busGB/s=3.136  PASS
 ```
 
-跨机 eRDMA（occ209↔occ11，N=2）尺寸阶梯（target 4 GiB，稳态）：1 MiB 3.28 / 4 MiB 3.19 / 16 MiB 3.22 / 64 MiB 3.19 / 256 MiB 3.19 GB/s，全档打平每方向 ~2.9 GB/s 的链路可持续上限。
+2 MiB 3.187 / 8 MiB 3.192 / 32 MiB 3.204 / 128 MiB 3.136 GB/s，全档打平每方向 ~3.2 GB/s 的链路可持续上限。
+
+### `test_allreduce_benchmark` 多机多 rank（N=8，2 机 × 4 rank）
+
+同样 4 channel、`--warmup 5 --repeats 10`，此时 `busbw = algbw × 2(N-1)/N = 1.75 × algbw`。小/中档 busbw（2–8 MiB ~3.16）与 N=2 持平，聚合带宽仍由跨机链路限制（环内其余跳走 SHM）；128 MiB 略降到 2.81：
+
+| bytes | algbw | busbw |
+| --- | --- | --- |
+| 2 MiB | 1.810 | 3.167 |
+| 8 MiB | 1.808 | 3.164 |
+| 32 MiB | 1.769 | 3.096 |
+| 128 MiB | 1.606 | 2.810 |
 
 ### `test_allreduce_ompi_benchmark`（OriginCCL 的 OpenMPI 公平对照）
 
