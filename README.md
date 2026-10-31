@@ -55,25 +55,75 @@ tests/            回归测试与性能基准
 scripts/          构建与测试脚本（run_tests.sh 是唯一测试入口）
 ```
 
-### Communicator
+### 整体架构
 
-顶层编排对象，**唯一对外入口**。负责初始化建连（bootstrap → 机器分组 → 建 channel → 选 executor），暴露五种集合操作、同步 Send/Recv 与 `GroupStart`/`GroupEnd` 批量下发。详见 [communicator.md](docs/layers/communicator.md)。
+OriginCCL 把「如何拆分任务」「何时推进任务」「执行什么通信算法」「如何搬运字节」分开。初始化负责准备连接；每次操作复用这些连接，经规划后同步执行。下图实线表示执行或数据流，虚线表示资源绑定或就绪依赖。
 
-### Planner
+```mermaid
+flowchart TB
+    subgraph setup[初始化：Communicator::Init]
+        listeners[创建 listeners] --> bootstrap[Bootstrap 交换节点信息]
+        bootstrap --> groups[按 hostname 分组]
+        groups --> channels[构建 Channel 拓扑与连接]
+    end
 
-把一批 `CollTask` 排序（集合在前、P2P 按轮次在后）并规划为 `CollPlan`：集合按 chunk 切片分配到 channel，P2P 按轮次准备连接。排序与切片为独立函数，无回调、无 `std::function`。详见 [planner.md](docs/layers/planner.md)。
+    subgraph execution[每次操作：提交、规划、执行]
+        api["用户 API / GroupEnd"] --> comm[Communicator]
+        comm -->|CollTask 批次| planner[Planner：排序、选择拓扑、切片]
+        planner -->|CollPlan| executor[Executor：调度与等待]
+        executor -->|CollectiveInit / Step / Done| topology["Topology：Ring / Tree / P2P"]
+        topology -->|TrySend / TryRecv| transport["Transport：SHM / TCP / RDMA / RDMA_ZC"]
+        transport -->|数据传输| peer[对端 rank]
+    end
 
-### Topology
+    channels -.->|绑定切片所用连接| planner
+    channels -.->|动态执行时绑定| executor
+    transport -.->|fd / 就绪事件| executor
+```
 
-拥有集合与 P2P 算法，把 `PlanTask.state` 当游标推进。通用三阶段接口（`CollectiveInit` / `CollectiveStep` / `CollectiveDone`），只做非阻塞事件处理。Ring 处理多数集合；Tree 仅处理小消息 AllReduce（机器内星型 + 机器间双二叉树）；P2P 处理 Send/Recv。详见 [topology.md](docs/layers/topology.md)。
+Bootstrap 只参与初始化的信息交换，不转发集合数据；实际数据由各 rank 的 Transport 连接传输。动态调度使用的控制广播也复用 channel 的 ring 连接，不另建控制网络。
 
-### Transport
+| 模块 | 核心职责 | 详细文档 |
+| --- | --- | --- |
+| Communicator | 唯一对外入口；管理初始化、分组、channel、待提交任务及执行器，暴露五种集合操作、Send/Recv 与嵌套 Group | [communicator.md](docs/layers/communicator.md) |
+| Planner | 排序并生成计划；集合选择拓扑、切片，P2P 按轮次准备连接；不执行集合算法 | [planner.md](docs/layers/planner.md) |
+| Executor | 调度切片、等待就绪，调用统一三阶段接口；不按集合类型实现算法 | [executor.md](docs/layers/executor.md) |
+| Topology | 实现算法并更新 `PlanTask.state`；Ring 处理多数集合，Tree 处理小消息 AllReduce，P2P 处理 Send/Recv；只做非阻塞推进 | [topology.md](docs/layers/topology.md) |
+| Transport | 搬运字节并提供就绪接口；TCP、SHM、RDMA 具有 listener/connection 双形态，RDMA_ZC 在大消息上直发用户 MR | [transport.md](docs/layers/transport.md) |
 
-字节搬运 + 就绪可等待性。四种实现：TCP、共享内存、RDMA（`WRITE_WITH_IMM` 环形缓冲）、RDMA 零拷贝（阈值 256 KiB 以上注册用户 MR、独立 QP 直发）。TCP / SHM / RDMA 同构（listener + connection 双形态）。详见 [transport.md](docs/layers/transport.md)。
+任务与连接不是同一个层次：
 
-### Executor
+- **CollTask**：一次用户操作，保存 buffer、count、dtype、op 等参数。
+- **CollPlan / PlanTask**：一批操作的执行计划及其中的切片任务；每个 `PlanTask` 保存切片地址、拓扑、连接与算法进度。
+- **Channel**：可复用的通信通道，拥有拓扑所需的连接。同一 channel 上任务顺序执行，不同 channel 可以并发推进。
+- **Chunk**：算法内部的传输粒度，一个切片可以包含多个 chunk；不是每个 chunk 都创建一个 `PlanTask`。
 
-决定「如何等待 transport 就绪」，驱动 topology，是 task 游标的唯一推进者。`Init` 时按全机在线核数与本地 rank 数在 **multi_thread**（忙等）与 **epoll**（事件驱动）之间运行时选定。详见 [executor.md](docs/layers/executor.md)。
+### AllReduce 发射与执行路径
+
+下面展示成功路径；参数校验、规划或执行失败时沿调用链返回 `false`。所有参与 rank 都需要提交匹配的操作。
+
+```mermaid
+flowchart TD
+    api["AllReduce(send, recv, count, dtype, op)"] --> submit["构造 CollTask；Submit 校验并入队"]
+    submit --> grouped{处于 Group 内？}
+    grouped -->|是| pending[暂存任务，本次调用返回]
+    pending -->|最外层 GroupEnd| flush[Flush / SortTasks]
+    grouped -->|否| flush
+    flush --> plan["Plan：选择 Tree/Ring，切片并绑定 channel"]
+    plan --> run[Executor::Run]
+    run --> init[CollectiveInit]
+    init --> done{CollectiveDone？}
+    done -->|否| step["调度就绪方向；CollectiveStep"]
+    step --> transfer["TrySend / TryRecv；推进归约与收发进度"]
+    transfer --> done
+    done -->|是| next[执行后续切片，直至整个计划完成]
+    next --> result["AllReduce 或最外层 GroupEnd 返回 true"]
+```
+
+1. **提交。** [Communicator](src/communicator.cpp) 将参数打包成 `CollTask`，经 `Submit` 校验入队后触发 `Flush`；Group 内只暂存，最外层 `GroupEnd` 才执行，组内操作必须彼此独立。
+2. **规划。** [Planner](src/planner.cpp) 先选择拓扑，再把 buffer 切成至多 `n_channels` 个连续区间，生成绑定到 channel 的 `PlanTask`。普通构建中，每 rank 数据量小于 128 KiB 走 Tree，否则走 Ring；[配置常量](include/occl_config.h) 在缩小测试构建中同步缩放。
+3. **执行。** Executor 通过 `CollectiveInit / Step / Done` 驱动切片。Ring 执行 ReduceScatter → AllGather；Tree 向上归约、向下分发。Topology 调用 `TrySend/TryRecv` 分别推进收发，遇到背压则由执行器轮询或等待就绪。
+4. **返回。** 所有切片完成后 `Run` 返回。Group 外等待 `AllReduce` 成功返回，Group 内等待最外层 `GroupEnd` 成功返回，此时本 rank 输出可用、buffer 可复用；不额外承诺全局 barrier。
 
 ## 构建
 
@@ -97,6 +147,8 @@ cmake --build build -j"$(nproc)"
 
 ## 测试结果
 
+### 单元测试
+
 测试入口只有一个脚本 `scripts/run_tests.sh`（`-h` 有完整说明）。rank / world size 来自 MPI，bootstrap 地址由 rank0 的 `GetUniqueId` 生成后经 `MPI_Bcast` 分发。
 
 等级决定进程布局与数据量：
@@ -113,9 +165,9 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 
 退出码：`0` 全过 / `1` 失败或超时 / `2` 只剩 SKIP / `4` 参数非法。无 RDMA 设备时 RDMA 与零拷贝档位记为 SKIP；可用 `scripts/setup_softroce.sh` 建软件 RoCE 让它们真正跑起来。七个回归测试入口在 `tests/regression/`，报告落在 `test-reports/`。
 
-### 性能基准（阿里云 ecs.g8y.4xlarge，eRDMA，2026-10）
+### RDMA传输层性能基准
 
-三个基准程序在 `tests/benchmark/`，手动 `mpirun` 运行。满双工聚合链路 ~6.4 GB/s（每方向 ~3.2 GB/s）。
+测试环境：阿里云 ecs.g8y.4xlarge，eRDMA。基准程序在 `tests/benchmark/`，手动 `mpirun` 运行。满双工聚合链路 ~6.4 GB/s（每方向 ~3.2 GB/s）。
 
 - `test_rdma_zc_benchmark`（双向聚合带宽，`2 × bytes / elapsed`）：≥512 KiB 起 ZC 稳定 ~6.4 GB/s，约 copy 路径的 2 倍：
 
@@ -128,11 +180,7 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 | 8 MiB | 5.21 | 6.39 |
 | 32 MiB | 4.48 | 6.43 |
 
-- `test_allreduce_benchmark`（N=2，`busbw == algbw`）：2–128 MiB 全档 ~3.14–3.20 GB/s，打平每方向链路上限。
-- `test_allreduce_benchmark`（N=8，2 机 × 4 rank）：小/中档 busbw ~3.16 GB/s，128 MiB 略降至 2.81 GB/s。
-- `test_allreduce_ompi_benchmark`：与 OriginCCL 逐行相同的 harness，后端切换为 `MPI_Allreduce`，供公平对照（eRDMA 上 OMPI 需自编带 rdmacm 的 `openib`，否则回退 TCP）。
-
-#### 动态多线程执行器（`--group-small`，2026-10）
+### 动态多线程执行器
 
 当一批任务全是集合通信时，planner 把切片平铺进公共队列，交给 `DynamicMultiThreadExecutor` 动态调度：每个 channel 空闲时由 rank0 从队列抓一小批（默认 2 个）切片，用 ring Broadcast 原语（`kControlMagic` 打头的控制消息）in-band 广播给所有 rank，再就地绑定 channel 执行。这样空闲的 channel 能承接别的 channel 排队中的切片，消除「快 channel 先跑完、worker 闲置」的负载不均；切片数 ≤ channel 数（均衡）时自动回退原 `MultiThreadExecutor`。`OCCL_DISABLE_DYNAMIC=1` 强制回退，`OCCL_DYNAMIC_BATCH=N` 调批大小。
 
@@ -146,7 +194,9 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 
 跨机 2×2（eRDMA，25 Gbps，`112.74.105.75` + `47.119.141.32`）上旧执行器在 `--group-small ≥8` 时死锁（ring credit 反馈环），动态执行器稳定跑通，快态吞吐约 11–14k msg/s（256 KiB，≈3.5 GB/s）；吞吐受 RDMA credit 双稳态支配、快慢态跳变，故收益倍数以单机 SHM 的干净 A/B（~2×）为准。运行命令：`mpirun -np 4 --allow-run-as-root --bind-to none --host <ip1>:2,<ip2>:2 ./build/tests/benchmark/test_allreduce_benchmark --group-small 64`（`--bind-to none` 必带，库里 worker 自行绑核）。
 
-- **tree / ring 分界（`kTreeThresholdChunks`）**：`AllReduce` 的每 rank 字节数低于 `kTreeThresholdChunks × kChunkBytes`（chunk = 32 KiB）时走 tree，否则 ring。方法：在 4 × ecs.g8y.4xlarge（4 机 × 4 rank = N=16，全 eRDMA，`--channels 4`）上分别编译 `kTreeThresholdChunks = 0`（纯 ring）与 `1e9`（纯 tree）两个版本，用同一条 factor-2 sweep 各跑一次，逐档比较 `median_us`（同一字节数、同一计时口径，可直接对比）：
+### tree / ring 分界测试
+
+`AllReduce` 的每 rank 字节数低于 `kTreeThresholdChunks × kChunkBytes`（chunk = 32 KiB）时走 tree，否则 ring。方法：在 4 × ecs.g8y.4xlarge（4 机 × 4 rank = N=16，全 eRDMA，`--channels 4`）上分别编译 `kTreeThresholdChunks = 0`（纯 ring）与 `1e9`（纯 tree）两个版本，用同一条 factor-2 sweep 各跑一次，逐档比较 `median_us`（同一字节数、同一计时口径，可直接对比）：
 
 | 每 rank size | ring µs | tree µs | 更快 |
 | --- | --- | --- | --- |
@@ -158,9 +208,15 @@ scripts/run_tests.sh --level 0 -j 2 --oversubscribe
 | 512 KiB | 369.0 | 747.5 | ring 103% |
 | 1 MiB | 790.0 | 1180.4 | ring 49% |
 
-### 全矩阵对照（4 × ecs.g8y.4xlarge，全部 eRDMA）
+### 全矩阵对照测试
 
-四机 A/B/C/D 全部 `erdma_0` PORT_ACTIVE，`busbw = algbw × 2(N-1)/N`。三档布局：单机 4 rank、两机 2+2、四机 4×4（N=16）；每格为 2/8/32/128 MiB 的 busGB/s（各档完整原始数据见 `tests/benchmark/test_allreduce_benchmark.cpp` 顶部注释）。
+基准程序在 `tests/benchmark/`，手动 `mpirun` 运行。阿里云 ecs.g8y.4xlarge、eRDMA 环境下的 AllReduce 基准：
+
+- `test_allreduce_benchmark`（N=2，`busbw == algbw`）：2–128 MiB 全档 ~3.14–3.20 GB/s，打平每方向链路上限。
+- `test_allreduce_benchmark`（N=8，2 机 × 4 rank）：小/中档 busbw ~3.16 GB/s，128 MiB 略降至 2.81 GB/s。
+- `test_allreduce_ompi_benchmark`：与 OriginCCL 逐行相同的 harness，后端切换为 `MPI_Allreduce`，供公平对照（eRDMA 上 OMPI 需自编带 rdmacm 的 `openib`，否则回退 TCP）。
+
+全矩阵测试使用 4 × ecs.g8y.4xlarge，全部 eRDMA。四机 A/B/C/D 全部 `erdma_0` PORT_ACTIVE，`busbw = algbw × 2(N-1)/N`。三档布局：单机 4 rank、两机 2+2、四机 4×4（N=16）；每格为 2/8/32/128 MiB 的 busGB/s（各档完整原始数据见 `tests/benchmark/test_allreduce_benchmark.cpp` 顶部注释）。
 
 | 布局 | OCCL 自动 | OCCL TCP | OMPI RDMA | OMPI TCP |
 | --- | --- | --- | --- | --- |
